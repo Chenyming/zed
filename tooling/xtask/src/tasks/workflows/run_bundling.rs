@@ -78,7 +78,7 @@ pub(crate) fn bundle_mac(
 
     pub fn bundle_mac(arch: Arch) -> Step<Run> {
         let target = Platform::Mac.target_triple(arch);
-        named::bash(&format!("./script/bundle-mac {target}"))
+        named::bash(&format!("./script/bundle-mac -r {target}"))
     }
     let platform = Platform::Mac;
     let target = platform.target_triple(arch);

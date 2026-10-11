@@ -7,27 +7,20 @@
 在仓库根目录执行：
 
 ```sh
-mkdir -p tmp
-
-TERM=xterm-256color \
-CARGO_TERM_COLOR=never \
-TMPDIR="$PWD/tmp" \
-TEMP="$PWD/tmp" \
-TMP="$PWD/tmp" \
-./script/bundle-mac
+./script/build-mac.sh
 ```
 
-`TERM=xterm-256color` 用于规避 `cargo-bundle` 在部分终端环境中触发的 `Term(ColorOutOfRange)` 错误。
+该入口自动设置终端和临时目录，并查询最新官方 stable remote-server 版本。
+默认仅编译客户端和 CLI；Linux remote-server 在连接远端时下载。
 
 该脚本依次完成：
 
 1. 生成第三方依赖许可证清单。
 2. 以 release 模式编译 `zed` 和 `cli`。
-3. 单独以 release 模式编译 `remote_server`。
-4. 生成并签名 `Zed.app`。
-5. 下载并加入应用内置的 Git 二进制。
-6. 生成 `Zed-aarch64.dmg`。
-7. 向 DMG 添加许可协议。
+3. 生成并签名 `Zed.app`。
+4. 下载并加入应用内置的 Git 二进制。
+5. 生成 `Zed-aarch64.dmg`。
+6. 向 DMG 添加许可协议。
 
 脚本内部对应的主要编译命令为：
 
@@ -36,7 +29,21 @@ cargo build --release \
   --package zed \
   --package cli \
   --target aarch64-apple-darwin
+```
 
+需要同时编译 macOS remote-server 时，显式启用：
+
+```sh
+./script/build-mac.sh --with-remote-server
+
+# 只编译二进制，不打包 .app 和 DMG
+./script/build-mac.sh binaries --with-remote-server
+```
+
+直接使用打包脚本时，对应参数为 `./script/bundle-mac -r`。
+该选项额外执行以下 macOS 编译命令，不进行 Linux 交叉编译：
+
+```sh
 cargo build --release \
   --package remote_server \
   --target aarch64-apple-darwin
@@ -56,8 +63,11 @@ release 二进制位于：
 ```text
 target/aarch64-apple-darwin/release/zed
 target/aarch64-apple-darwin/release/cli
-target/aarch64-apple-darwin/release/remote_server
 ```
+
+启用 `--with-remote-server` 时，额外生成
+`target/aarch64-apple-darwin/release/remote_server`；完整打包还生成
+`target/zed-remote-server-macos-aarch64.gz`。
 
 ## 补全 DMG 许可协议
 
@@ -106,10 +116,20 @@ hdiutil imageinfo \
 ## 实验性复用官方 remote-server
 
 main 分支的客户端版本可能尚未发布，因而官方没有对应的 Linux remote-server。
-可以显式固定官方 stable 服务端版本，而不改变客户端自己的版本号：
+`script/build-mac.sh` 默认通过 GitHub Releases API 查询最新官方 stable 版本，
+确认该发布包含 Linux remote-server，并将版本写入客户端默认值。自动查询需要 `curl`
+和 `jq`；查询失败会停止构建。
+
+可以显式固定官方 stable 服务端版本，跳过查询，而不改变客户端自己的版本号：
 
 ```sh
 ZED_REMOTE_SERVER_VERSION=1.20.2 ./script/build-mac.sh --channel stable
+```
+
+构建时显式设置为空字符串可禁用自动查询和版本覆盖：
+
+```sh
+ZED_REMOTE_SERVER_VERSION= ./script/build-mac.sh
 ```
 
 构建时设置的值会成为客户端默认值，因此从 Finder 启动也生效。`binaries` 模式同样支持，
@@ -143,4 +163,50 @@ ZED_REMOTE_SERVER_VERSION= /Applications/Zed.app/Contents/MacOS/zed
 
 ## 签名说明
 
-如果没有配置 `MACOS_CERTIFICATE`、`APPLE_NOTARIZATION_KEY` 等 Apple 发布凭据，脚本会对应用执行本地临时签名。该应用可用于本机运行，但不会经过 Apple 公证，通用链接等依赖完整 entitlement 的功能可能不可用。
+如果没有配置 `MACOS_CERTIFICATE`、`APPLE_NOTARIZATION_KEY` 等 Apple 发布凭据，
+脚本使用 `MACOS_SIGNING_KEY` 指定的本地签名身份；未指定时使用 ad-hoc 临时签名。
+该方式不会执行 Apple 公证，通用链接等依赖完整 entitlement 的功能可能不可用。
+
+### 使用固定证书签名
+
+每次重新编译会改变 ad-hoc 签名的应用身份，替换版本后可能再次弹出钥匙串访问请求。
+使用固定证书签名，可以在更新应用时保持签名身份一致。
+
+查询钥匙串中有效的代码签名身份：
+
+```sh
+security find-identity -v -p codesigning
+```
+
+本机当前查询结果为：
+
+```text
+1) 73C71571A1E993B2B628A5F4998CC201DB8336FA "Apple Development: cym8677@gmail.com (J8QP4MUX59)"
+```
+
+使用该证书的指纹构建并签名 stable 应用：
+
+```sh
+MACOS_SIGNING_KEY=73C71571A1E993B2B628A5F4998CC201DB8336FA \
+  ./script/build-mac.sh --channel stable
+```
+
+在其他机器上或证书更新后，使用查询结果中的有效指纹。
+`MACOS_SIGNING_KEY` 指定的是钥匙串中已有的证书及其私钥身份，不是文件路径或密码。
+当前脚本未对该变量展开加引号，因此使用无空格的指纹，避免证书全名被拆分为多个参数。
+每次构建使用相同身份；`binaries` 模式仅编译二进制，不执行应用签名。
+
+构建完成后检查应用签名：
+
+```sh
+codesign -dv --verbose=4 \
+  target/aarch64-apple-darwin/release/dmg/Zed.app
+
+codesign --verify --deep --strict \
+  target/aarch64-apple-darwin/release/dmg/Zed.app
+```
+
+签名信息应包含证书的 `Authority=`，而不是 `Signature=adhoc`。
+从临时签名首次切换为证书签名后，仍可能需要重新授权一次钥匙串。
+
+参考：[Apple 代码签名说明](https://developer.apple.com/library/archive/documentation/Security/Conceptual/CodeSigningGuide/Procedures/Procedures.html)。

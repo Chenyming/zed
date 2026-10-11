@@ -7,13 +7,14 @@
 #   script/build-mac.sh binaries            只编 release 二进制,跳过 bundle 和 DMG(日常迭代用)
 #   script/build-mac.sh open                完整流程,结束后打开产物所在目录
 #   script/build-mac.sh --channel stable    临时用 stable 渠道构建,结束后自动还原
+#   script/build-mac.sh --with-remote-server 同时编译 macOS remote_server
 #
 # 渠道可选 dev / nightly / preview / stable,默认沿用 crates/zed/RELEASE_CHANNEL 当前的值。
 #
 # 环境变量:
 #   MIN_FREE_GB   构建前要求的最小可用空间,默认 60
 #   TARGET_TRIPLE 目标三元组,默认取 rustc 的 host
-#   ZED_REMOTE_SERVER_VERSION 可选,将指定的官方 stable 服务端版本写入客户端默认值(如 1.20.2)
+#   ZED_REMOTE_SERVER_VERSION 默认查询最新官方 stable 版本;可指定版本,设为空则禁用覆盖
 
 set -euo pipefail
 
@@ -21,6 +22,7 @@ cd "$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 
 mode="full"
 requested_channel=""
+build_remote_server=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -40,9 +42,13 @@ while [[ $# -gt 0 ]]; do
             requested_channel="${1#--channel=}"
             shift
             ;;
+        --with-remote-server)
+            build_remote_server=true
+            shift
+            ;;
         *)
             echo "未知参数: $1" >&2
-            echo "可选:full / binaries / open,--channel dev|nightly|preview|stable" >&2
+            echo "可选:full / binaries / open,--channel dev|nightly|preview|stable,--with-remote-server" >&2
             exit 2
             ;;
     esac
@@ -69,9 +75,36 @@ if [[ "$free_gb" -lt "$MIN_FREE_GB" ]]; then
     exit 1
 fi
 echo "可用空间 ${free_gb}G,目标三元组 ${TARGET_TRIPLE},渠道 ${channel}"
+
+if [[ -z "${ZED_REMOTE_SERVER_VERSION+x}" ]]; then
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "自动查询 remote-server 版本需要 jq;请安装 jq 或显式设置 ZED_REMOTE_SERVER_VERSION。" >&2
+        exit 1
+    fi
+    echo "查询最新官方 stable remote-server 版本"
+    if ! ZED_REMOTE_SERVER_VERSION=$(
+        curl --fail --silent --show-error --location \
+            --connect-timeout 10 --max-time 30 --retry 2 \
+            https://api.github.com/repos/zed-industries/zed/releases/latest |
+            jq --exit-status --raw-output '
+                select(.draft == false and .prerelease == false)
+                | select(any(.assets[]; .name | startswith("zed-remote-server-linux-")))
+                | .tag_name | strings | sub("^v"; "")
+            '
+    ); then
+        echo "查询最新 remote-server 版本失败;请检查网络或显式设置 ZED_REMOTE_SERVER_VERSION 后重试。" >&2
+        exit 1
+    fi
+fi
+
 if [[ -n "${ZED_REMOTE_SERVER_VERSION:-}" ]]; then
+    if [[ ! "$ZED_REMOTE_SERVER_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+        echo "ZED_REMOTE_SERVER_VERSION 必须是精确的 stable 版本号(如 1.23.2),或为空以禁用覆盖。" >&2
+        exit 1
+    fi
     echo "固定官方 stable remote-server 为 ${ZED_REMOTE_SERVER_VERSION}(与自编译客户端的协议兼容性需自行验证)"
 fi
+export ZED_REMOTE_SERVER_VERSION
 
 # cargo-bundle 在部分终端下会因为颜色能力探测失败抛 Term(ColorOutOfRange)。
 export TERM=xterm-256color
@@ -126,26 +159,31 @@ if [[ "$mode" == "binaries" ]]; then
     cargo --config .cargo/bundle-config.toml build --release \
         --package zed --package cli --target "$TARGET_TRIPLE"
 
-    # remote_server 单独一次调用,避免其他 crate 的 feature 统一影响它
-    # 依赖的动态库。
-    echo "编译 remote_server"
-    cargo --config .cargo/bundle-config.toml build --release \
-        --package remote_server --target "$TARGET_TRIPLE"
+    if [[ "$build_remote_server" == true ]]; then
+        # remote_server 单独一次调用,避免其他 crate 的 feature 统一影响它
+        # 依赖的动态库。
+        echo "编译 remote_server"
+        cargo --config .cargo/bundle-config.toml build --release \
+            --package remote_server --target "$TARGET_TRIPLE"
+    fi
 
     echo "二进制产物:"
-    ls -lh "target/${TARGET_TRIPLE}/release/zed" \
-           "target/${TARGET_TRIPLE}/release/cli" \
-           "target/${TARGET_TRIPLE}/release/remote_server"
+    set -- "target/${TARGET_TRIPLE}/release/zed" "target/${TARGET_TRIPLE}/release/cli"
+    if [[ "$build_remote_server" == true ]]; then
+        set -- "$@" "target/${TARGET_TRIPLE}/release/remote_server"
+    fi
+    ls -lh "$@"
     exit 0
 fi
 
-# macOS 自带的是 bash 3.2,在 set -u 下展开空数组会报 unbound variable
-# (bash 4.4 才修),所以这里分支写死参数而不是拼数组。
-if [[ "$mode" == "open" ]]; then
-    ./script/bundle-mac -o "$TARGET_TRIPLE"
-else
-    ./script/bundle-mac "$TARGET_TRIPLE"
+set -- "$TARGET_TRIPLE"
+if [[ "$build_remote_server" == true ]]; then
+    set -- -r "$@"
 fi
+if [[ "$mode" == "open" ]]; then
+    set -- -o "$@"
+fi
+./script/bundle-mac "$@"
 
 # app 的名字随渠道变("Zed Dev" / "Zed Preview" / "Zed Nightly" / "Zed"),
 # 所以这里靠通配而不是写死名字。

@@ -6,6 +6,7 @@ source script/lib/blob-store.sh
 build_flag="--release"
 zed_features=""
 remote_server_features=""
+build_remote_server=false
 target_dir="release"
 open_result=false
 local_install=false
@@ -25,11 +26,12 @@ Options:
   -d    Compile in debug mode
   -o    Open dir with the resulting DMG or launch the app itself in local mode.
   -i    Install the resulting DMG into /Applications.
+  -r    Build and package the macOS remote server (disabled by default).
   -h    Display this help and exit.
   "
 }
 
-while getopts 'dloih' flag
+while getopts 'dloihr' flag
 do
     case "${flag}" in
         o) open_result=true;;
@@ -41,6 +43,7 @@ do
             target_dir="debug"
             ;;
         i) local_install=true;;
+        r) build_remote_server=true;;
         h)
            help_info
            exit 0
@@ -99,7 +102,9 @@ else
 fi
 # Build remote_server in separate invocation to prevent feature unification from other crates
 # from influencing dynamic libraries required by it.
-cargo --config .cargo/bundle-config.toml build ${build_flag} ${remote_server_features} --package remote_server --target $target_triple
+if [[ "$build_remote_server" == true ]]; then
+    cargo --config .cargo/bundle-config.toml build ${build_flag} ${remote_server_features} --package remote_server --target $target_triple
+fi
 
 echo "Creating application bundle"
 pushd crates/zed
@@ -312,7 +317,7 @@ function extract_debug_symbols() {
         cat target/dsymutil.log
         exit 1
     fi
-    if ! dsymutil --flat "target/${target_triple}/${target_dir}/remote_server" 2> target/dsymutil.log; then
+    if [[ "$build_remote_server" == true ]] && ! dsymutil --flat "target/${target_triple}/${target_dir}/remote_server" 2> target/dsymutil.log; then
         echo "dsymutil failed"
         cat target/dsymutil.log
         exit 1
@@ -325,12 +330,14 @@ function upload_debug_symbols() {
     elif [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
         echo "Uploading zed debug symbols to sentry..."
         extract_debug_symbols
+        set -- "target/${target_triple}/${target_dir}/zed.dwarf"
+        if [[ "$build_remote_server" == true ]]; then
+            set -- "$@" "target/${target_triple}/${target_dir}/remote_server.dwarf"
+        fi
         # Try uploading up to 3 times
         for attempt in 1 2 3; do
             echo "Sentry upload attempt $attempt..."
-            if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
-                "target/${target_triple}/${target_dir}/zed.dwarf" \
-                "target/${target_triple}/${target_dir}/remote_server.dwarf"; then
+            if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev "$@"; then
                 break
             else
                 echo "Sentry upload failed on attempt $attempt"
@@ -354,12 +361,16 @@ if [[ "$target_dir" == "release" && "$local_install" != true ]]; then
     extract_debug_symbols
     strip -x "target/${target_triple}/${target_dir}/zed"
     strip -x "target/${target_triple}/${target_dir}/cli"
-    strip -x "target/${target_triple}/${target_dir}/remote_server"
+    if [[ "$build_remote_server" == true ]]; then
+        strip -x "target/${target_triple}/${target_dir}/remote_server"
+    fi
 fi
 
 cp target/${target_triple}/${target_dir}/zed "${app_path}/Contents/MacOS/zed"
 cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
 sign_app_binaries
 
-sign_binary "target/$target_triple/release/remote_server"
-gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+if [[ "$build_remote_server" == true ]]; then
+    sign_binary "target/$target_triple/$target_dir/remote_server"
+    gzip -f --stdout --best "target/$target_triple/$target_dir/remote_server" > "target/zed-remote-server-macos-$arch_suffix.gz"
+fi

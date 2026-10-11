@@ -7462,7 +7462,7 @@ impl Sidebar {
                     header,
                     left_window_controls,
                     right_window_controls,
-                    no_open_projects,
+                    no_projects,
                 ),
                 Decorations::Server => header.mt_px().pb_px(),
             })

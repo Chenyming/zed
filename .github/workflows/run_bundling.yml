@@ -218,7 +218,7 @@ jobs:
         printf 'SDKROOT=%s\n' "${SDKROOT-<unset>}"
         printf 'MACOSX_DEPLOYMENT_TARGET=%s\n' "${MACOSX_DEPLOYMENT_TARGET-<unset>}"
     - name: run_bundling::bundle_mac::bundle_mac
-      run: ./script/bundle-mac aarch64-apple-darwin
+      run: ./script/bundle-mac -r aarch64-apple-darwin
     - name: run_bundling::upload_artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
@@ -280,7 +280,7 @@ jobs:
         printf 'SDKROOT=%s\n' "${SDKROOT-<unset>}"
         printf 'MACOSX_DEPLOYMENT_TARGET=%s\n' "${MACOSX_DEPLOYMENT_TARGET-<unset>}"
     - name: run_bundling::bundle_mac::bundle_mac
-      run: ./script/bundle-mac x86_64-apple-darwin
+      run: ./script/bundle-mac -r x86_64-apple-darwin
     - name: run_bundling::upload_artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
