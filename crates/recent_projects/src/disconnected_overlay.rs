@@ -3,11 +3,9 @@ use project::project_settings::ProjectSettings;
 use remote::RemoteConnectionOptions;
 use settings::Settings;
 use ui::{ElevationIndex, Modal, ModalFooter, ModalHeader, Section, prelude::*};
-use workspace::{
-    ModalView, MultiWorkspace, OpenOptions, Workspace, notifications::DetachAndPromptErr,
-};
+use workspace::{ModalView, MultiWorkspace, OpenOptions, Workspace};
 
-use crate::open_remote_project;
+use crate::remote_connections::open_remote_project_in_workspace;
 
 enum Host {
     CollabGuestProject,
@@ -28,6 +26,10 @@ impl Focusable for DisconnectedOverlay {
     }
 }
 impl ModalView for DisconnectedOverlay {
+    fn scope_to_workspace(&self) -> bool {
+        true
+    }
+
     fn on_before_dismiss(
         &mut self,
         _window: &mut Window,
@@ -120,7 +122,7 @@ impl DisconnectedOverlay {
             .collect();
 
         cx.spawn_in(window, async move |_, cx| {
-            open_remote_project(
+            let result = open_remote_project_in_workspace(
                 connection_options,
                 paths,
                 app_state,
@@ -128,12 +130,17 @@ impl DisconnectedOverlay {
                     requesting_window: Some(window_handle),
                     ..Default::default()
                 },
+                Some(workspace.clone()),
                 cx,
             )
-            .await?;
-            Ok(())
+            .await;
+            if let Err(error) = result {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_error(format!("Failed to reconnect: {error:#}"), cx);
+                });
+            }
         })
-        .detach_and_prompt_err("Failed to reconnect", window, cx, |_, _, _| None);
+        .detach();
     }
 
     fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
@@ -191,11 +198,11 @@ impl Render for DisconnectedOverlay {
                             h_flex()
                                 .gap_2()
                                 .child(
-                                    Button::new("close-window", "Close Window")
+                                    Button::new("dismiss", "Dismiss")
                                         .style(ButtonStyle::Filled)
                                         .layer(ElevationIndex::ModalSurface)
-                                        .on_click(cx.listener(move |_, _, window, _| {
-                                            window.remove_window();
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.cancel(&menu::Cancel, window, cx);
                                         })),
                                 )
                                 .when(can_reconnect, |el| {

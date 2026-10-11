@@ -194,6 +194,10 @@ impl WslRemoteConnection {
         version: Version,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
+        let release =
+            crate::server_release::RemoteServerRelease::for_client(release_channel, version)?;
+        let release_channel = release.channel;
+        let version = release.version.clone();
         let version_str = match release_channel {
             ReleaseChannel::Dev => "build".to_string(),
             _ => version.to_string(),
@@ -217,18 +221,19 @@ impl WslRemoteConnection {
         }
 
         let binary_exists_on_server = self
-            .run_wsl_command(&dst_path.display(PathStyle::Unix), &["version"])
+            .run_wsl_command_with_output(&dst_path.display(PathStyle::Unix), &["version"])
             .await
-            .is_ok();
+            .is_ok_and(|output| release.accepts_version_output(&output));
 
         #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
-        if let Some(remote_server_path) = super::build_remote_server_from_source(
-            &self.platform,
-            delegate.as_ref(),
-            binary_exists_on_server,
-            cx,
-        )
-        .await?
+        if !release.overridden
+            && let Some(remote_server_path) = super::build_remote_server_from_source(
+                &self.platform,
+                delegate.as_ref(),
+                binary_exists_on_server,
+                cx,
+            )
+            .await?
         {
             let tmp_path = paths::remote_server_dir_relative().join(
                 &RelPath::from_unix_str(&format!(
@@ -251,7 +256,7 @@ impl WslRemoteConnection {
 
         let wanted_version = match release_channel {
             ReleaseChannel::Nightly | ReleaseChannel::Dev => None,
-            _ => Some(cx.update(|cx| AppVersion::global(cx))),
+            _ => Some(version),
         };
 
         let src_path = delegate
@@ -267,6 +272,11 @@ impl WslRemoteConnection {
 
         self.upload_file(&src_path, &tmp_path, delegate, cx).await?;
         self.extract_and_install(&tmp_path, &dst_path, delegate, cx)
+            .await?;
+        release
+            .verify_download(
+                self.run_wsl_command_with_output(&dst_path.display(PathStyle::Unix), &["version"]),
+            )
             .await?;
 
         Ok(dst_path.into())

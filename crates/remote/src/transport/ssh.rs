@@ -837,6 +837,10 @@ impl SshRemoteConnection {
         version: Version,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
+        let release =
+            crate::server_release::RemoteServerRelease::for_client(release_channel, version)?;
+        let release_channel = release.channel;
+        let version = release.version.clone();
         let version_str = match release_channel {
             ReleaseChannel::Dev => "build".to_string(),
             _ => version.to_string(),
@@ -863,16 +867,17 @@ impl SshRemoteConnection {
                 true,
             )
             .await
-            .is_ok();
+            .is_ok_and(|output| release.accepts_version_output(&output));
 
         #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
-        if let Some(remote_server_path) = super::build_remote_server_from_source(
-            &self.ssh_platform,
-            delegate.as_ref(),
-            binary_exists_on_server,
-            cx,
-        )
-        .await?
+        if !release.overridden
+            && let Some(remote_server_path) = super::build_remote_server_from_source(
+                &self.ssh_platform,
+                delegate.as_ref(),
+                binary_exists_on_server,
+                cx,
+            )
+            .await?
         {
             let tmp_path = paths::remote_server_dir_relative().join(
                 RelPath::from_unix_str(&format!(
@@ -893,16 +898,16 @@ impl SshRemoteConnection {
             return Ok(dst_path.into());
         }
 
-        let wanted_version = cx.update(|cx| match release_channel {
-            ReleaseChannel::Nightly => Ok(None),
+        let wanted_version = match release_channel {
+            ReleaseChannel::Nightly => None,
             ReleaseChannel::Dev => {
                 anyhow::bail!(
                     "ZED_BUILD_REMOTE_SERVER is not set and no remote server exists at ({:?})",
                     dst_path
                 )
             }
-            _ => Ok(Some(AppVersion::global(cx))),
-        })?;
+            _ => Some(version),
+        };
 
         let tmp_path_compressed = remote_server_dir_relative().join(
             RelPath::from_unix_str(&format!(
@@ -935,6 +940,14 @@ impl SshRemoteConnection {
                     self.extract_server_binary(&dst_path, &tmp_path_compressed, delegate, cx)
                         .await
                         .context("extracting server binary")?;
+                    release
+                        .verify_download(self.socket.run_command(
+                            self.ssh_shell_kind,
+                            &dst_path.display(self.path_style()),
+                            &["version"],
+                            true,
+                        ))
+                        .await?;
                     return Ok(dst_path.into());
                 }
                 Err(e) => {
@@ -960,6 +973,14 @@ impl SshRemoteConnection {
         self.extract_server_binary(&dst_path, &tmp_path_compressed, delegate, cx)
             .await
             .context("extracting server binary")?;
+        release
+            .verify_download(self.socket.run_command(
+                self.ssh_shell_kind,
+                &dst_path.display(self.path_style()),
+                &["version"],
+                true,
+            ))
+            .await?;
         Ok(dst_path.into())
     }
 

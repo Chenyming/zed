@@ -406,6 +406,35 @@ pub fn has_active_connection(opts: &RemoteConnectionOptions, cx: &App) -> bool {
     })
 }
 
+/// Resolves persisted host metadata to the options of an already connected host.
+/// Unlike opening a new connection, navigating existing threads should retain
+/// the runtime options (for example, SSH arguments) of their live connection.
+pub fn active_connection_options_for_host(
+    connection_options: &RemoteConnectionOptions,
+    cx: &App,
+) -> Option<RemoteConnectionOptions> {
+    if has_active_connection(connection_options, cx) {
+        return Some(connection_options.clone());
+    }
+
+    let pool = cx.try_global::<ConnectionPool>()?;
+    pool.connections.iter().find_map(|(options, connection)| {
+        if !crate::same_remote_connection_identity(Some(options), Some(connection_options)) {
+            return None;
+        }
+        match connection {
+            ConnectionPoolEntry::Connected(connection)
+                if connection
+                    .upgrade()
+                    .is_some_and(|connection| !connection.has_been_killed()) =>
+            {
+                Some(options.clone())
+            }
+            _ => None,
+        }
+    })
+}
+
 impl RemoteClient {
     pub fn new(
         unique_identifier: ConnectionIdentifier,
@@ -1406,6 +1435,87 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use rpc::{ErrorCodeExt, proto::ErrorCode};
+
+    #[gpui::test]
+    async fn test_active_connection_options_for_persisted_host(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (mock_options, _server, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+        let connection_task = cx.update(|cx| {
+            cx.update_default_global(|pool: &mut ConnectionPool, cx| {
+                pool.connect(mock_options.clone(), Arc::new(crate::MockDelegate), cx)
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(active_connection_options_for_host(&mock_options, cx).is_none());
+        });
+        drop(connect_guard);
+        let connection = connection_task
+            .await
+            .expect("mock transport should connect");
+        let persisted_options = RemoteConnectionOptions::Ssh(SshConnectionOptions {
+            host: "example.com".into(),
+            username: Some("developer".into()),
+            port: Some(2222),
+            ..Default::default()
+        });
+        let mut live_options = persisted_options.clone();
+        if let RemoteConnectionOptions::Ssh(options) = &mut live_options {
+            options.nickname = Some("Build server".into());
+            options.args = Some(vec!["-o".into(), "Compression=yes".into()]);
+            options.connection_timeout = Some(30);
+            options.upload_binary_over_ssh = true;
+        }
+        cx.update(|cx| {
+            cx.default_global::<ConnectionPool>().connections.insert(
+                live_options.clone(),
+                ConnectionPoolEntry::Connected(Arc::downgrade(&connection)),
+            );
+            assert!(!has_active_connection(&persisted_options, cx));
+            assert_eq!(
+                active_connection_options_for_host(&persisted_options, cx),
+                Some(live_options.clone()),
+            );
+            let mut different_host = persisted_options.clone();
+            if let RemoteConnectionOptions::Ssh(options) = &mut different_host {
+                options.port = Some(2223);
+            }
+            assert!(active_connection_options_for_host(&different_host, cx).is_none());
+            if let RemoteConnectionOptions::Ssh(options) = &mut different_host {
+                options.port = Some(2222);
+                options.username = Some("another-user".into());
+            }
+            assert!(active_connection_options_for_host(&different_host, cx).is_none());
+        });
+        let resolved_options = cx
+            .update(|cx| active_connection_options_for_host(&persisted_options, cx))
+            .expect("persisted host should resolve to the live connection options");
+        let reused_connection = connect(
+            resolved_options,
+            Arc::new(crate::MockDelegate),
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("resolved host should reuse the pooled transport");
+        assert!(Arc::ptr_eq(&connection, &reused_connection));
+        drop(reused_connection);
+        cx.update(|cx| {
+            cx.default_global::<ConnectionPool>().connections.insert(
+                persisted_options.clone(),
+                ConnectionPoolEntry::Connected(Arc::downgrade(&connection)),
+            );
+            assert_eq!(
+                active_connection_options_for_host(&persisted_options, cx),
+                Some(persisted_options.clone()),
+            );
+        });
+        drop(connection);
+        cx.update(|cx| {
+            assert!(active_connection_options_for_host(&persisted_options, cx).is_none());
+        });
+    }
 
     #[test]
     fn test_ssh_display_name_prefers_nickname() {

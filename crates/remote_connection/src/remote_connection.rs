@@ -48,6 +48,7 @@ pub struct RemoteConnectionModal {
     pub prompt: Entity<RemoteConnectionPrompt>,
     paths: Vec<PathBuf>,
     finished: bool,
+    error: Option<(SharedString, oneshot::Sender<()>)>,
 }
 
 impl RemoteConnectionPrompt {
@@ -107,7 +108,6 @@ impl RemoteConnectionPrompt {
             .ok();
         }));
         self.status_message.take();
-        window.focus(&self.editor.focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -270,11 +270,19 @@ impl RemoteConnectionModal {
                 )
             }),
             finished: false,
+            error: None,
             paths,
         }
     }
 
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_, retry)) = self.error.take() {
+            if retry.send(()).is_err() {
+                log::debug!("remote connection retry was cancelled");
+            }
+            cx.notify();
+            return;
+        }
         self.prompt
             .update(cx, |prompt, cx| prompt.confirm(window, cx))
     }
@@ -284,7 +292,15 @@ impl RemoteConnectionModal {
         cx.emit(DismissEvent);
     }
 
+    pub fn show_error(&mut self, error: String, cx: &mut Context<Self>) -> oneshot::Receiver<()> {
+        let (retry, receiver) = oneshot::channel();
+        self.error = Some((error.into(), retry));
+        cx.notify();
+        receiver
+    }
+
     fn dismiss(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        self.error.take();
         if let Some(tx) = self
             .prompt
             .update(cx, |prompt, _cx| prompt.cancellation.take())
@@ -395,8 +411,28 @@ impl Render for RemoteConnectionModal {
                     .bg(body_color)
                     .border_y_1()
                     .border_color(theme.colors().border_variant)
-                    .child(self.prompt.clone()),
+                    .when_some(self.error.as_ref(), |this, (error, _)| {
+                        this.child(
+                            v_flex()
+                                .p_3()
+                                .gap_2()
+                                .child(Label::new("Failed to connect").color(Color::Error))
+                                .child(Label::new(error.clone())),
+                        )
+                    })
+                    .when(self.error.is_none(), |this| this.child(self.prompt.clone())),
             )
+            .when(self.error.is_some(), |this| {
+                this.child(
+                    ListItem::new("retry-remote-connection")
+                        .inset(true)
+                        .start_slot(Icon::new(IconName::ArrowCircle))
+                        .child(Label::new("Retry"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.confirm(&menu::Confirm, window, cx);
+                        })),
+                )
+            })
             .child(
                 div().w_full().py_1().child(
                     ListItem::new("li-devcontainer-go-back")
@@ -425,6 +461,10 @@ impl Focusable for RemoteConnectionModal {
 impl EventEmitter<DismissEvent> for RemoteConnectionModal {}
 
 impl ModalView for RemoteConnectionModal {
+    fn scope_to_workspace(&self) -> bool {
+        true
+    }
+
     fn on_before_dismiss(
         &mut self,
         _window: &mut Window,
@@ -564,26 +604,69 @@ pub fn connect_with_modal(
     cx: &mut App,
 ) -> Task<Result<Option<Entity<RemoteClient>>>> {
     if remote::has_active_connection(&connection_options, cx) {
-        return connect_reusing_pool(connection_options, cx);
+        let task = connect_reusing_pool(connection_options, cx);
+        let workspace = workspace.downgrade();
+        return cx.spawn(async move |cx| {
+            let result = task.await;
+            if let Err(error) = &result {
+                if let Err(update_error) = workspace.update(cx, |workspace, cx| {
+                    workspace.show_error(format!("Failed to connect: {error:#}"), cx);
+                }) {
+                    log::debug!(
+                        "Workspace closed before reporting connection failure: {update_error}"
+                    );
+                }
+            }
+            result
+        });
     }
 
-    workspace.update(cx, |workspace, cx| {
+    let Some(modal) = workspace.update(cx, |workspace, cx| {
         workspace.toggle_modal(window, cx, |window, cx| {
             RemoteConnectionModal::new(&connection_options, Vec::new(), window, cx)
         });
-        let Some(modal) = workspace.active_modal::<RemoteConnectionModal>(cx) else {
-            return Task::ready(Err(anyhow::anyhow!(
-                "Failed to open remote connection dialog"
-            )));
-        };
-        let prompt = modal.read(cx).prompt.clone();
-        connect(
-            ConnectionIdentifier::setup(),
-            connection_options,
-            prompt,
-            window,
-            cx,
-        )
+        workspace.active_modal::<RemoteConnectionModal>(cx)
+    }) else {
+        return Task::ready(Err(anyhow::anyhow!(
+            "Failed to open remote connection dialog"
+        )));
+    };
+    let task = connect(
+        ConnectionIdentifier::setup(),
+        connection_options.clone(),
+        modal.read(cx).prompt.clone(),
+        window,
+        cx,
+    );
+    let modal = modal.downgrade();
+    let window = window.window_handle();
+    cx.spawn(async move |cx| {
+        let mut task = task;
+        loop {
+            let error = match task.await {
+                Ok(result) => return Ok(result),
+                Err(error) => error,
+            };
+            log::error!("Failed to connect: {error:#}");
+            let Ok(retry) =
+                modal.update(cx, |modal, cx| modal.show_error(format!("{error:#}"), cx))
+            else {
+                return Ok(None);
+            };
+            if retry.await.is_err() {
+                return Ok(None);
+            }
+            task = window.update(cx, |_, window, cx| {
+                let prompt = modal.read_with(cx, |modal, _| modal.prompt.clone())?;
+                anyhow::Ok(connect(
+                    ConnectionIdentifier::setup(),
+                    connection_options.clone(),
+                    prompt,
+                    window,
+                    cx,
+                ))
+            })??;
+        }
     })
 }
 

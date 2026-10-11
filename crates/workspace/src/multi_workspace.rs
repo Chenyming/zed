@@ -8,7 +8,7 @@ use gpui::{
 };
 pub use project::ProjectGroupKey;
 use project::{DisableAiSettings, Project};
-use remote::RemoteConnectionOptions;
+use remote::{RemoteConnectionOptions, same_remote_connection_identity};
 use settings::Settings;
 pub use settings::SidebarSide;
 use std::cell::Cell;
@@ -583,6 +583,8 @@ impl MultiWorkspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        let modal_layer = workspace.read(cx).modal_layer.clone();
+        cx.observe(&modal_layer, |_, _, cx| cx.notify()).detach();
         let project = workspace.read(cx).project().clone();
         cx.subscribe_in(&project, window, {
             let workspace = workspace.downgrade();
@@ -1066,7 +1068,7 @@ impl MultiWorkspace {
         for workspace in self.workspaces() {
             let root_paths = PathList::new(&workspace.read(cx).root_paths(cx));
             let key = workspace.read(cx).project_group_key(cx);
-            let host_matches = key.host().as_ref() == host;
+            let host_matches = same_remote_connection_identity(key.host().as_ref(), host);
             let paths_match = root_paths == *path_list;
             if host_matches && paths_match {
                 return Some(workspace.clone());
@@ -1497,7 +1499,12 @@ impl MultiWorkspace {
     }
 
     pub fn focus_active_workspace(&self, window: &mut Window, cx: &mut App) {
-        let focus_handle = self.workspace().read(cx).fallback_focus_handle(window, cx);
+        let workspace = self.workspace().read(cx);
+        let focus_handle = workspace
+            .modal_layer
+            .read(cx)
+            .active_focus_handle(cx)
+            .unwrap_or_else(|| workspace.fallback_focus_handle(window, cx));
         window.focus(&focus_handle, cx);
     }
 
@@ -2069,6 +2076,8 @@ impl Render for MultiWorkspace {
         let text_color = cx.theme().colors().text;
 
         let workspace = self.workspace().clone();
+        let modal_layer = workspace.read(cx).modal_layer.clone();
+        let scope_modal_to_workspace = modal_layer.read(cx).scope_to_workspace(cx);
         let workspace_key_context = workspace.update(cx, |workspace, cx| workspace.key_context(cx));
         let root = workspace.update(cx, |workspace, cx| workspace.actions(h_flex(), window, cx));
 
@@ -2172,14 +2181,18 @@ impl Render for MultiWorkspace {
                 .children(left_sidebar)
                 .child(
                     div()
+                        .relative()
                         .flex()
                         .flex_1()
                         .size_full()
                         .overflow_hidden()
-                        .child(self.workspace().clone()),
+                        .child(self.workspace().clone())
+                        .when(scope_modal_to_workspace, |this| {
+                            this.child(modal_layer.clone())
+                        }),
                 )
                 .children(right_sidebar)
-                .child(self.workspace().read(cx).modal_layer.clone())
+                .when(!scope_modal_to_workspace, |this| this.child(modal_layer))
                 .children(self.sidebar_overlay.as_ref().map(|view| {
                     deferred(div().absolute().size_full().inset_0().occlude().child(
                         v_flex().h(px(0.0)).top_20().items_center().child(

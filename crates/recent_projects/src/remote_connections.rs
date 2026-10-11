@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result};
 use askpass::EncryptedPassword;
 use editor::Editor;
 use futures::{FutureExt as _, channel::oneshot, select};
-use gpui::{AppContext, AsyncApp, PromptLevel, WindowHandle};
+use gpui::{AppContext, AsyncApp, Entity, WindowHandle};
 
 use project::trusted_worktrees;
 use remote::{
@@ -132,6 +132,33 @@ pub async fn open_remote_project(
     open_options: workspace::OpenOptions,
     cx: &mut AsyncApp,
 ) -> Result<WindowHandle<MultiWorkspace>> {
+    let initial_workspace = open_options
+        .requesting_window
+        .map(|window| {
+            window.update(cx, |multi_workspace, _, _| {
+                multi_workspace.workspace().clone()
+            })
+        })
+        .transpose()?;
+    open_remote_project_in_workspace(
+        connection_options,
+        paths,
+        app_state,
+        open_options,
+        initial_workspace,
+        cx,
+    )
+    .await
+}
+
+pub(crate) async fn open_remote_project_in_workspace(
+    connection_options: RemoteConnectionOptions,
+    paths: Vec<PathBuf>,
+    app_state: Arc<AppState>,
+    open_options: workspace::OpenOptions,
+    initial_workspace: Option<Entity<Workspace>>,
+    cx: &mut AsyncApp,
+) -> Result<WindowHandle<MultiWorkspace>> {
     let created_new_window = open_options.requesting_window.is_none();
 
     let (existing, open_visible) = find_existing_workspace(
@@ -202,9 +229,7 @@ pub async fn open_remote_project(
     }
 
     let (window, initial_workspace) = if let Some(window) = open_options.requesting_window {
-        let workspace = window.update(cx, |multi_workspace, _, _| {
-            multi_workspace.workspace().clone()
-        })?;
+        let workspace = initial_workspace.context("missing workspace for remote connection")?;
         (window, workspace)
     } else {
         let workspace_position = cx
@@ -251,8 +276,10 @@ pub async fn open_remote_project(
             let paths = paths.clone();
             let connection_options = connection_options.clone();
             let initial_workspace = initial_workspace.clone();
-            move |_multi_workspace: &mut MultiWorkspace, window, cx| {
-                window.activate_window();
+            move |multi_workspace: &mut MultiWorkspace, window, cx| {
+                if multi_workspace.workspace() == &initial_workspace {
+                    window.activate_window();
+                }
                 initial_workspace.update(cx, |workspace, cx| {
                     workspace.hide_modal(window, cx);
                     workspace.toggle_modal(window, cx, |window, cx| {
@@ -303,41 +330,21 @@ pub async fn open_remote_project(
         let remote_connection = match connection {
             Ok(connection) => connection,
             Err(e) => {
-                initial_workspace.update(cx, |workspace, cx| {
-                    if let Some(ui) = workspace.active_modal::<RemoteConnectionModal>(cx) {
-                        ui.update(cx, |modal, cx| modal.finished(cx))
-                    }
-                });
                 log::error!("Failed to open project: {e:#}");
-                let response = window
-                    .update(cx, |_, window, cx| {
-                        window.prompt(
-                            PromptLevel::Critical,
-                            match connection_options {
-                                RemoteConnectionOptions::Ssh(_) => "Failed to connect over SSH",
-                                RemoteConnectionOptions::Wsl(_) => "Failed to connect to WSL",
-                                RemoteConnectionOptions::Docker(_) => {
-                                    "Failed to connect to Dev Container"
-                                }
-                                #[cfg(any(test, feature = "test-support"))]
-                                RemoteConnectionOptions::Mock(_) => {
-                                    "Failed to connect to mock server"
-                                }
-                            },
-                            Some(&format!("{e:#}")),
-                            &["Retry", "Cancel"],
-                            cx,
-                        )
-                    })?
-                    .await;
-
-                if response == Ok(0) {
+                if retry_remote_connection(&initial_workspace, &e, cx).await {
                     continue;
                 }
 
                 if created_new_window {
                     window
-                        .update(cx, |_, window, _| window.remove_window())
+                        .update(cx, |multi_workspace, window, _| {
+                            if multi_workspace
+                                .workspaces()
+                                .all(|workspace| workspace == &initial_workspace)
+                            {
+                                window.remove_window();
+                            }
+                        })
                         .ok();
                 }
                 return Ok(window);
@@ -356,48 +363,29 @@ pub async fn open_remote_project(
                     delegate.clone(),
                     app_state.clone(),
                     paths.clone(),
+                    initial_workspace.downgrade(),
                     cx,
                 )
             })
             .await;
 
-        initial_workspace.update(cx, |workspace, cx| {
-            if let Some(ui) = workspace.active_modal::<RemoteConnectionModal>(cx) {
-                ui.update(cx, |modal, cx| modal.finished(cx))
-            }
-        });
-
         match opened {
             Err(e) => {
                 log::error!("Failed to open project: {e:#}");
-                let response = window
-                    .update(cx, |_, window, cx| {
-                        window.prompt(
-                            PromptLevel::Critical,
-                            match connection_options {
-                                RemoteConnectionOptions::Ssh(_) => "Failed to connect over SSH",
-                                RemoteConnectionOptions::Wsl(_) => "Failed to connect to WSL",
-                                RemoteConnectionOptions::Docker(_) => {
-                                    "Failed to connect to Dev Container"
-                                }
-                                #[cfg(any(test, feature = "test-support"))]
-                                RemoteConnectionOptions::Mock(_) => {
-                                    "Failed to connect to mock server"
-                                }
-                            },
-                            Some(&format!("{e:#}")),
-                            &["Retry", "Cancel"],
-                            cx,
-                        )
-                    })?
-                    .await;
-                if response == Ok(0) {
+                if retry_remote_connection(&initial_workspace, &e, cx).await {
                     continue;
                 }
 
                 if created_new_window {
                     window
-                        .update(cx, |_, window, _| window.remove_window())
+                        .update(cx, |multi_workspace, window, _| {
+                            if multi_workspace
+                                .workspaces()
+                                .all(|workspace| workspace == &initial_workspace)
+                            {
+                                window.remove_window();
+                            }
+                        })
                         .ok();
                 }
                 initial_workspace.update(cx, |workspace, cx| {
@@ -412,6 +400,11 @@ pub async fn open_remote_project(
             }
 
             Ok((_, items)) => {
+                initial_workspace.update(cx, |workspace, cx| {
+                    if let Some(ui) = workspace.active_modal::<RemoteConnectionModal>(cx) {
+                        ui.update(cx, |modal, cx| modal.finished(cx));
+                    }
+                });
                 navigate_to_positions(&window, items, &paths_with_positions, cx);
             }
         }
@@ -420,6 +413,21 @@ pub async fn open_remote_project(
     }
 
     Ok(window)
+}
+
+async fn retry_remote_connection(
+    workspace: &Entity<Workspace>,
+    error: &anyhow::Error,
+    cx: &mut AsyncApp,
+) -> bool {
+    let modal = workspace.read_with(cx, |workspace, cx| {
+        workspace.active_modal::<RemoteConnectionModal>(cx)
+    });
+    let Some(modal) = modal else { return false };
+    let retry = modal.update(cx, |modal, cx| modal.show_error(format!("{error:#}"), cx));
+    let retry = retry.await.is_ok();
+    modal.update(cx, |modal, cx| modal.finished(cx));
+    retry
 }
 
 pub fn navigate_to_positions(
@@ -817,6 +825,22 @@ mod tests {
         cx: &mut TestAppContext,
         server_cx: &mut TestAppContext,
     ) {
+        check_reconnect_when_server_not_running(cx, server_cx, false).await;
+    }
+
+    #[gpui::test]
+    async fn test_reconnect_preserves_other_workspace(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        check_reconnect_when_server_not_running(cx, server_cx, true).await;
+    }
+
+    async fn check_reconnect_when_server_not_running(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+        switch_workspace: bool,
+    ) {
         let app_state = init_test(cx);
         let executor = cx.executor();
 
@@ -924,21 +948,60 @@ mod tests {
             )
         });
 
-        drop(connect_guard_2);
+        let original_workspace = window
+            .update(cx, |multi_workspace, window, cx| {
+                window.dispatch_action(Box::new(menu::Cancel), cx);
+                multi_workspace.workspace().clone()
+            })
+            .expect("window exists");
+        executor.run_until_parked();
+        let reconnect = cx.spawn({
+            let app_state = app_state.clone();
+            let original_workspace = original_workspace.clone();
+            async move |mut cx| {
+                open_remote_project_in_workspace(
+                    opts,
+                    paths,
+                    app_state,
+                    workspace::OpenOptions {
+                        requesting_window: Some(window),
+                        ..Default::default()
+                    },
+                    Some(original_workspace),
+                    &mut cx,
+                )
+                .await
+            }
+        });
+        executor.run_until_parked();
+        assert!(original_workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_modal::<RemoteConnectionModal>(cx)
+                .is_some()
+        }));
 
-        // Simulate clicking "Reconnect": calls open_remote_project with
-        // replace_window pointing to the existing window.
-        let result = open_remote_project(
-            opts,
-            paths,
-            app_state,
-            workspace::OpenOptions {
-                requesting_window: Some(window),
-                ..Default::default()
-            },
-            &mut async_cx,
-        )
-        .await;
+        let other_workspace = if switch_workspace {
+            let project = project::Project::test(FakeFs::new(cx.executor()), [], cx).await;
+            Some(
+                window
+                    .update(cx, |multi_workspace, window, cx| {
+                        multi_workspace.open_sidebar(cx);
+                        let workspace =
+                            cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+                        multi_workspace.activate(workspace.clone(), None, window, cx);
+                        workspace
+                    })
+                    .expect("window exists"),
+            )
+        } else {
+            None
+        };
+        executor.run_until_parked();
+        let previous_focus = window
+            .update(cx, |_, window, cx| window.focused(cx))
+            .expect("window exists");
+        drop(connect_guard_2);
+        let result = reconnect.await;
 
         executor.run_until_parked();
 
@@ -952,14 +1015,24 @@ mod tests {
         assert_eq!(cx.update(|cx| cx.windows().len()), 1);
 
         window
-            .update(cx, |multi_workspace, _, cx| {
-                let workspace = multi_workspace.workspace().clone();
-                workspace.update(cx, |workspace, cx| {
+            .update(cx, |multi_workspace, window, cx| {
+                if let Some(other_workspace) = other_workspace {
+                    assert_eq!(multi_workspace.workspace(), &other_workspace);
+                    assert_eq!(window.focused(cx), previous_focus);
                     assert!(
-                        workspace.project().read(cx).is_remote(),
-                        "project should be remote after reconnect"
+                        other_workspace
+                            .read(cx)
+                            .active_modal::<RemoteConnectionModal>(cx)
+                            .is_none()
                     );
-                });
+                }
+                assert!(
+                    multi_workspace.workspaces().any(|workspace| {
+                        let project = workspace.read(cx).project().read(cx);
+                        project.is_remote() && !project.is_disconnected(cx)
+                    }),
+                    "a connected remote workspace should be available after reconnect"
+                );
             })
             .unwrap();
     }
@@ -971,5 +1044,140 @@ mod tests {
             editor::init(cx);
             state
         })
+    }
+
+    #[gpui::test]
+    async fn test_sidebar_connection_failure_waits_for_retry_or_cancel(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = project::Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let window = cx.add_window(|window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+            MultiWorkspace::new(workspace, window, cx)
+        });
+        let workspace = window
+            .update(cx, |multi_workspace, _, _| {
+                multi_workspace.workspace().clone()
+            })
+            .expect("window exists");
+        // No mock transport is registered, so every attempt fails before opening a session.
+        let connection = window
+            .update(cx, |_, window, cx| {
+                remote_connection::connect_with_modal(
+                    &workspace,
+                    RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: u64::MAX }),
+                    window,
+                    cx,
+                )
+            })
+            .expect("window exists");
+        let completed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let connection = cx.spawn({
+            let completed = completed.clone();
+            async move |_| {
+                let result = connection.await;
+                completed.set(true);
+                result
+            }
+        });
+        cx.run_until_parked();
+        assert!(
+            !completed.get(),
+            "failure must wait for the user's response"
+        );
+        let modal = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_modal::<RemoteConnectionModal>(cx)
+                .expect("failed connection should keep its dialog")
+        });
+        for _ in 0..2 {
+            window
+                .update(cx, |_, window, cx| {
+                    window.dispatch_action(Box::new(menu::Confirm), cx);
+                })
+                .expect("window exists");
+            cx.run_until_parked();
+            assert!(!completed.get(), "retry failure must remain visible");
+            assert_eq!(
+                workspace.read_with(cx, |workspace, cx| {
+                    workspace.active_modal::<RemoteConnectionModal>(cx)
+                }),
+                Some(modal.clone())
+            );
+        }
+        window
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(Box::new(menu::Cancel), cx);
+            })
+            .expect("window exists");
+        assert!(connection.await.expect("cancel is not an error").is_none());
+        cx.run_until_parked();
+        assert!(workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_modal::<RemoteConnectionModal>(cx)
+                .is_none()
+        }));
+    }
+
+    #[gpui::test]
+    async fn test_remote_connection_error_retry_and_cancel(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = project::Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let window = cx.add_window(|window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+            MultiWorkspace::new(workspace, window, cx)
+        });
+        let workspace = window
+            .update(cx, |multi_workspace, _, _| {
+                multi_workspace.workspace().clone()
+            })
+            .expect("window exists");
+
+        for retry in [true, false] {
+            window
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.toggle_modal(window, cx, |window, cx| {
+                            RemoteConnectionModal::new(
+                                &RemoteConnectionOptions::Ssh(SshConnectionOptions {
+                                    host: "example.com".into(),
+                                    ..Default::default()
+                                }),
+                                Vec::new(),
+                                window,
+                                cx,
+                            )
+                        });
+                    });
+                })
+                .expect("window exists");
+            let response = cx.spawn({
+                let workspace = workspace.clone();
+                async move |mut cx| {
+                    retry_remote_connection(
+                        &workspace,
+                        &anyhow::anyhow!("connection failed"),
+                        &mut cx,
+                    )
+                    .await
+                }
+            });
+            cx.run_until_parked();
+            window
+                .update(cx, |_, window, cx| {
+                    if retry {
+                        window.dispatch_action(Box::new(menu::Confirm), cx);
+                    } else {
+                        window.dispatch_action(Box::new(menu::Cancel), cx);
+                    }
+                })
+                .expect("window exists");
+            assert_eq!(response.await, retry);
+            cx.run_until_parked();
+            assert!(workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .active_modal::<RemoteConnectionModal>(cx)
+                    .is_none()
+            }));
+        }
     }
 }

@@ -1,6 +1,6 @@
 use gpui::{
     AnyView, App, DismissEvent, Entity, EventEmitter, FocusHandle, Global, ManagedView,
-    MouseButton, Subscription, WeakFocusHandle,
+    MouseButton, Subscription, WeakEntity, WeakFocusHandle,
 };
 use ui::prelude::*;
 
@@ -47,6 +47,11 @@ fn focus_handle_is_reopenable(focus_handle: &FocusHandle, cx: &App) -> bool {
 }
 
 pub trait ModalView: ManagedView {
+    /// Keeps navigation to other workspaces available while this modal is open.
+    fn scope_to_workspace(&self) -> bool {
+        false
+    }
+
     fn on_before_dismiss(
         &mut self,
         _window: &mut Window,
@@ -65,6 +70,7 @@ pub trait ModalView: ManagedView {
 }
 
 trait ModalViewHandle {
+    fn scope_to_workspace(&self, cx: &App) -> bool;
     fn on_before_dismiss(&mut self, window: &mut Window, cx: &mut App) -> DismissDecision;
     fn view(&self) -> AnyView;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
@@ -74,6 +80,10 @@ trait ModalViewHandle {
 }
 
 impl<V: ModalView> ModalViewHandle for Entity<V> {
+    fn scope_to_workspace(&self, cx: &App) -> bool {
+        self.read(cx).scope_to_workspace()
+    }
+
     fn on_before_dismiss(&mut self, window: &mut Window, cx: &mut App) -> DismissDecision {
         self.update(cx, |this, cx| this.on_before_dismiss(window, cx))
     }
@@ -109,6 +119,7 @@ pub struct ActiveModal {
 }
 
 pub struct ModalLayer {
+    workspace: Option<WeakEntity<crate::Workspace>>,
     active_modal: Option<ActiveModal>,
     // Kept alive (hidden) rather than dropped on dismissal so `ReopenLastPicker`
     // can reveal it again with its exact prior state. Left intact across
@@ -135,11 +146,31 @@ impl Default for ModalLayer {
 impl ModalLayer {
     pub fn new() -> Self {
         Self {
+            workspace: None,
             active_modal: None,
             stashed_modal: None,
             reveal_stash_when_free: false,
             dismiss_on_focus_lost: false,
         }
+    }
+
+    pub(crate) fn for_workspace(workspace: WeakEntity<crate::Workspace>) -> Self {
+        Self {
+            workspace: Some(workspace),
+            ..Self::new()
+        }
+    }
+
+    pub(crate) fn scope_to_workspace(&self, cx: &App) -> bool {
+        self.active_modal
+            .as_ref()
+            .is_some_and(|active| active.modal.scope_to_workspace(cx))
+    }
+
+    pub(crate) fn active_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
+        self.active_modal
+            .as_ref()
+            .map(|active| active.modal.focus_handle(cx))
     }
 
     /// Toggles a modal of type `V`. If a modal of the same type is currently active,
@@ -196,7 +227,18 @@ impl ModalLayer {
             previous_focus_handle,
             focus_handle,
         });
-        cx.defer_in(window, move |_, window, cx| {
+        cx.defer_in(window, move |this, window, cx| {
+            if let Some(workspace) = &this.workspace
+                && !workspace
+                    .read_with(cx, |workspace, _| workspace.owns_window_chrome())
+                    .unwrap_or(false)
+            {
+                if let Some(active_modal) = &mut this.active_modal {
+                    // The saved focus belongs to a different workspace.
+                    active_modal.previous_focus_handle = None;
+                }
+                return;
+            }
             window.focus(&modal_focus_handle, cx);
         });
         cx.notify();

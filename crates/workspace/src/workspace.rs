@@ -1957,7 +1957,7 @@ impl Workspace {
         });
 
         cx.emit(Event::WorkspaceCreated(weak_handle.clone()));
-        let modal_layer = cx.new(|_| ModalLayer::new());
+        let modal_layer = cx.new(|_| ModalLayer::for_workspace(weak_handle.clone()));
         let toast_layer = cx.new(|_| ToastLayer::new());
         cx.subscribe(
             &modal_layer,
@@ -7913,7 +7913,9 @@ impl Workspace {
 
                     if let Some(active_pane) = active_pane {
                         workspace.set_active_pane(&active_pane, window, cx);
-                        cx.focus_self(window);
+                        if workspace.owns_window_chrome() {
+                            cx.focus_self(window);
+                        }
                     } else {
                         workspace.set_active_pane(&workspace.center.first_pane(), window, cx);
                     }
@@ -9326,7 +9328,7 @@ fn open_items(
                                         workspace.open_path(
                                             file_project_path,
                                             None,
-                                            true,
+                                            workspace.owns_window_chrome(),
                                             window,
                                             cx,
                                         )
@@ -11363,6 +11365,7 @@ pub fn open_remote_project_with_new_connection(
     delegate: Arc<dyn RemoteClientDelegate>,
     app_state: Arc<AppState>,
     paths: Vec<PathBuf>,
+    requesting_workspace: WeakEntity<Workspace>,
     cx: &mut App,
 ) -> Task<Result<(Option<Entity<Workspace>>, Vec<Option<Box<dyn ItemHandle>>>)>> {
     cx.spawn(async move |cx| {
@@ -11408,6 +11411,7 @@ pub fn open_remote_project_with_new_connection(
             window,
             None,
             None,
+            Some(requesting_workspace),
             cx,
         )
         .await?;
@@ -11438,6 +11442,7 @@ pub fn open_remote_project_with_existing_connection(
             window,
             provisional_project_group_key,
             source_workspace,
+            None,
             cx,
         )
         .await
@@ -11453,6 +11458,7 @@ async fn open_remote_project_inner(
     window: WindowHandle<MultiWorkspace>,
     provisional_project_group_key: Option<ProjectGroupKey>,
     source_workspace: Option<WeakEntity<Workspace>>,
+    requesting_workspace: Option<WeakEntity<Workspace>>,
     cx: &mut AsyncApp,
 ) -> Result<(Entity<Workspace>, Vec<Option<Box<dyn ItemHandle>>>)> {
     let mut project_paths_to_open = vec![];
@@ -11479,6 +11485,7 @@ async fn open_remote_project_inner(
     }
 
     let workspace = window.update(cx, |multi_workspace, window, cx| {
+        let previous_focus = window.focused(cx);
         let new_workspace = cx.new(|cx| {
             let mut workspace = Workspace::new(
                 Some(workspace_id),
@@ -11496,7 +11503,15 @@ async fn open_remote_project_inner(
             workspace
         });
 
-        if let Some(project_group_key) = provisional_project_group_key.clone() {
+        let activate = requesting_workspace
+            .as_ref()
+            .is_none_or(|workspace| workspace == &multi_workspace.workspace().downgrade());
+        if !activate {
+            multi_workspace.add(new_workspace.clone(), window, cx);
+            if let Some(previous_focus) = previous_focus {
+                window.focus(&previous_focus, cx);
+            }
+        } else if let Some(project_group_key) = provisional_project_group_key.clone() {
             multi_workspace.activate_provisional_workspace(
                 new_workspace.clone(),
                 project_group_key,
@@ -11534,8 +11549,10 @@ async fn open_remote_project_inner(
 
     let items = window
         .update(cx, |_, window, cx| {
-            window.activate_window();
-            workspace.update(cx, |_workspace, cx| {
+            workspace.update(cx, |workspace, cx| {
+                if workspace.owns_window_chrome() {
+                    window.activate_window();
+                }
                 open_items(serialized_workspace, project_paths_to_open, window, cx)
             })
         })?

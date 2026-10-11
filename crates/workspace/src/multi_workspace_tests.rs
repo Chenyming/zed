@@ -5,7 +5,7 @@ use crate::item::test::TestItem;
 use agent_settings::AgentSettings;
 use client::proto;
 use fs::{FakeFs, Fs};
-use gpui::{TestAppContext, VisualTestContext};
+use gpui::{DismissEvent, Modifiers, TestAppContext, VisualTestContext};
 use project::DisableAiSettings;
 use serde_json::json;
 use settings::{Settings, SettingsStore};
@@ -44,6 +44,189 @@ fn setup_multi_workspace<'a>(
     cx.run_until_parked();
 
     (multi_workspace, cx)
+}
+
+struct ScopedTestModal {
+    focus_handle: FocusHandle,
+    scope_to_workspace: bool,
+}
+
+impl EventEmitter<DismissEvent> for ScopedTestModal {}
+
+impl Focusable for ScopedTestModal {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl ModalView for ScopedTestModal {
+    fn scope_to_workspace(&self) -> bool {
+        self.scope_to_workspace
+    }
+
+    fn on_before_dismiss(
+        &mut self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> crate::DismissDecision {
+        crate::DismissDecision::Dismiss(false)
+    }
+}
+
+impl Render for ScopedTestModal {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_20().track_focus(&self.focus_handle)
+    }
+}
+
+struct ModalTestSidebar {
+    focus_handle: FocusHandle,
+    side: SidebarSide,
+    clicks: usize,
+}
+
+impl EventEmitter<SidebarEvent> for ModalTestSidebar {}
+
+impl Focusable for ModalTestSidebar {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Sidebar for ModalTestSidebar {
+    fn width(&self, _: &App) -> Pixels {
+        px(200.)
+    }
+
+    fn set_width(&mut self, _: Option<Pixels>, _: &mut Context<Self>) {}
+
+    fn has_notifications(&self, _: &App) -> bool {
+        false
+    }
+
+    fn side(&self, _: &App) -> SidebarSide {
+        self.side
+    }
+}
+
+impl Render for ModalTestSidebar {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("modal-test-sidebar")
+            .debug_selector(|| "modal-test-sidebar".into())
+            .size_full()
+            .track_focus(&self.focus_handle)
+            .on_click(cx.listener(|this, _, _, _| this.clicks += 1))
+    }
+}
+
+#[gpui::test]
+async fn test_workspace_scoped_modal_keeps_sidebar_interactive(cx: &mut TestAppContext) {
+    init_test(cx);
+    let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+    let (multi_workspace, cx) = setup_multi_workspace(&[project], cx);
+    let sidebar = cx.new(|cx| ModalTestSidebar {
+        focus_handle: cx.focus_handle(),
+        side: SidebarSide::Left,
+        clicks: 0,
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(sidebar.clone(), cx);
+        cx.notify();
+    });
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.toggle_modal(window, cx, |_, cx| ScopedTestModal {
+            focus_handle: cx.focus_handle(),
+            scope_to_workspace: true,
+        });
+    });
+    for side in [SidebarSide::Left, SidebarSide::Right] {
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.side = side;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let position = cx
+            .debug_bounds("modal-test-sidebar")
+            .expect("sidebar is rendered")
+            .center();
+        let clicks = sidebar.read_with(cx, |sidebar, _| sidebar.clicks);
+        cx.simulate_click(position, Modifiers::none());
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.clicks),
+            clicks + 1
+        );
+    }
+
+    workspace.update_in(cx, |workspace, _, cx| {
+        workspace
+            .active_modal::<ScopedTestModal>(cx)
+            .expect("modal remains open")
+            .update(cx, |modal, cx| {
+                modal.scope_to_workspace = false;
+                cx.notify();
+            });
+        workspace.modal_layer.update(cx, |_, cx| cx.notify());
+    });
+    cx.run_until_parked();
+    let position = cx
+        .debug_bounds("modal-test-sidebar")
+        .expect("sidebar is rendered")
+        .center();
+    let clicks = sidebar.read_with(cx, |sidebar, _| sidebar.clicks);
+    cx.simulate_click(position, Modifiers::none());
+    assert_eq!(sidebar.read_with(cx, |sidebar, _| sidebar.clicks), clicks);
+}
+
+#[gpui::test]
+async fn test_background_workspace_modal_preserves_focus(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let first_project = Project::test(fs.clone(), [], cx).await;
+    let second_project = Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) = setup_multi_workspace(&[first_project, second_project], cx);
+    let (active_workspace, background_workspace) =
+        multi_workspace.read_with(cx, |multi_workspace, _| {
+            let active = multi_workspace.workspace().clone();
+            let background = multi_workspace
+                .workspaces()
+                .find(|workspace| *workspace != &active)
+                .expect("second workspace")
+                .clone();
+            (active, background)
+        });
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.focus_active_workspace(window, cx);
+    });
+    let previous_focus = cx.update(|window, cx| window.focused(cx));
+    background_workspace.update_in(cx, |workspace, window, cx| {
+        workspace.toggle_modal(window, cx, |_, cx| ScopedTestModal {
+            focus_handle: cx.focus_handle(),
+            scope_to_workspace: true,
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| assert_eq!(window.focused(cx), previous_focus));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        assert_eq!(multi_workspace.workspace(), &active_workspace);
+        multi_workspace.activate(background_workspace.clone(), None, window, cx);
+        let modal = background_workspace
+            .read(cx)
+            .active_modal::<ScopedTestModal>(cx)
+            .expect("background modal");
+        assert!(modal.focus_handle(cx).is_focused(window));
+    });
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.activate(active_workspace.clone(), None, window, cx);
+        assert!(
+            active_workspace
+                .read(cx)
+                .active_modal::<ScopedTestModal>(cx)
+                .is_none()
+        );
+    });
 }
 
 #[gpui::test]

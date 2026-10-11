@@ -539,7 +539,7 @@ struct SidebarContents {
     notified_threads: HashSet<agent_ui::ThreadId>,
     notified_terminals: HashSet<TerminalId>,
     project_header_indices: Vec<usize>,
-    has_open_projects: bool,
+    has_projects: bool,
 }
 
 /// Identity-and-layout key for a [`ListEntry`] used to preserve measured list items
@@ -761,6 +761,8 @@ fn connect_remote(
     window: &mut Window,
     cx: &mut Context<MultiWorkspace>,
 ) -> gpui::Task<anyhow::Result<Option<Entity<remote::RemoteClient>>>> {
+    let connection_options = remote::active_connection_options_for_host(&connection_options, cx)
+        .unwrap_or(connection_options);
     remote_connection::connect_with_modal(&modal_workspace, connection_options, window, cx)
 }
 
@@ -1435,9 +1437,13 @@ impl Sidebar {
         let mut seen_thread_ids: HashSet<agent_ui::ThreadId> = HashSet::new();
         let mut seen_terminal_ids: HashSet<TerminalId> = HashSet::new();
 
-        let has_open_projects = workspaces
-            .iter()
-            .any(|ws| !workspace_path_list(ws, cx).paths().is_empty());
+        let groups = mw.project_groups(cx);
+        // Closing the last live workspace does not remove retained project
+        // groups or their threads. Keep those rows reachable without reopening.
+        let has_projects = groups.iter().any(|group| !group.key.path_list().is_empty())
+            || workspaces
+                .iter()
+                .any(|ws| !workspace_path_list(ws, cx).paths().is_empty());
 
         let resolve_agent_icon = |agent_id: &AgentId| -> (IconName, Option<SharedString>) {
             let agent = Agent::from(agent_id.clone());
@@ -1453,7 +1459,6 @@ impl Sidebar {
             (icon, icon_from_external_svg)
         };
 
-        let groups = mw.project_groups(cx);
         let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
@@ -2050,7 +2055,7 @@ impl Sidebar {
             notified_threads,
             notified_terminals,
             project_header_indices,
-            has_open_projects,
+            has_projects,
         };
     }
 
@@ -7374,7 +7379,7 @@ impl Sidebar {
 
     fn render_sidebar_header(
         &self,
-        no_open_projects: bool,
+        no_projects: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -7408,7 +7413,7 @@ impl Sidebar {
             })
             .when(!right_window_controls, |this| this.pr_1p5())
             .gap_1()
-            .when(!no_open_projects, |this| {
+            .when(!no_projects, |this| {
                 this.border_b_1()
                     .border_color(cx.theme().colors().border)
                     .when(traffic_lights, |this| {
@@ -7946,7 +7951,7 @@ impl Render for Sidebar {
             .title_bar_background
             .blend(color.panel_background.opacity(0.25));
 
-        let no_open_projects = !self.contents.has_open_projects;
+        let no_projects = !self.contents.has_projects;
         let no_search_results = self.contents.entries.is_empty();
 
         v_flex()
@@ -8029,9 +8034,9 @@ impl Render for Sidebar {
             .border_color(color.border)
             .map(|this| match &self.view {
                 SidebarView::ThreadList => this
-                    .child(self.render_sidebar_header(no_open_projects, window, cx))
+                    .child(self.render_sidebar_header(no_projects, window, cx))
                     .map(|this| {
-                        if no_open_projects {
+                        if no_projects {
                             this.child(self.render_empty_state(cx))
                         } else {
                             this.child(

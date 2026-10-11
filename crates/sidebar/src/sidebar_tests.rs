@@ -1748,7 +1748,7 @@ async fn test_new_entry_noops_without_open_project(cx: &mut TestAppContext) {
     });
 
     assert!(
-        !sidebar.read_with(cx, |sidebar, _cx| sidebar.contents.has_open_projects),
+        !sidebar.read_with(cx, |sidebar, _cx| sidebar.contents.has_projects),
         "empty workspaces should be treated as having no open projects"
     );
 
@@ -1767,6 +1767,94 @@ async fn test_new_entry_noops_without_open_project(cx: &mut TestAppContext) {
         visible_entries_as_strings(&sidebar, cx),
         Vec::<String>::new()
     );
+}
+
+#[gpui::test]
+async fn test_deleting_thread_keeps_closed_project_threads_visible(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+    let project = project::Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    // Removing the last remote worktree workspace leaves an empty local
+    // workspace, but the retained project groups must remain navigable.
+    let connection = RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 99 });
+    let paths = PathList::new(&[PathBuf::from("/remote/project")]);
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.test_add_project_group(workspace::ProjectGroup {
+            key: ProjectGroupKey::new(Some(connection.clone()), paths.clone()),
+            workspaces: Vec::new(),
+            expanded: true,
+        });
+        cx.notify();
+    });
+    let deleted_thread = ThreadId::new();
+    let remaining_thread = ThreadId::new();
+    cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            for (thread_id, title) in [
+                (deleted_thread, "Deleted Thread"),
+                (remaining_thread, "Remaining Thread"),
+            ] {
+                store.save(
+                    ThreadMetadata {
+                        thread_id,
+                        session_id: Some(acp::SessionId::new(Arc::from(title))),
+                        agent_id: agent::ZED_AGENT_ID.clone(),
+                        title: Some(title.into()),
+                        title_override: None,
+                        updated_at: chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0)
+                            .unwrap(),
+                        created_at: None,
+                        interacted_at: None,
+                        worktree_paths: WorktreePaths::from_folder_paths(&paths),
+                        archived: false,
+                        remote_connection: Some(connection.clone()),
+                    },
+                    cx,
+                );
+            }
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            store.delete(deleted_thread, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(has_thread_entry(
+            sidebar,
+            &acp::SessionId::new(Arc::from("Remaining Thread"))
+        ));
+        assert!(!has_thread_entry(
+            sidebar,
+            &acp::SessionId::new(Arc::from("Deleted Thread"))
+        ));
+        assert!(
+            sidebar.contents.has_projects,
+            "retained threads must not be hidden by the open-project empty state"
+        );
+    });
+
+    type_in_search(&sidebar, "no-matching-thread", cx);
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(sidebar.contents.entries.is_empty());
+        assert!(
+            sidebar.contents.has_projects,
+            "an unmatched search should retain the filter instead of showing the open-project prompt"
+        );
+    });
+    type_in_search(&sidebar, "", cx);
+    assert!(sidebar.read_with(cx, |sidebar, _| has_thread_entry(
+        sidebar,
+        &acp::SessionId::new(Arc::from("Remaining Thread"))
+    )));
 }
 
 #[gpui::test]
