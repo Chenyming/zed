@@ -3,8 +3,8 @@ mod thread_switcher;
 use acp_thread::ThreadStatus;
 use action_log::DiffStats;
 use agent::{ThreadStore, ZED_AGENT_ID};
-use agent_client_protocol::schema::v1 as acp;
-use agent_settings::AgentSettings;
+use agent_client_protocol::schema::v2 as acp;
+use agent_settings::{AgentSettings, THREADS_LIST_MAX_WIDTH, THREADS_LIST_MIN_WIDTH};
 use agent_ui::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
@@ -39,6 +39,7 @@ use menu::{
     Cancel, Confirm, SelectChild, SelectFirst, SelectLast, SelectNext, SelectParent, SelectPrevious,
 };
 use notifications::status_toast::StatusToast;
+use platform_title_bar::apply_title_bar_insets;
 use project::{
     AgentId, AgentRegistryStore, Event as ProjectEvent, WorktreeId, repo_identity_path_if_local,
 };
@@ -47,7 +48,7 @@ use remote::{RemoteConnectionOptions, same_remote_connection_identity};
 use ui::utils::platform_title_bar_height;
 
 use serde::{Deserialize, Serialize};
-use settings::Settings as _;
+use settings::{Settings as _, SettingsStore};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::mem;
@@ -103,9 +104,6 @@ gpui::actions!(
     ]
 );
 
-const DEFAULT_WIDTH: Pixels = px(300.0);
-const MIN_WIDTH: Pixels = px(200.0);
-const MAX_WIDTH: Pixels = px(800.0);
 const MIN_PROJECT_LOCATION_WIDTH: Pixels = px(48.0);
 const MAX_PROJECT_LOCATION_WIDTH: Pixels = px(120.0);
 
@@ -127,6 +125,13 @@ enum NewEntryTarget {
 struct SerializedSidebar {
     #[serde(default)]
     width: Option<f32>,
+    /// Whether `width` came from the user dragging the divider.
+    ///
+    /// Legacy state recorded every width without this flag. A width other than
+    /// the old default of 300 pixels still identifies a manual resize. Only
+    /// that ambiguous default falls back to `agent.threads_sidebar.default_width`.
+    #[serde(default)]
+    width_set_by_user: bool,
     #[serde(default)]
     active_view: SerializedSidebarView,
 }
@@ -667,20 +672,24 @@ fn workspace_menu_worktree_labels(
     let root_paths = workspace.read(cx).root_paths(cx);
     let show_folder_name = root_paths.len() > 1;
     let project = workspace.read(cx).project().clone();
-    let repository_snapshots: Vec<_> = project
-        .read(cx)
-        .repositories(cx)
-        .values()
-        .map(|repo| repo.read(cx).snapshot())
-        .collect();
+    let (path_style, repository_snapshots) = {
+        let project = project.read(cx);
+        let path_style = project.path_style(cx);
+        let repository_snapshots = project
+            .repositories(cx)
+            .values()
+            .map(|repo| repo.read(cx).snapshot())
+            .collect::<Vec<_>>();
+        (path_style, repository_snapshots)
+    };
 
     root_paths
         .into_iter()
         .map(|root_path| {
             let root_path = root_path.as_ref();
-            let folder_name = root_path
-                .file_name()
-                .map(|name| SharedString::from(name.to_string_lossy().to_string()))
+            let folder_name = path_style
+                .file_name(root_path)
+                .map(|name| SharedString::from(name.to_string_lossy().into_owned()))
                 .unwrap_or_default();
             let repository_snapshot = repository_snapshots
                 .iter()
@@ -696,7 +705,11 @@ fn workspace_menu_worktree_labels(
                         .main_worktree_abs_path()
                         .or(identity_fallback)
                         .and_then(|name_anchor_path| {
-                            project::linked_worktree_short_name(name_anchor_path, root_path)
+                            project::linked_worktree_short_name(
+                                name_anchor_path,
+                                root_path,
+                                snapshot.path_style,
+                            )
                         })
                         .unwrap_or_else(|| folder_name.clone())
                 } else {
@@ -802,6 +815,11 @@ fn create_worktree_in_workspace(
 pub struct Sidebar {
     multi_workspace: WeakEntity<MultiWorkspace>,
     width: Pixels,
+    /// Whether `width` came from the user rather than from
+    /// `agent.threads_sidebar.default_width`. Only a user-chosen width is persisted, so
+    /// that changing the setting is not overridden by a width the user never
+    /// picked. Serialization runs on many triggers besides resizing.
+    width_set_by_user: bool,
     focus_handle: FocusHandle,
     filter_editor: Entity<Editor>,
     rename_editor: Entity<Editor>,
@@ -870,6 +888,18 @@ impl Sidebar {
             .detach();
 
         AgentThreadWorktreeLabelFlag::watch(cx);
+
+        let mut previous_default_width =
+            AgentSettings::get_global(cx).threads_sidebar.default_width;
+        cx.observe_global::<SettingsStore>(move |this, cx| {
+            let width = AgentSettings::get_global(cx).threads_sidebar.default_width;
+            if previous_default_width != width {
+                previous_default_width = width;
+                this.set_width(None, cx);
+                this.serialize(cx);
+            }
+        })
+        .detach();
 
         let filter_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
@@ -956,7 +986,8 @@ impl Sidebar {
 
         Self {
             multi_workspace: multi_workspace.downgrade(),
-            width: DEFAULT_WIDTH,
+            width: AgentSettings::get_global(cx).threads_sidebar.default_width,
+            width_set_by_user: false,
             focus_handle,
             filter_editor,
             rename_editor,
@@ -2354,8 +2385,16 @@ impl Sidebar {
         let key_for_toggle = key.clone();
         let key_for_focus = key.clone();
 
-        let opaque_window =
-            cx.theme().window_background_appearance() == WindowBackgroundAppearance::Opaque;
+        let color = cx.theme().colors();
+        let sidebar_base_bg = if is_sticky {
+            color.panel_background_for_overlay()
+        } else {
+            color.panel_background
+        };
+
+        let opaque_window = cx.theme().window_background_appearance()
+            == WindowBackgroundAppearance::Opaque
+            && sidebar_base_bg.a >= 1.0;
 
         // The fade gradient renders as a visible patch on transparent windows, so
         // truncate the label instead. Truncate as well when a remote location
@@ -2375,21 +2414,14 @@ impl Sidebar {
                 .into_any_element()
         };
 
-        let color = cx.theme().colors();
-        let sidebar_base_bg = color
-            .title_bar_background
-            .blend(color.panel_background.opacity(0.25));
-
         let base_bg = color.background.blend(sidebar_base_bg);
 
-        let hover_base = color
-            .element_active
-            .blend(color.element_background.opacity(0.2));
-        let hover_solid = base_bg.blend(hover_base);
+        let hover_solid = base_bg.blend(color.ghost_element_hover);
+        let active_solid = base_bg.blend(color.ghost_element_active);
 
         let group_name_for_gradient = group_name.clone();
         let gradient_overlay = move || {
-            GradientFade::new(base_bg, hover_solid, hover_solid)
+            GradientFade::new(base_bg, hover_solid, active_solid)
                 .width(px(92.0))
                 .right(px(-2.0))
                 .gradient_stop(0.7)
@@ -2409,14 +2441,18 @@ impl Sidebar {
             .pr_1p5()
             .justify_between()
             .border_1()
+            .border_r_2()
             .map(|this| {
                 if is_focused {
-                    this.border_color(color.border_focused)
+                    this.border_color(color.panel_focused_border)
                 } else {
                     this.border_color(gpui::transparent_black())
                 }
             })
-            .when(!has_filter, |this| this.hover(|s| s.bg(hover_solid)))
+            .when(!has_filter, |this| {
+                this.hover(|s| s.bg(color.ghost_element_hover))
+                    .group_active(&group_name, |s| s.bg(color.ghost_element_active))
+            })
             .child(
                 h_flex()
                     .relative()
@@ -2511,22 +2547,31 @@ impl Sidebar {
             .children(opaque_window.then(|| gradient_overlay()))
             .child(
                 h_flex()
-                    .gap_px()
-                    .pr_1p5()
                     .children(opaque_window.then(|| gradient_overlay()))
-                    .child(self.render_new_thread_button(ix, id_prefix, key, &group_name, cx))
-                    .child(self.render_project_header_ellipsis_menu(
-                        ix,
-                        id_prefix,
-                        key,
-                        is_active,
-                        has_threads,
-                        &group_name,
-                        cx,
-                    ))
-                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    }),
+                    .child(
+                        h_flex()
+                            .gap_px()
+                            .pr_1p5()
+                            .child(self.render_new_thread_button(
+                                ix,
+                                id_prefix,
+                                key,
+                                &group_name,
+                                cx,
+                            ))
+                            .child(self.render_project_header_ellipsis_menu(
+                                ix,
+                                id_prefix,
+                                key,
+                                is_active,
+                                has_threads,
+                                &group_name,
+                                cx,
+                            ))
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            }),
+                    ),
             )
             .on_mouse_down(gpui::MouseButton::Right, {
                 let menu_handle = self
@@ -2596,6 +2641,12 @@ impl Sidebar {
             SharedString::from(format!("{id_prefix}project-header-new-thread-{ix}")),
             IconName::Plus,
         )
+        .when(!is_menu_open && !self.has_filter_query(cx), |button| {
+            let color = cx.theme().colors();
+            button
+                .hover_background(color.element_background)
+                .active_background(color.element_active)
+        })
         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
         .icon_size(IconSize::Small)
         .when(!is_menu_open, |this| this.visible_on_hover(group_name));
@@ -2900,6 +2951,12 @@ impl Sidebar {
             .with_handle(menu_handle)
             .trigger(
                 IconButton::new(trigger_id, IconName::Ellipsis)
+                    .when(!is_menu_open && !self.has_filter_query(cx), |button| {
+                        let color = cx.theme().colors();
+                        button
+                            .hover_background(color.element_background)
+                            .active_background(color.element_active)
+                    })
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                     .icon_size(IconSize::Small)
                     .when(!is_menu_open, |el| el.visible_on_hover(group_name)),
@@ -3307,9 +3364,7 @@ impl Sidebar {
             .unwrap_or(px(0.));
 
         let color = cx.theme().colors();
-        let background = color
-            .title_bar_background
-            .blend(color.panel_background.opacity(0.2));
+        let background = color.panel_background_for_overlay();
 
         let element = v_flex()
             .absolute()
@@ -3889,9 +3944,7 @@ impl Sidebar {
             }
         }
 
-        let Some(configured_model) =
-            LanguageModelRegistry::read_global(cx).thread_summary_model(cx)
-        else {
+        let Some(model) = LanguageModelRegistry::read_global(cx).thread_summary_model(cx) else {
             if let Some(workspace) = self.active_workspace(cx) {
                 Self::show_no_thread_summary_model_toast(workspace, cx);
             }
@@ -3902,7 +3955,6 @@ impl Sidebar {
             return;
         }
 
-        let model = configured_model.model;
         let temperature = AgentSettings::temperature_for_model(&model, cx);
 
         let thread_store = ThreadStore::global(cx);
@@ -6301,9 +6353,9 @@ impl Sidebar {
         let id = SharedString::from(format!("thread-entry-{}", ix));
 
         let color = cx.theme().colors();
-        let sidebar_bg = color
-            .title_bar_background
-            .blend(color.panel_background.opacity(0.25));
+        let sidebar_bg = color.panel_background;
+        let button_hover_bg = color.element_background;
+        let button_active_bg = color.element_active;
 
         let timestamp: SharedString = if is_empty_draft {
             SharedString::default()
@@ -6367,6 +6419,8 @@ impl Sidebar {
             })
             .when(is_hovered && !is_renaming, |this| {
                 let rename_button = IconButton::new(("rename-thread", ix), IconName::Pencil)
+                    .hover_background(button_hover_bg)
+                    .active_background(button_active_bg)
                     .icon_size(IconSize::Small)
                     .tooltip({
                         let focus_handle = focus_handle.clone();
@@ -6409,6 +6463,8 @@ impl Sidebar {
                         Some(DraftKind::Empty) => None,
                         Some(DraftKind::WithContent) => Some(
                             IconButton::new("discard_thread", IconName::Close)
+                                .hover_background(button_hover_bg)
+                                .active_background(button_active_bg)
                                 .icon_size(IconSize::Small)
                                 .tooltip(Tooltip::text("Discard Draft"))
                                 .on_click({
@@ -6426,6 +6482,8 @@ impl Sidebar {
                         ),
                         None => Some(
                             IconButton::new("archive-thread", IconName::Archive)
+                                .hover_background(button_hover_bg)
+                                .active_background(button_active_bg)
                                 .icon_size(IconSize::Small)
                                 .tooltip({
                                     let focus_handle = focus_handle.clone();
@@ -6624,9 +6682,9 @@ impl Sidebar {
         let timestamp = format_history_entry_timestamp(terminal.metadata.created_at);
         let is_hovered = self.hovered_thread_index == Some(ix);
         let color = cx.theme().colors();
-        let sidebar_bg = color
-            .title_bar_background
-            .blend(color.panel_background.opacity(0.25));
+        let sidebar_bg = color.panel_background;
+        let button_hover_bg = color.element_background;
+        let button_active_bg = color.element_active;
         let metadata = terminal.metadata.clone();
         let workspace = terminal.workspace.clone();
         let focus_handle = self.focus_handle.clone();
@@ -6672,6 +6730,8 @@ impl Sidebar {
             .when(is_hovered && !is_renaming, |this| {
                 this.action_slot(
                     IconButton::new("close-terminal", IconName::Close)
+                        .hover_background(button_hover_bg)
+                        .active_background(button_active_bg)
                         .icon_size(IconSize::Small)
                         .icon_color(Color::Muted)
                         .tooltip({
@@ -6694,6 +6754,7 @@ impl Sidebar {
                 let metadata = terminal.metadata.clone();
                 let workspace = terminal.workspace.clone();
                 move |this, _, window, cx| {
+                    this.selection = None;
                     this.activate_terminal_entry(
                         metadata.clone(),
                         workspace.clone(),
@@ -7396,7 +7457,13 @@ impl Sidebar {
         h_flex()
             .h(header_height)
             .map(|header| match window.window_decorations() {
-                Decorations::Client { .. } => header.mt(px(-1.)),
+                // Without projects there's no bottom border to match the title bar's.
+                Decorations::Client { .. } => apply_title_bar_insets(
+                    header,
+                    left_window_controls,
+                    right_window_controls,
+                    no_open_projects,
+                ),
                 Decorations::Server => header.mt_px().pb_px(),
             })
             .when(left_window_controls, |this| {
@@ -7863,7 +7930,11 @@ impl WorkspaceSidebar for Sidebar {
     }
 
     fn set_width(&mut self, width: Option<Pixels>, cx: &mut Context<Self>) {
-        self.width = width.unwrap_or(DEFAULT_WIDTH).clamp(MIN_WIDTH, MAX_WIDTH);
+        // `None` is the reset gesture, which hands the width back to the setting.
+        self.width_set_by_user = width.is_some();
+        self.width = width
+            .unwrap_or_else(|| AgentSettings::get_global(cx).threads_sidebar.default_width)
+            .clamp(THREADS_LIST_MIN_WIDTH, THREADS_LIST_MAX_WIDTH);
         cx.notify();
     }
 
@@ -7903,7 +7974,8 @@ impl WorkspaceSidebar for Sidebar {
 
     fn serialized_state(&self, _cx: &App) -> Option<String> {
         let serialized = SerializedSidebar {
-            width: Some(f32::from(self.width)),
+            width: self.width_set_by_user.then(|| f32::from(self.width)),
+            width_set_by_user: self.width_set_by_user,
             active_view: match self.view {
                 SidebarView::ThreadList => SerializedSidebarView::ThreadList,
                 SidebarView::Archive(_) => SerializedSidebarView::History,
@@ -7919,8 +7991,13 @@ impl WorkspaceSidebar for Sidebar {
         cx: &mut Context<Self>,
     ) {
         if let Some(serialized) = serde_json::from_str::<SerializedSidebar>(state).log_err() {
-            if let Some(width) = serialized.width {
-                self.width = px(width).clamp(MIN_WIDTH, MAX_WIDTH);
+            // Legacy widths other than the old 300-pixel default imply a manual resize
+            if let Some(width) = serialized
+                .width
+                .filter(|width| serialized.width_set_by_user || *width != 300.0)
+            {
+                self.width = px(width).clamp(THREADS_LIST_MIN_WIDTH, THREADS_LIST_MAX_WIDTH);
+                self.width_set_by_user = true;
             }
             if serialized.active_view == SerializedSidebarView::History {
                 cx.defer_in(window, |this, window, cx| {
@@ -7947,9 +8024,7 @@ impl Render for Sidebar {
         let sticky_header = self.render_sticky_header(window, cx);
 
         let color = cx.theme().colors();
-        let bg = color
-            .title_bar_background
-            .blend(color.panel_background.opacity(0.25));
+        let bg = color.background.blend(color.panel_background);
 
         let no_projects = !self.contents.has_projects;
         let no_search_results = self.contents.entries.is_empty();
