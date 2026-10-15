@@ -14,6 +14,8 @@ use gpui::{AppContext as _, AsyncApp, Task};
 use rpc::proto::Envelope;
 use util::command::Child;
 
+#[cfg(any(test, debug_assertions, feature = "build-remote-server-binary"))]
+mod copied_server;
 pub mod docker;
 #[cfg(any(test, feature = "test-support"))]
 pub mod mock;

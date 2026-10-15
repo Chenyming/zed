@@ -8,6 +8,7 @@
 #   script/build-mac.sh open                完整流程,结束后打开产物所在目录
 #   script/build-mac.sh --channel stable    临时用 stable 渠道构建,结束后自动还原
 #   script/build-mac.sh --with-remote-server 同时编译 macOS remote_server
+#   script/build-mac.sh --with-copy-remote-server 启用客户端 ZED_COPY_REMOTE_SERVER 上传能力
 #
 # 渠道可选 dev / nightly / preview / stable,默认沿用 crates/zed/RELEASE_CHANNEL 当前的值。
 #
@@ -23,6 +24,7 @@ cd "$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 mode="full"
 requested_channel=""
 build_remote_server=false
+copy_remote_server=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -46,9 +48,13 @@ while [[ $# -gt 0 ]]; do
             build_remote_server=true
             shift
             ;;
+        --with-copy-remote-server)
+            copy_remote_server=true
+            shift
+            ;;
         *)
             echo "未知参数: $1" >&2
-            echo "可选:full / binaries / open,--channel dev|nightly|preview|stable,--with-remote-server" >&2
+            echo "可选:full / binaries / open,--channel dev|nightly|preview|stable,--with-remote-server,--with-copy-remote-server" >&2
             exit 2
             ;;
     esac
@@ -76,7 +82,14 @@ if [[ "$free_gb" -lt "$MIN_FREE_GB" ]]; then
 fi
 echo "可用空间 ${free_gb}G,目标三元组 ${TARGET_TRIPLE},渠道 ${channel}"
 
-if [[ -z "${ZED_REMOTE_SERVER_VERSION+x}" ]]; then
+if [[ "$copy_remote_server" == true ]]; then
+    if [[ -n "${ZED_REMOTE_SERVER_VERSION:-}" ]]; then
+        echo "--with-copy-remote-server 不能与非空 ZED_REMOTE_SERVER_VERSION 同时使用：版本覆盖会跳过本地上传。" >&2
+        exit 2
+    fi
+    ZED_REMOTE_SERVER_VERSION=""
+    echo "启用 ZED_COPY_REMOTE_SERVER 上传能力，禁用官方服务端版本覆盖和自动查询"
+elif [[ -z "${ZED_REMOTE_SERVER_VERSION+x}" ]]; then
     if ! command -v jq >/dev/null 2>&1; then
         echo "自动查询 remote-server 版本需要 jq;请安装 jq 或显式设置 ZED_REMOTE_SERVER_VERSION。" >&2
         exit 1
@@ -156,8 +169,12 @@ if [[ "$mode" == "binaries" ]]; then
     # --config .cargo/bundle-config.toml),否则 rustflags 不同会在同一个
     # 目录里生成第二套 fingerprint,完整打包时等于从头再编一遍。
     echo "编译 zed / cli"
-    cargo --config .cargo/bundle-config.toml build --release \
+    set -- --config .cargo/bundle-config.toml build --release \
         --package zed --package cli --target "$TARGET_TRIPLE"
+    if [[ "$copy_remote_server" == true ]]; then
+        set -- "$@" --features remote/build-remote-server-binary
+    fi
+    cargo "$@"
 
     if [[ "$build_remote_server" == true ]]; then
         # remote_server 单独一次调用,避免其他 crate 的 feature 统一影响它
@@ -179,6 +196,9 @@ fi
 set -- "$TARGET_TRIPLE"
 if [[ "$build_remote_server" == true ]]; then
     set -- -r "$@"
+fi
+if [[ "$copy_remote_server" == true ]]; then
+    set -- -c "$@"
 fi
 if [[ "$mode" == "open" ]]; then
     set -- -o "$@"

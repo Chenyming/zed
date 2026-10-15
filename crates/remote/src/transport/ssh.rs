@@ -1060,6 +1060,40 @@ impl SshRemoteConnection {
             )
             .await?
         {
+            let copied_digest = if !self.ssh_platform.os.is_windows()
+                && std::env::var("ZED_COPY_REMOTE_SERVER")
+                    .is_ok_and(|source| Path::new(&source) == remote_server_path)
+            {
+                delegate.set_status(Some("Checking copied remote server SHA-256"), cx);
+                let path = remote_server_path.clone();
+                let digest = cx
+                    .background_spawn(
+                        async move { super::copied_server::content_digest(&path).await },
+                    )
+                    .await?;
+                let force = super::copied_server::force_upload_from_environment()?;
+                if binary_exists_on_server && !force {
+                    let script = super::copied_server::cache_check_script(
+                        &dst_path.display(PathStyle::Unix),
+                        &digest,
+                    )?;
+                    let output = self
+                        .socket
+                        .run_command(self.ssh_shell_kind, "sh", &["-c", &script], false)
+                        .await
+                        .context("Checking installed copied remote server")?;
+                    if super::copied_server::cache_hit(&output)? {
+                        log::info!(
+                            "Reusing copied remote server at {}",
+                            dst_path.display(PathStyle::Unix)
+                        );
+                        return Ok(dst_path.into());
+                    }
+                }
+                Some(digest)
+            } else {
+                None
+            };
             let tmp_path = paths::remote_server_dir_relative().join(
                 RelPath::from_unix_str(&format!(
                     "download-{}-{}",
@@ -1070,8 +1104,21 @@ impl SshRemoteConnection {
             );
             self.upload_local_server_binary(&remote_server_path, &tmp_path, delegate, cx)
                 .await?;
-            self.extract_server_binary(&dst_path, &tmp_path, delegate, cx)
-                .await?;
+            if let Some(digest) = copied_digest {
+                delegate.set_status(Some("Verifying and installing copied remote server"), cx);
+                let script = super::copied_server::install_script(
+                    &dst_path.display(PathStyle::Unix),
+                    &tmp_path.display(PathStyle::Unix),
+                    &digest,
+                )?;
+                self.socket
+                    .run_command(self.ssh_shell_kind, "sh", &["-c", &script], false)
+                    .await
+                    .context("Verifying and installing copied remote server")?;
+            } else {
+                self.extract_server_binary(&dst_path, &tmp_path, delegate, cx)
+                    .await?;
+            }
             return Ok(dst_path.into());
         }
 

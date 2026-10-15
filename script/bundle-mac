@@ -7,6 +7,7 @@ build_flag="--release"
 zed_features=""
 remote_server_features=""
 build_remote_server=false
+copy_remote_server=false
 target_dir="release"
 open_result=false
 local_install=false
@@ -27,11 +28,12 @@ Options:
   -o    Open dir with the resulting DMG or launch the app itself in local mode.
   -i    Install the resulting DMG into /Applications.
   -r    Build and package the macOS remote server (disabled by default).
+  -c    Enable client uploads via ZED_COPY_REMOTE_SERVER (no server build).
   -h    Display this help and exit.
   "
 }
 
-while getopts 'dloihr' flag
+while getopts 'dloihrc' flag
 do
     case "${flag}" in
         o) open_result=true;;
@@ -44,6 +46,7 @@ do
             ;;
         i) local_install=true;;
         r) build_remote_server=true;;
+        c) copy_remote_server=true;;
         h)
            help_info
            exit 0
@@ -52,6 +55,15 @@ do
 done
 
 shift $((OPTIND-1))
+
+if [[ "$copy_remote_server" == true ]]; then
+    if [[ -n "${ZED_REMOTE_SERVER_VERSION:-}" ]]; then
+        echo "-c cannot be combined with a nonempty ZED_REMOTE_SERVER_VERSION; the override skips local uploads." >&2
+        exit 2
+    fi
+    export ZED_REMOTE_SERVER_VERSION=""
+    zed_features="${zed_features} --features remote/build-remote-server-binary"
+fi
 
 
 # Get release channel

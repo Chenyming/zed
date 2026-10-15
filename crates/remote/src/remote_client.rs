@@ -1461,7 +1461,12 @@ mod tests {
         let (mock_options, _server, connect_guard) = RemoteClient::fake_server(cx, server_cx);
         let connection_task = cx.update(|cx| {
             cx.update_default_global(|pool: &mut ConnectionPool, cx| {
-                pool.connect(mock_options.clone(), Arc::new(crate::MockDelegate), cx)
+                pool.connect(
+                    mock_options.clone(),
+                    None,
+                    Arc::new(crate::MockDelegate),
+                    cx,
+                )
             })
         });
         cx.run_until_parked();

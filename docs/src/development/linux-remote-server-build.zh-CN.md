@@ -69,6 +69,81 @@ target/<target-triple>/release/remote_server
 编译完成后仍需自行部署。远端文件名以客户端实际请求的通道和完整版本为准，
 不要将新产物伪装成旧的官方版本。
 
+## 从 macOS 客户端自动上传 {#upload-from-macos}
+
+可以把 Linux 产物复制到 Mac，由客户端自动上传、命名并设置远端文件的执行权限，
+无需手动命名或安装到远端。客户端默认 release 构建不包含此功能，需在 Mac 上
+重新构建并安装带上传能力的应用：
+
+```sh
+./script/build-mac.sh --channel stable --with-copy-remote-server
+```
+
+`--with-copy-remote-server` 启用 `remote/build-remote-server-binary` feature，
+自动禁用官方服务端版本查询和版本覆盖；与非空 `ZED_REMOTE_SERVER_VERSION`
+同时使用会报错。该参数只启用客户端能力，不编译 macOS 或 Linux 服务端。
+它与额外编译 macOS 服务端的 `--with-remote-server` 是两个独立选项。
+
+仅编译二进制时也可使用该参数，但不会更新已安装的 `.app`：
+
+```sh
+./script/build-mac.sh binaries --channel stable --with-copy-remote-server
+```
+
+直接使用底层打包脚本时，对应参数为 `./script/bundle-mac -c`。
+
+将 Linux 产物放到 Mac 上的固定路径，例如
+`/Volumes/code/zed/tmp/remote_server`。原始二进制和 `.gz` 都受支持，文件必须
+匹配远端 Linux 架构和客户端源码。彻底退出所有 Zed 进程后，在 Mac 上启动：
+
+```sh
+ZED_REMOTE_SERVER_VERSION= \
+ZED_COPY_REMOTE_SERVER=/Volumes/code/zed/tmp/remote_server \
+ZED_BUILD_REMOTE_SERVER=never \
+/Applications/Zed.app/Contents/MacOS/zed
+```
+
+随后正常连接 Linux。`ZED_COPY_REMOTE_SERVER` 是 Mac 上的文件路径，
+不是 Linux 上的安装路径；启动时指定即可，不需要在构建时提供。
+
+### 自动复用与更新 {#copy-cache}
+
+SSH 连接到 Linux 或 macOS 时，客户端按解压后的二进制内容计算 SHA-256。
+原始文件直接计算；`.gz` 流式解压后计算，不生成本地解压文件。
+仅改变 gzip 时间戳或压缩方式、不改变二进制内容时，不会重复上传。
+
+摘要缓存在当前 Zed 进程内，不写入本地缓存文件。未变化的同一个文件只计算一次，
+并发连接也复用计算结果；文件大小、修改时间或文件标识变化时重新计算。
+退出 Zed 后，进程内缓存消失，下次启动首次使用时重新计算。
+
+远端安装成功后，在二进制旁保存 `.copy-sha256` 记录，包含内容摘要和安装文件标识。
+后续连接中，远端程序可运行、摘要及文件标识一致时直接复用，可以始终保留
+`ZED_COPY_REMOTE_SERVER`。文件或记录缺失、内容变化或安装文件标识不符时重新上传。
+首次使用这项缓存功能时，原先已上传但没有记录的文件需要重新上传一次。
+
+上传后先校验解压后的 SHA-256，并确认二进制的 `version` 命令可运行，再替换
+远端文件和记录。摘要不符或程序无法运行时保留原来安装的文件。
+远端需要 `stat`、`sha256sum` 或 `shasum`；上传 `.gz` 时还需要 `gunzip`。
+原子替换二进制不会主动终止已经运行的服务端进程，需要时关闭旧会话后重新连接。
+
+需要强制重新上传时，在 Mac 启动命令中设置：
+
+```sh
+ZED_REMOTE_SERVER_VERSION= \
+ZED_COPY_REMOTE_SERVER=/Volumes/code/zed/tmp/remote_server \
+ZED_COPY_REMOTE_SERVER_FORCE=1 \
+ZED_BUILD_REMOTE_SERVER=never \
+/Applications/Zed.app/Contents/MacOS/zed
+```
+
+`ZED_COPY_REMOTE_SERVER_FORCE` 接受 `1` / `true` 或 `0` / `false`，默认不强制。
+它只强制上传，不要求未变化的本地文件重新计算摘要。
+Windows SSH、WSL 和容器连接暂时保留原有上传行为。
+
+> **Warn:** 该 feature 也包含从源码自动构建服务端的路径。启动时设置
+> `ZED_BUILD_REMOTE_SERVER=never`，防止未指定上传文件或文件路径无效时
+> 自动触发编译；路径无效时仍可能走已有服务端或官方下载流程。
+
 ## 远程 ACP 版本兼容 {#acp-compatibility}
 
 当前客户端启动远程 ACP 需要服务端支持 `exec`。官方 stable `1.23.2`
