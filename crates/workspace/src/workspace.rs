@@ -151,12 +151,7 @@ pub use toolbar::{
 pub use ui;
 use ui::{Window, prelude::*};
 use url::Url;
-use util::{
-    ResultExt, TryFutureExt,
-    paths::{PathStyle, SanitizedPath},
-    rel_path::RelPath,
-    serde::default_true,
-};
+use util::{ResultExt, TryFutureExt, paths::PathStyle, serde::default_true};
 use uuid::Uuid;
 pub use workspace_settings::{
     AccessibleMode, AutosaveSetting, BottomDockLayout, EncodingDisplayOptions, FocusFollowsMouse,
@@ -4023,6 +4018,7 @@ impl Workspace {
         abs_paths.sort_unstable();
         cx.spawn_in(window, async move |this, cx| {
             let mut tasks = Vec::with_capacity(abs_paths.len());
+            let mut opened_paths = HashMap::default();
 
             for abs_path in &abs_paths {
                 let visible = match options.visible.as_ref().unwrap_or(&OpenVisible::None) {
@@ -4057,27 +4053,47 @@ impl Workspace {
                     None => None,
                 };
 
+                let Some((worktree, project_path)) = project_path else {
+                    tasks.push(Task::ready(None));
+                    continue;
+                };
+                let (entry_is_directory, worktree_is_local) =
+                    worktree.read_with(cx, |worktree, _| {
+                        let entry = if project_path.path.is_empty() {
+                            worktree.root_entry()
+                        } else {
+                            worktree.entry_for_path(&project_path.path)
+                        };
+                        (entry.map(|entry| entry.is_dir()), worktree.is_local())
+                    });
+                let is_directory = match entry_is_directory {
+                    Some(is_directory) => is_directory,
+                    None if worktree_is_local => fs.is_dir(abs_path).await,
+                    None => {
+                        let resolved_path = this
+                            .update(cx, |workspace, cx| {
+                                workspace
+                                    .project
+                                    .read(cx)
+                                    .resolve_abs_path(&abs_path.to_string_lossy(), cx)
+                            })
+                            .log_err();
+                        match resolved_path {
+                            Some(task) => task.await.is_some_and(|path| path.is_dir()),
+                            None => false,
+                        }
+                    }
+                };
+                // The remote server may expand `~` or resolve symlinks, so revealing the
+                // opened path must reuse its worktree instead of looking up the input again.
+                opened_paths.insert(
+                    abs_path.clone(),
+                    (worktree, project_path.clone(), is_directory),
+                );
+
                 let this = this.clone();
-                let abs_path: Arc<Path> = SanitizedPath::new(&abs_path).as_path().into();
-                let fs = fs.clone();
                 let pane = pane.clone();
                 let task = cx.spawn(async move |cx| {
-                    let (worktree, project_path) = project_path?;
-                    let (entry_is_directory, worktree_is_local) =
-                        worktree.read_with(cx, |worktree, _| {
-                            let entry = if project_path.path.as_unix_str().is_empty() {
-                                worktree.root_entry()
-                            } else {
-                                worktree.entry_for_path(&project_path.path)
-                            };
-                            (entry.map(|entry| entry.is_dir()), worktree.is_local())
-                        });
-                    let is_directory = match entry_is_directory {
-                        Some(is_directory) => is_directory,
-                        None if worktree_is_local => fs.is_dir(&abs_path).await,
-                        None => false,
-                    };
-
                     if is_directory {
                         // Opening a directory should not race to update the active entry.
                         // We'll select/reveal a deterministic final entry after all paths finish opening.
@@ -4103,19 +4119,18 @@ impl Workspace {
 
             let results = futures::future::join_all(tasks).await;
 
-            // Determine the winner using the fake/abstract FS metadata, not `Path::is_dir`.
-            let mut winner: Option<(PathBuf, bool)> = None;
+            let mut winner = None;
             for abs_path in caller_ordered_abs_paths.into_iter().rev() {
-                if let Some(Some(metadata)) = fs.metadata(&abs_path).await.log_err() {
-                    if !metadata.is_dir {
-                        winner = Some((abs_path, false));
-                        break;
-                    }
-                    if winner.is_none() {
-                        winner = Some((abs_path, true));
-                    }
-                } else if winner.is_none() {
-                    winner = Some((abs_path, false));
+                let Some((worktree, project_path, is_directory)) = opened_paths.remove(&abs_path)
+                else {
+                    continue;
+                };
+                if !is_directory {
+                    winner = Some((worktree, project_path));
+                    break;
+                }
+                if winner.is_none() {
+                    winner = Some((worktree, project_path));
                 }
             }
 
@@ -4123,52 +4138,14 @@ impl Workspace {
             // paths finish opening. This avoids races between concurrently-opening paths
             // (directories in particular) and makes the resulting project panel selection
             // deterministic.
-            if let Some((winner_abs_path, winner_is_dir)) = winner {
+            if let Some((worktree, project_path)) = winner {
                 'emit_winner: {
-                    let winner_abs_path: Arc<Path> =
-                        SanitizedPath::new(&winner_abs_path).as_path().into();
-
-                    let visible = match options.visible.as_ref().unwrap_or(&OpenVisible::None) {
-                        OpenVisible::All => true,
-                        OpenVisible::None => false,
-                        OpenVisible::OnlyFiles => !winner_is_dir,
-                        OpenVisible::OnlyDirectories => winner_is_dir,
-                    };
-
-                    let Some(worktree_task) = this
-                        .update(cx, |workspace, cx| {
-                            workspace.project.update(cx, |project, cx| {
-                                project.find_or_create_worktree(
-                                    winner_abs_path.as_ref(),
-                                    visible,
-                                    cx,
-                                )
-                            })
-                        })
-                        .ok()
-                    else {
-                        break 'emit_winner;
-                    };
-
-                    let Ok((worktree, _)) = worktree_task.await else {
-                        break 'emit_winner;
-                    };
-
                     let Ok(Some(entry_id)) = this.update(cx, |_, cx| {
                         let worktree = worktree.read(cx);
-                        let worktree_abs_path = worktree.abs_path();
-                        let entry = if winner_abs_path.as_ref() == worktree_abs_path.as_ref() {
+                        let entry = if project_path.path.is_empty() {
                             worktree.root_entry()
                         } else {
-                            winner_abs_path
-                                .strip_prefix(worktree_abs_path.as_ref())
-                                .ok()
-                                .and_then(|relative_path| {
-                                    let relative_path =
-                                        RelPath::new(relative_path, PathStyle::local())
-                                            .log_err()?;
-                                    worktree.entry_for_path(&relative_path)
-                                })
+                            worktree.entry_for_path(&project_path.path)
                         }?;
                         Some(entry.id)
                     }) else {
@@ -12513,7 +12490,7 @@ mod tests {
     use serde_json::json;
     use settings::SettingsStore;
     use util::path;
-    use util::rel_path::rel_path;
+    use util::rel_path::{RelPath, rel_path};
 
     #[test]
     fn test_render_window_title_format_omits_empty_segments() {
@@ -19305,6 +19282,54 @@ mod tests {
             cx.set_global(db::AppDatabase::test_new());
             theme_settings::init(theme::LoadThemes::JustBase, cx);
         });
+    }
+
+    #[gpui::test]
+    async fn test_open_paths_selects_last_directory_in_caller_order(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "a": {}, "b": {} }))
+            .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let selected_entry = Rc::new(std::cell::Cell::new(None));
+        let _subscription = cx.update(|cx| {
+            let selected_entry = selected_entry.clone();
+            cx.subscribe(&project, move |_, event, _| {
+                if let project::Event::ActiveEntryChanged(entry) = event {
+                    selected_entry.set(*entry);
+                }
+            })
+        });
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        for (paths, expected_path) in [
+            ([path!("/root/b"), path!("/root/a")], rel_path("a")),
+            ([path!("/root/a"), path!("/root/b")], rel_path("b")),
+        ] {
+            let results = workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_paths(
+                        paths.into_iter().map(PathBuf::from).collect(),
+                        OpenOptions {
+                            visible: Some(OpenVisible::All),
+                            ..Default::default()
+                        },
+                        None,
+                        window,
+                        cx,
+                    )
+                })
+                .await;
+            assert!(results.iter().all(Option::is_none));
+            project.read_with(cx, |project, cx| {
+                assert_eq!(project.visible_worktrees(cx).count(), 1);
+                let selected_path = project
+                    .path_for_entry(selected_entry.get().expect("selected directory"), cx)
+                    .expect("selected directory path");
+                assert_eq!(selected_path.path.as_ref(), expected_path);
+            });
+        }
     }
 
     #[gpui::test]

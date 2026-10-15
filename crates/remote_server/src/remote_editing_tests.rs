@@ -3335,6 +3335,119 @@ async fn test_canceling_buffer_opening(cx: &mut TestAppContext, server_cx: &mut 
     });
 }
 
+#[cfg(not(windows))]
+#[gpui::test]
+async fn test_add_remote_folders_reuses_resolved_worktrees(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    let home_path = util::paths::home_dir();
+    fs.insert_tree(
+        home_path,
+        json!({
+            "remote-folder": { "README.md": "" },
+            "linked-folder": { "README.md": "" },
+        }),
+    )
+    .await;
+    fs.insert_symlink("/folder-alias", home_path.join("linked-folder"))
+        .await;
+
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    cx.update(|cx| {
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+    });
+    let active_entry = Rc::new(std::cell::Cell::new(None));
+    let _subscription = cx.update(|cx| {
+        let active_entry = active_entry.clone();
+        cx.subscribe(&project, move |_, event, _| {
+            if let project::Event::ActiveEntryChanged(entry) = event {
+                active_entry.set(*entry);
+            }
+        })
+    });
+    let (workspace, cx) = cx
+        .add_window_view(|window, cx| workspace::Workspace::test_new(project.clone(), window, cx));
+
+    for (index, (input_path, canonical_path)) in [
+        ("~/remote-folder", home_path.join("remote-folder")),
+        ("/folder-alias", home_path.join("linked-folder")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_prompt_for_open_path(Box::new(move |_, _, _, _| {
+                let (sender, receiver) = futures::channel::oneshot::channel();
+                assert!(sender.send(Some(vec![PathBuf::from(input_path)])).is_ok());
+                receiver
+            }));
+            workspace.add_folder_to_project(&workspace::AddFolderToProject, window, cx);
+        });
+        cx.run_until_parked();
+
+        project.read_with(cx, |project, cx| {
+            let worktrees = project.visible_worktrees(cx).collect::<Vec<_>>();
+            assert_eq!(worktrees.len(), index + 1);
+            let worktree = worktrees
+                .iter()
+                .find(|worktree| worktree.read(cx).abs_path().as_ref() == canonical_path)
+                .expect("added folder should use the canonical remote path")
+                .read(cx);
+            assert_eq!(
+                active_entry.get(),
+                Some(worktree.root_entry().expect("remote folder root").id)
+            );
+        });
+        headless.read_with(server_cx, |headless, cx| {
+            assert_eq!(
+                headless.worktree_store.read(cx).worktrees().count(),
+                index + 1
+            );
+        });
+    }
+
+    let results = workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_paths(
+                vec![
+                    home_path.join("remote-folder/README.md"),
+                    home_path.join("linked-folder"),
+                ],
+                workspace::OpenOptions {
+                    visible: Some(workspace::OpenVisible::All),
+                    ..Default::default()
+                },
+                None,
+                window,
+                cx,
+            )
+        })
+        .await;
+    for result in results.into_iter().flatten() {
+        result.expect("remote file should open");
+    }
+    cx.run_until_parked();
+    project.read_with(cx, |project, cx| {
+        assert_eq!(project.visible_worktrees(cx).count(), 2);
+        let (worktree, path) = project
+            .find_worktree(&home_path.join("remote-folder/README.md"), cx)
+            .expect("opened remote file worktree");
+        assert_eq!(
+            active_entry.get(),
+            Some(
+                worktree
+                    .read(cx)
+                    .entry_for_path(&path)
+                    .expect("opened remote file")
+                    .id
+            )
+        );
+    });
+}
+
 #[gpui::test]
 async fn test_adding_then_removing_then_adding_worktrees(
     cx: &mut TestAppContext,
