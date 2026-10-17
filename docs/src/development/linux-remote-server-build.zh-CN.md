@@ -36,6 +36,7 @@ Linux 上的源码必须与当前客户端一致，包括相关未提交修改�
 | `--channel CHANNEL` | 指定 `dev`、`nightly`、`preview` 或 `stable` | `stable`                                   |
 | `--target TRIPLE`   | 指定 Linux Rust 目标三元组                   | `TARGET_TRIPLE`，未设置时使用 `rustc` host |
 | `--jobs NUMBER`     | 指定正整数编译并发数                         | 沿用 Cargo 配置                            |
+| `--no-strip`        | 只编译，不生成去掉调试信息的产物和压缩包     | 生成                                       |
 | `--help`            | 显示帮助                                     | 不执行构建                                 |
 
 例如构建 musl 目标，或使用与客户端一致的 preview 通道：
@@ -50,11 +51,19 @@ Rust target、C/C++ 工具链和链接器，脚本不会自动安装这些依赖
 
 ## 产物与验证 {#artifacts}
 
-默认产物路径：
+release 配置保留了调试信息（`debug = "limited"`），直接编译出的二进制有数百 MB。
+脚本编译后与官方发布包一样，用 objcopy 去掉调试信息和局部符号，再用 gzip 压缩：
 
-```text
-target/<target-triple>/release/remote_server
-```
+| 文件                                                         | 用途                                   |
+| ------------------------------------------------------------ | -------------------------------------- |
+| `target/remote-server-dist/<target-triple>/remote_server`    | 去掉调试信息，用于上传和部署           |
+| `target/remote-server-dist/<target-triple>/remote_server.gz` | 上面文件的 gzip 压缩包，体积最小       |
+| `target/<target-triple>/release/remote_server`               | 未去掉调试信息，仅用于本地调试和符号化 |
+
+objcopy 依次查找 `llvm-objcopy`、`llvm-objcopy-<版本>`、Rust 工具链自带的
+`rust-objcopy` / `llvm-objcopy`，最后才使用 GNU `objcopy`。较旧发行版的 GNU objcopy
+不认识新版 LLVM 生成的 CREL 节，失败时请安装 llvm，或执行
+`rustup component add llvm-tools`。使用 `--no-strip` 时只生成最后一个文件。
 
 也可通过 `CARGO_TARGET_DIR` 指定输出文件夹。临时文件位于仓库的 `docs/tmp/`。
 
@@ -62,8 +71,8 @@ target/<target-triple>/release/remote_server
 以默认输出文件夹中的 x86_64 GNU 产物为例：
 
 ```sh
-./target/x86_64-unknown-linux-gnu/release/remote_server version
-./target/x86_64-unknown-linux-gnu/release/remote_server --help
+./target/remote-server-dist/x86_64-unknown-linux-gnu/remote_server version
+./target/remote-server-dist/x86_64-unknown-linux-gnu/remote_server --help
 ```
 
 编译完成后仍需自行部署。远端文件名以客户端实际请求的通道和完整版本为准，
@@ -110,7 +119,7 @@ target/<target-triple>/release/remote_server
 
 直接使用底层打包脚本时，对应参数为 `./script/bundle-mac -c`。
 
-将 Linux 产物放到 Mac 上的固定路径，例如
+将 Linux 产物（推荐 `remote_server.gz`）放到 Mac 上的固定路径，例如
 `/Volumes/code/zed/tmp/remote_server`。原始二进制和 `.gz` 都受支持，文件必须
 匹配远端 Linux 架构和客户端源码。彻底退出所有 Zed 进程后，在 Mac 上启动：
 

@@ -7,11 +7,13 @@ usage() {
 用法: ./script/build-linux-remote-server.sh [选项]
 
 在 Linux 上仅以 release 模式编译 remote_server，不构建客户端、CLI 或安装产物。
+编译后去掉调试信息并生成 gzip 压缩包，与官方发布包的处理方式一致。
 
 选项:
   --channel CHANNEL  dev / nightly / preview / stable，默认 stable
   --target TRIPLE    Linux Rust 目标三元组，默认 TARGET_TRIPLE 或 rustc host
   --jobs NUMBER      编译并发数，例如 --jobs 2；默认沿用 Cargo 配置
+  --no-strip         只编译，不生成去掉调试信息的产物和压缩包
   -h, --help         显示帮助
 
 支持 x86_64 / aarch64 的 GNU 和 musl 目标。
@@ -28,6 +30,7 @@ fail() {
 channel=stable
 target_triple="${TARGET_TRIPLE:-}"
 jobs=""
+strip_binary=true
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -39,6 +42,10 @@ while [[ $# -gt 0 ]]; do
                 --jobs) jobs="$2" ;;
             esac
             shift 2
+            ;;
+        --no-strip)
+            strip_binary=false
+            shift
             ;;
         -h|--help)
             usage
@@ -94,6 +101,56 @@ fi
 echo "仅编译 Linux remote_server：目标 ${target_triple}，通道 ${channel}"
 cargo "${build_arguments[@]}"
 
-echo "构建完成，产物: ${binary_path}"
+echo "构建完成，未去掉调试信息的产物: ${binary_path}"
 ls -lh "$binary_path"
+
+if [[ "$strip_binary" == false ]]; then
+    echo "请在目标 Linux 上执行该产物的 version 和 --help，确认版本及 exec 子命令。"
+    exit 0
+fi
+
+# 优先使用 llvm-objcopy：较旧发行版的 GNU objcopy 不认识新版 LLVM 生成的 CREL 节。
+find_objcopy() {
+    local candidate
+    for candidate in llvm-objcopy $(compgen -c llvm-objcopy- | sort -t- -k3 -rn | uniq); do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            command -v "$candidate"
+            return
+        fi
+    done
+    local host sysroot
+    host=$(rustc -vV | sed -n 's/^host: //p')
+    sysroot=$(rustc --print sysroot)
+    # rustc 自带 rust-objcopy（LLVM objcopy）；llvm-tools 组件提供 llvm-objcopy。
+    for candidate in rust-objcopy llvm-objcopy; do
+        candidate="${sysroot}/lib/rustlib/${host}/bin/${candidate}"
+        if [[ -x "$candidate" ]]; then
+            echo "$candidate"
+            return
+        fi
+    done
+    if command -v objcopy >/dev/null 2>&1; then
+        echo "未找到 llvm-objcopy，改用 GNU objcopy" >&2
+        command -v objcopy
+        return
+    fi
+    return 1
+}
+
+objcopy=$(find_objcopy) || fail "缺少 llvm-objcopy；请安装 llvm，或执行 rustup component add llvm-tools"
+command -v gzip >/dev/null 2>&1 || fail "缺少 gzip"
+
+output_dir="${target_dir}/remote-server-dist/${target_triple}"
+stripped_path="${output_dir}/remote_server"
+mkdir -p "$output_dir"
+rm -f "$stripped_path" "${stripped_path}.gz"
+
+"$objcopy" --strip-debug --discard-all "$binary_path" "$stripped_path" ||
+    fail "去掉调试信息失败；GNU objcopy 版本过旧时请安装 llvm-objcopy"
+gzip --best --no-name --stdout "$stripped_path" > "${stripped_path}.gz"
+
+echo "去掉调试信息的产物: ${stripped_path}"
+echo "压缩包: ${stripped_path}.gz"
+ls -lh "$stripped_path" "${stripped_path}.gz"
+echo "上传到 Mac 时可使用以上任一文件；未去掉调试信息的产物仅用于本地调试和符号化。"
 echo "请在目标 Linux 上执行该产物的 version 和 --help，确认版本及 exec 子命令。"
