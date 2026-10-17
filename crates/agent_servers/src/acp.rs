@@ -26,18 +26,34 @@ use agent_client_protocol::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
-use futures::{Future, channel::mpsc};
+use futures::{
+    Future,
+    channel::{mpsc, oneshot},
+};
 use gpui::{App, AsyncApp, Entity, SharedString, Subscription, Task, WeakEntity};
 use project::agent_server_store::{AgentServerCommand, AgentServerStore};
 use project::context_server_store::ContextServerConfiguration;
 use project::{AgentId, Project};
-use std::{cell::RefCell, path::PathBuf, process::ExitStatus, rc::Rc, sync::Arc};
+use serde::Deserialize;
+use std::{
+    cell::{Cell, RefCell},
+    path::PathBuf,
+    process::ExitStatus,
+    rc::Rc,
+    sync::Arc,
+};
 use task::SpawnInTerminal;
 use thiserror::Error;
 use util::ResultExt as _;
 use util::path_list::PathList;
 
 const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Marks agents hosted by acp-mux on a remote server, which keeps agents running
+/// while Zed is disconnected.
+const MUX_META_KEY: &str = "zed.dev/acpMux";
+/// Reports turns that acp-mux saw start on behalf of another Zed connection.
+const MUX_TURN_STATE_METHOD: &str = "_zed.dev/acpMux/turn_state";
 
 fn mcp_configurations_for_project(
     project: &Entity<Project>,
@@ -140,6 +156,8 @@ struct ClientContext {
     request_elicitations: Entity<ElicitationStore>,
     // Legacy and ingress-only contexts do not track caller ownership of outgoing RPCs.
     active_request_scopes: Option<RefCell<HashSet<acp_v2::RequestId>>>,
+    /// Set once the agent's `initialize` response identifies it as hosted by acp-mux.
+    mux_turn_state: Rc<Cell<bool>>,
 }
 
 fn dispatch_queue_closed_error() -> acp::Error {
@@ -178,6 +196,10 @@ impl ForegroundWorkItem for ClientDisconnectWork {
     fn run(self: Box<Self>, cx: &mut AsyncApp, context: &ClientContext) {
         if let Some(scopes) = &context.active_request_scopes {
             scopes.borrow_mut().clear();
+        }
+        // Dropping the senders ends mirrored turns with a connection error.
+        for session in context.sessions.borrow_mut().values_mut() {
+            session.external_turn.take();
         }
         let threads = context
             .sessions
@@ -349,6 +371,8 @@ pub struct AcpSession {
     session_modes: Option<Rc<RefCell<acp::SessionModeState>>>,
     config_options: Option<ConfigOptions>,
     default_config_task: Option<Task<()>>,
+    /// Completes the turn mirrored by `AcpThread::attach_external_turn`.
+    external_turn: Option<oneshot::Sender<Result<acp::PromptResponse>>>,
     _release_subscription: Subscription,
 }
 
@@ -795,4 +819,72 @@ fn handle_v2_complete_elicitation(
     ctx.request_elicitations.update(cx, |store, cx| {
         store.complete_url_elicitation(&elicitation_id, cx);
     })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MuxTurnState {
+    session_id: String,
+    state: MuxTurnStateKind,
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MuxTurnStateKind {
+    Running,
+    Idle,
+}
+
+fn mux_turn_state_notification(
+    message: &UntypedMessage,
+) -> Option<Result<MuxTurnState, agent_client_protocol::Error>> {
+    if message.method() != MUX_TURN_STATE_METHOD {
+        return None;
+    }
+    Some(
+        serde_json::from_value(message.params().clone()).map_err(|error| {
+            agent_client_protocol::Error::invalid_params().data(error.to_string())
+        }),
+    )
+}
+
+fn handle_mux_turn_state(notification: MuxTurnState, cx: &mut AsyncApp, context: &ClientContext) {
+    if !context.mux_turn_state.get() {
+        log::debug!("Ignoring acp-mux turn state from an agent that is not hosted by acp-mux");
+        return;
+    }
+    let session_id = acp_v2::SessionId::new(notification.session_id);
+    let mut sessions = context.sessions.borrow_mut();
+    let Some(session) = sessions.get_mut(&session_id) else {
+        log::warn!("Received acp-mux turn state for unknown session {session_id}");
+        return;
+    };
+    match notification.state {
+        MuxTurnStateKind::Running => {
+            let (sender, receiver) = oneshot::channel();
+            session.external_turn = Some(sender);
+            let thread = session.thread.clone();
+            drop(sessions);
+            thread
+                .update(cx, |thread, cx| thread.attach_external_turn(receiver, cx))
+                .log_err();
+        }
+        MuxTurnStateKind::Idle => {
+            let Some(sender) = session.external_turn.take() else {
+                return;
+            };
+            let stop_reason = notification
+                .stop_reason
+                .unwrap_or_else(|| "end_turn".into());
+            let response =
+                serde_json::from_value::<acp::StopReason>(serde_json::Value::String(stop_reason))
+                    .map(acp::PromptResponse::new)
+                    .map_err(|_| anyhow!("The agent's turn ended with an error"));
+            if sender.send(response).is_err() {
+                log::debug!("The mirrored turn for session {session_id} already ended");
+            }
+        }
+    }
 }

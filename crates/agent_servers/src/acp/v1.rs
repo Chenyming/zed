@@ -1,10 +1,11 @@
 use super::{
     AcpDebugLog, AcpDebugMessage, AcpSession, ClientContext, ConfigOptions, FlattenAcpResult as _,
-    ForegroundWork, UnsupportedVersion, drain_foreground_queue, enqueue_notification,
-    enqueue_request, first_class_terminal_auth_task, handle_v2_complete_elicitation,
-    handle_v2_create_elicitation, map_acp_error, mcp_configurations_for_project, respond_err,
-    respond_result, runtime, session_thread, terminal_auth_task_id, transport,
-    with_v2_client_ingress, work_dirs_from_session_info,
+    ForegroundWork, MUX_META_KEY, UnsupportedVersion, drain_foreground_queue, enqueue_notification,
+    enqueue_request, first_class_terminal_auth_task, handle_mux_turn_state,
+    handle_v2_complete_elicitation, handle_v2_create_elicitation, map_acp_error,
+    mcp_configurations_for_project, mux_turn_state_notification, respond_err, respond_result,
+    runtime, session_thread, terminal_auth_task_id, transport, with_v2_client_ingress,
+    work_dirs_from_session_info,
 };
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
@@ -17,7 +18,8 @@ use agent_client_protocol::schema::{
     v2 as acp_v2,
 };
 use agent_client_protocol::{
-    Agent, Builder, Client, ConnectionTo, HandleDispatchFrom, Lines, Responder, V2Builder,
+    Agent, Builder, Client, ConnectionTo, HandleDispatchFrom, Handled, Lines, Responder,
+    UntypedMessage, V2Builder,
 };
 use anyhow::anyhow;
 use async_channel;
@@ -34,7 +36,10 @@ use settings::{AgentConfigOptionValue, SettingsStore};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::{any::Any, cell::RefCell};
+use std::{
+    any::Any,
+    cell::{Cell, RefCell},
+};
 use task::SpawnInTerminal;
 use util::ResultExt as _;
 use util::path_list::PathList;
@@ -440,6 +445,35 @@ fn client_builder(
             on_notification!(handle_complete_elicitation),
             agent_client_protocol::on_receive_notification!(),
         )
+        .on_receive_notification(
+            {
+                let dispatch_sender = dispatch_sender.clone();
+                async move |message: UntypedMessage, connection: ConnectionTo<Agent>| {
+                    match mux_turn_state_notification(&message) {
+                        Some(notification) => {
+                            enqueue_notification(
+                                &dispatch_sender,
+                                notification?,
+                                handle_mux_turn_state,
+                            );
+                            Ok(Handled::Yes)
+                        }
+                        None => Ok(Handled::No {
+                            message: (message, connection),
+                            retry: false,
+                        }),
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+}
+
+fn is_hosted_by_mux(response: &acp::InitializeResponse) -> bool {
+    response
+        .meta
+        .as_ref()
+        .is_some_and(|meta| meta.contains_key(MUX_META_KEY))
 }
 
 fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities {
@@ -525,12 +559,14 @@ impl AcpConnection {
         let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
             Rc::new(RefCell::new(None));
         let request_elicitations = cx.new(|_| ElicitationStore::default());
+        let mux_turn_state = Rc::new(Cell::new(false));
 
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: None,
+            mux_turn_state: mux_turn_state.clone(),
         };
         let (mut runtime, shutdown) = runtime::ClientRuntime::new(dispatch_context, cx);
         let dispatch_tx = runtime.sender();
@@ -600,6 +636,7 @@ impl AcpConnection {
         if response.protocol_version < MINIMUM_SUPPORTED_VERSION {
             return Err(UnsupportedVersion.into());
         }
+        mux_turn_state.set(is_hosted_by_mux(&response));
 
         let wait_task = runtime::watch_process(
             status_fut,
@@ -778,6 +815,7 @@ impl AcpConnection {
                 session_modes,
                 config_options,
                 default_config_task,
+                external_turn: None,
                 _release_subscription: release_subscription,
             },
         );
@@ -2185,6 +2223,7 @@ pub mod test_support {
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: None,
+            mux_turn_state: Default::default(),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -7372,6 +7411,7 @@ exit 7
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: None,
+            mux_turn_state: Default::default(),
         };
         // `TestAppContext::spawn` hands out an `AsyncApp` by value, whereas the
         // production path uses `Context::spawn` which hands out `&mut AsyncApp`.
@@ -7754,6 +7794,7 @@ exit 7
             session_list: Rc::new(RefCell::new(None)),
             request_elicitations: store.clone(),
             active_request_scopes: None,
+            mux_turn_state: Default::default(),
         };
         let (dispatch_tx, mut dispatch_rx) = mpsc::unbounded::<ForegroundWork>();
         let dispatch_task = cx.spawn(move |mut cx| async move {
@@ -7876,6 +7917,7 @@ exit 7
             session_list: Rc::new(RefCell::new(None)),
             request_elicitations: cx.new(|_| ElicitationStore::default()),
             active_request_scopes: None,
+            mux_turn_state: Default::default(),
         };
         let (sender, mut receiver) = mpsc::unbounded::<ForegroundWork>();
         let cleanup = settle_after_disconnect(sender.clone()).boxed().shared();
@@ -9128,6 +9170,312 @@ exit 7
         cx.run_until_parked();
         cx.update(|_| ());
         cx.run_until_parked();
+    }
+
+    struct FakeMuxAgent {
+        connection: Rc<AcpConnection>,
+        project: Entity<project::Project>,
+        agent: ConnectionTo<Client>,
+        load_replay: Arc<Mutex<Vec<UntypedMessage>>>,
+        cancel_count: Arc<AtomicUsize>,
+        _keep_agent_alive: Task<anyhow::Result<()>>,
+    }
+
+    const MUX_SESSION_ID: &str = "mux-session";
+
+    impl FakeMuxAgent {
+        async fn connect(hosted_by_mux: bool, cx: &mut gpui::TestAppContext) -> Self {
+            init_settings_test(cx);
+            let fs = fs::FakeFs::new(cx.executor());
+            fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
+            let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+            let load_replay = Arc::new(Mutex::new(Vec::<UntypedMessage>::new()));
+            let cancel_count = Arc::new(AtomicUsize::new(0));
+
+            let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+            let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+            let agent_future = Agent
+                .builder()
+                .name("fake-mux-agent")
+                .on_receive_request(
+                    async move |request: acp::InitializeRequest, responder, _cx| {
+                        let mut response = acp::InitializeResponse::new(request.protocol_version)
+                            .agent_capabilities(acp::AgentCapabilities::default().load_session(true));
+                        if hosted_by_mux {
+                            response = response.meta(acp::Meta::from_iter([(
+                                MUX_META_KEY.to_string(),
+                                serde_json::json!({"protocol": 1}),
+                            )]));
+                        }
+                        responder.respond(response)
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    {
+                        let load_replay = load_replay.clone();
+                        // Like acp-mux, replay history and the turn state before responding.
+                        async move |_request: acp::LoadSessionRequest, responder, cx| {
+                            let replay = std::mem::take(
+                                &mut *load_replay.lock().expect("load replay lock poisoned"),
+                            );
+                            for message in replay {
+                                cx.send_notification(message)?;
+                            }
+                            responder.respond(acp::LoadSessionResponse::new())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_notification(
+                    {
+                        let cancel_count = cancel_count.clone();
+                        async move |_notification: acp::CancelNotification, _cx| {
+                            cancel_count.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_with(agent_transport, async move |agent| {
+                    assert!(agent_sender.send(agent).is_ok(), "send fake agent handle");
+                    futures::future::pending::<Result<(), agent_client_protocol::Error>>().await
+                });
+            let agent_io_task = cx.background_spawn(agent_future);
+
+            let (dispatch_tx, dispatch_rx) = mpsc::unbounded::<ForegroundWork>();
+            let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
+            let client_future = connect_client_future(
+                "zed-test",
+                client_transport,
+                dispatch_tx.clone(),
+                connection_tx,
+                futures::future::pending(),
+            );
+            let client_io_task = cx.background_spawn(async move {
+                client_future.await.ok();
+            });
+            let client_connection: ConnectionTo<Agent> = connection_rx
+                .await
+                .expect("failed to receive ACP connection handle");
+            let response = client_connection
+                .send_request(acp::InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await
+                .expect("failed to initialize ACP connection");
+
+            let sessions = Rc::new(RefCell::new(HashMap::default()));
+            let request_elicitations = cx.new(|_| ElicitationStore::default());
+            let dispatch_context = ClientContext {
+                sessions: sessions.clone(),
+                session_list: Rc::new(RefCell::new(None)),
+                request_elicitations: request_elicitations.clone(),
+                active_request_scopes: None,
+                mux_turn_state: Rc::new(Cell::new(is_hosted_by_mux(&response))),
+            };
+            let dispatch_task = cx.spawn(move |cx| async move {
+                let mut cx = cx;
+                let mut dispatch_rx = dispatch_rx;
+                while let Some(work) = dispatch_rx.next().await {
+                    work.run(&mut cx, &dispatch_context);
+                }
+            });
+            let agent_server_store =
+                project.read_with(cx, |project, _| project.agent_server_store().downgrade());
+            let connection = cx.update(|cx| {
+                AcpConnection::new_for_test(
+                    client_connection,
+                    sessions,
+                    response.agent_capabilities,
+                    request_elicitations,
+                    agent_server_store,
+                    client_io_task,
+                    dispatch_tx,
+                    dispatch_task,
+                    cx,
+                )
+            });
+            let agent = agent_receiver.await.expect("fake agent handle");
+
+            Self {
+                connection: Rc::new(connection),
+                project,
+                agent,
+                load_replay,
+                cancel_count,
+                _keep_agent_alive: cx.background_spawn(async move {
+                    agent_io_task.await.ok();
+                    anyhow::Ok(())
+                }),
+            }
+        }
+
+        async fn load(
+            &self,
+            replay: Vec<UntypedMessage>,
+            cx: &mut gpui::TestAppContext,
+        ) -> Entity<AcpThread> {
+            *self.load_replay.lock().expect("load replay lock poisoned") = replay;
+            let thread = cx
+                .update(|cx| {
+                    self.connection.clone().load_session(
+                        acp_v2::SessionId::new(MUX_SESSION_ID),
+                        self.project.clone(),
+                        PathList::new(&[std::path::Path::new("/a")]),
+                        None,
+                        cx,
+                    )
+                })
+                .await
+                .expect("load session");
+            cx.run_until_parked();
+            thread
+        }
+
+        fn send(&self, message: UntypedMessage, cx: &mut gpui::TestAppContext) {
+            self.agent
+                .send_notification(message)
+                .expect("send notification from the fake agent");
+            cx.run_until_parked();
+        }
+    }
+
+    fn mux_turn_state(state: &str, stop_reason: Option<&str>) -> UntypedMessage {
+        let mut params = serde_json::json!({"sessionId": MUX_SESSION_ID, "state": state});
+        if let Some(stop_reason) = stop_reason {
+            params["stopReason"] = stop_reason.into();
+        }
+        UntypedMessage::new(MUX_TURN_STATE_METHOD, params).expect("turn state message")
+    }
+
+    fn mux_user_message(text: &str) -> UntypedMessage {
+        acp::SessionNotification::new(
+            acp::SessionId::new(MUX_SESSION_ID),
+            acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
+                acp::TextContent::new(text.to_string()),
+            ))),
+        )
+        .to_untyped_message()
+        .expect("user message")
+    }
+
+    fn thread_status(
+        thread: &Entity<AcpThread>,
+        cx: &mut gpui::TestAppContext,
+    ) -> acp_thread::ThreadStatus {
+        thread.read_with(cx, |thread, _| thread.status())
+    }
+
+    #[gpui::test]
+    async fn mux_turn_state_mirrors_a_turn_started_elsewhere(cx: &mut gpui::TestAppContext) {
+        let agent = FakeMuxAgent::connect(true, cx).await;
+        let thread = agent
+            .load(
+                vec![mux_user_message("do it"), mux_turn_state("running", None)],
+                cx,
+            )
+            .await;
+        assert_eq!(
+            thread_status(&thread, cx),
+            acp_thread::ThreadStatus::Generating
+        );
+
+        let stop_reasons = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            let stop_reasons = stop_reasons.clone();
+            cx.subscribe(&thread, move |_, event, _| {
+                if let acp_thread::AcpThreadEvent::Stopped { stop_reason, .. } = event {
+                    stop_reasons.borrow_mut().push(stop_reason.clone());
+                }
+            })
+        });
+        agent.send(mux_turn_state("idle", Some("end_turn")), cx);
+
+        assert_eq!(thread_status(&thread, cx), acp_thread::ThreadStatus::Idle);
+        assert_eq!(
+            *stop_reasons.borrow(),
+            vec![Some(acp_v2::StopReason::EndTurn)]
+        );
+        assert!(!thread.read_with(cx, |thread, _| thread.had_error()));
+    }
+
+    #[gpui::test]
+    async fn cancelling_a_mirrored_turn_waits_for_the_agent(cx: &mut gpui::TestAppContext) {
+        let agent = FakeMuxAgent::connect(true, cx).await;
+        let thread = agent
+            .load(vec![mux_turn_state("running", None)], cx)
+            .await;
+
+        let mut cancel = thread.update(cx, |thread, cx| thread.cancel(cx));
+        cx.run_until_parked();
+        assert_eq!(agent.cancel_count.load(Ordering::SeqCst), 1);
+        assert!(
+            futures::FutureExt::now_or_never(&mut cancel).is_none(),
+            "cancellation completes only when the agent reports the turn ended"
+        );
+
+        agent.send(mux_turn_state("idle", Some("cancelled")), cx);
+        cancel.await.expect("cancellation completes");
+        assert_eq!(thread_status(&thread, cx), acp_thread::ThreadStatus::Idle);
+    }
+
+    #[gpui::test]
+    async fn losing_the_connection_ends_a_mirrored_turn_with_an_error(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let agent = FakeMuxAgent::connect(true, cx).await;
+        let thread = agent
+            .load(vec![mux_turn_state("running", None)], cx)
+            .await;
+
+        settle_after_disconnect(agent.connection.dispatch_tx.clone())
+            .await
+            .expect("disconnect cleanup");
+        cx.run_until_parked();
+
+        assert_eq!(thread_status(&thread, cx), acp_thread::ThreadStatus::Idle);
+        assert!(thread.read_with(cx, |thread, _| thread.had_error()));
+    }
+
+    #[gpui::test]
+    async fn permission_requests_after_a_mirrored_turn_starts_stay_pending(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let agent = FakeMuxAgent::connect(true, cx).await;
+        let thread = agent
+            .load(vec![mux_turn_state("running", None)], cx)
+            .await;
+
+        let _permission = agent.agent.send_request(acp::RequestPermissionRequest::new(
+            acp::SessionId::new(MUX_SESSION_ID),
+            acp::ToolCallUpdate::new(
+                acp::ToolCallId::new("tool"),
+                acp::ToolCallUpdateFields::default()
+                    .title("Edit a file")
+                    .status(acp::ToolCallStatus::Pending),
+            ),
+            vec![acp::PermissionOption::new(
+                "allow",
+                "Allow once",
+                acp::PermissionOptionKind::AllowOnce,
+            )],
+        ));
+        cx.run_until_parked();
+
+        assert!(thread.read_with(cx, |thread, _| thread.is_waiting_for_confirmation()));
+        assert_eq!(
+            thread_status(&thread, cx),
+            acp_thread::ThreadStatus::Generating
+        );
+    }
+
+    #[gpui::test]
+    async fn turn_state_is_ignored_for_agents_not_hosted_by_mux(cx: &mut gpui::TestAppContext) {
+        let agent = FakeMuxAgent::connect(false, cx).await;
+        let thread = agent
+            .load(vec![mux_turn_state("running", None)], cx)
+            .await;
+        assert_eq!(thread_status(&thread, cx), acp_thread::ThreadStatus::Idle);
     }
 }
 

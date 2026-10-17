@@ -57,7 +57,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         std::io::stderr()
             .write_all(if cfg!(unix) {
-                b"usage: remote <run|proxy|version|exec>\n"
+                b"usage: remote <run|proxy|version|exec|acp-mux>\n"
             } else {
                 b"usage: remote <run|proxy|version>\n"
             })

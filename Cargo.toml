@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/acp_mux",
     "crates/acp_thread",
     "crates/acp_tools",
     "crates/action_log",
@@ -281,6 +282,7 @@ edition = "2024"
 # Workspace member crates
 #
 
+acp_mux = { path = "crates/acp_mux" }
 acp_thread = { path = "crates/acp_thread" }
 acp_tools = { path = "crates/acp_tools" }
 action_log = { path = "crates/action_log" }

@@ -225,6 +225,7 @@ impl AcpV2Connection {
             session_list: Rc::new(RefCell::new(None)),
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: Some(RefCell::new(Default::default())),
+            mux_turn_state: Default::default(),
         };
         let (mut runtime, shutdown) = runtime::ClientRuntime::new(context, cx);
         let dispatch_tx = runtime.sender();
@@ -607,6 +608,7 @@ impl AcpV2Connection {
                 session_modes: None,
                 config_options: Some(ConfigOptions::new(Rc::new(RefCell::new(Vec::new())))),
                 default_config_task: None,
+                external_turn: None,
                 _release_subscription: release_subscription,
             },
         );

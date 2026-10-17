@@ -89,6 +89,9 @@ pub enum Commands {
     Version,
     #[cfg(unix)]
     Exec,
+    #[cfg(unix)]
+    #[command(subcommand)]
+    AcpMux(acp_mux::Command),
 }
 
 pub fn run(command: Commands) -> anyhow::Result<()> {
@@ -115,6 +118,8 @@ pub fn run(command: Commands) -> anyhow::Result<()> {
         } => execute_proxy(identifier, reconnect).context("running proxy on the remote server"),
         #[cfg(unix)]
         Commands::Exec => execute_command(),
+        #[cfg(unix)]
+        Commands::AcpMux(command) => acp_mux::run(command, &VERSION),
         Commands::Version => {
             let release_channel = *RELEASE_CHANNEL;
             match release_channel {

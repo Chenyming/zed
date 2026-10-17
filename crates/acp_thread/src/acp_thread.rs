@@ -6643,12 +6643,46 @@ impl AcpThread {
         cx: &mut Context<Self>,
         f: impl 'static + AsyncFnOnce(WeakEntity<Self>, &mut AsyncApp) -> Result<acp_v1::PromptResponse>,
     ) -> Submission {
-        let cancel_task = match self
-            .request_cancellation(RequestPermissionOutcome::InterruptedByFollowUp, cx)
-        {
-            Ok(task) => task,
-            Err(error) => return self.track_submission(id, None, cx, async move |_, _| Err(error)),
-        };
+        let turn = self.start_turn(None, cx, f);
+        self.track_submission(id, None, cx, async move |_, _| {
+            Ok(turn.await?.map(SubmissionResponse::LegacyCompleted))
+        })
+    }
+
+    /// Mirrors a turn that the agent started on behalf of another client
+    /// connection, so the thread shows it as running until `turn_end` resolves.
+    pub fn attach_external_turn(
+        &mut self,
+        turn_end: oneshot::Receiver<Result<acp_v1::PromptResponse>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.running_turn.is_some() || self.uses_reported_activity() {
+            return;
+        }
+        // The turn began before this connection attached, so its entries start at
+        // the last user message rather than at the end of the replayed history.
+        let first_entry_index = self.last_user_message().map(|(index, _)| index);
+        self.start_turn(first_entry_index, cx, async move |_, _| {
+            turn_end
+                .await
+                .map_err(|_| anyhow!("Lost connection to the agent while it was running"))?
+        })
+        .detach();
+    }
+
+    /// Starts a turn without registering a submission, so that retrying never
+    /// resends an empty prompt for a turn this thread did not start.
+    fn start_turn(
+        &mut self,
+        first_entry_index: Option<usize>,
+        cx: &mut Context<Self>,
+        f: impl 'static + AsyncFnOnce(WeakEntity<Self>, &mut AsyncApp) -> Result<acp_v1::PromptResponse>,
+    ) -> Task<Result<Option<acp_v1::PromptResponse>>> {
+        let cancel_task =
+            match self.request_cancellation(RequestPermissionOutcome::InterruptedByFollowUp, cx) {
+                Ok(task) => task,
+                Err(error) => return Task::ready(Err(error)),
+            };
         self.clear_completed_plan_entries(cx);
         self.had_error = false;
         self.local_execution_error = None;
@@ -6658,7 +6692,8 @@ impl AcpThread {
         self.turn_id += 1;
         let turn_id = self.turn_id;
         // A continuation can extend the trailing entry rather than create a new one.
-        let first_entry_index = self.entries.len().saturating_sub(1);
+        let first_entry_index =
+            first_entry_index.unwrap_or_else(|| self.entries.len().saturating_sub(1));
         self.running_turn = Some(RunningTurn {
             id: turn_id,
             first_entry_index,
@@ -6814,11 +6849,7 @@ impl AcpThread {
                 }
             })?
         };
-        self.track_submission(id, None, cx, async move |thread, cx| {
-            Ok(completion(thread, cx)
-                .await?
-                .map(SubmissionResponse::LegacyCompleted))
-        })
+        cx.spawn(async move |thread, cx| completion(thread, cx).await)
     }
 
     /// Receipt sessions wait for reported Idle without withdrawing pending prompt RPCs.

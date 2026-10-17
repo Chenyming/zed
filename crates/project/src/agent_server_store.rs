@@ -183,9 +183,15 @@ impl ExternalAgentEntry {
     }
 }
 
+/// Rewrites the command used to launch an external agent before it is sent to a
+/// downstream client, given the agent's name and its resolved command.
+pub type AgentCommandWrapper =
+    Arc<dyn Fn(&str, AgentServerCommand) -> AgentServerCommand + Send + Sync>;
+
 pub struct AgentServerStore {
     state: AgentServerStoreState,
     pub external_agents: HashMap<AgentId, ExternalAgentEntry>,
+    command_wrapper: Option<AgentCommandWrapper>,
 }
 
 pub struct AgentServersUpdated;
@@ -521,6 +527,7 @@ impl AgentServerStore {
                 _subscriptions: subscriptions,
             },
             external_agents: HashMap::default(),
+            command_wrapper: None,
         };
         this.agent_servers_settings_changed(cx);
         this
@@ -538,6 +545,7 @@ impl AgentServerStore {
                 worktree_store,
             },
             external_agents: HashMap::default(),
+            command_wrapper: None,
         }
     }
 
@@ -545,7 +553,12 @@ impl AgentServerStore {
         Self {
             state: AgentServerStoreState::Collab,
             external_agents: HashMap::default(),
+            command_wrapper: None,
         }
+    }
+
+    pub fn set_command_wrapper(&mut self, wrapper: Option<AgentCommandWrapper>) {
+        self.command_wrapper = wrapper;
     }
 
     pub fn shared(&mut self, project_id: u64, client: AnyProtoClient, cx: &mut Context<Self>) {
@@ -692,6 +705,10 @@ impl AgentServerStore {
                 anyhow::Ok(agent.get_command(vec![], extra_env, &mut cx.to_async()))
             })?
             .await?;
+        let command = match this.read_with(&cx, |this, _| this.command_wrapper.clone()) {
+            Some(wrapper) => wrapper(&envelope.payload.name, command),
+            None => command,
+        };
         Ok(proto::AgentServerCommand {
             path: command.path.to_string_lossy().into_owned(),
             args: command.args,

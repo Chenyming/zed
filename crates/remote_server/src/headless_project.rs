@@ -260,6 +260,10 @@ impl HeadlessProject {
                 cx,
             );
             agent_server_store.shared(REMOTE_SERVER_PROJECT_ID, session.clone(), cx);
+            #[cfg(unix)]
+            if let Some(wrapper) = acp_mux_command_wrapper() {
+                agent_server_store.set_command_wrapper(Some(wrapper));
+            }
             agent_server_store
         });
 
@@ -1534,4 +1538,38 @@ fn find_venv_python(working_directory: &str) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// Routes external agents through `acp-mux` when `acp_mux.json` enables it, so
+/// they keep running on this host after the client disconnects.
+#[cfg(unix)]
+fn acp_mux_command_wrapper() -> Option<project::agent_server_store::AgentCommandWrapper> {
+    use project::agent_server_store::AgentServerCommand;
+
+    let config = acp_mux::Config::load().log_err().flatten()?;
+    if !config.enabled {
+        return None;
+    }
+    log::info!("routing external agents through acp-mux");
+    Some(Arc::new(move |name: &str, command: AgentServerCommand| {
+        if !config.wraps_agent(name) {
+            return command;
+        }
+        let key_env = command
+            .env
+            .iter()
+            .flat_map(|env| env.keys().cloned())
+            .collect::<Vec<_>>();
+        match acp_mux::wrap_command(name, &command.path, &command.args, key_env) {
+            Ok((path, args)) => AgentServerCommand {
+                path,
+                args,
+                env: command.env,
+            },
+            Err(error) => {
+                log::error!("not routing agent {name} through acp-mux: {error:#}");
+                command
+            }
+        }
+    }))
 }
