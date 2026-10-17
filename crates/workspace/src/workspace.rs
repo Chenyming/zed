@@ -151,7 +151,7 @@ pub use toolbar::{
 pub use ui;
 use ui::{Window, prelude::*};
 use url::Url;
-use util::{ResultExt, TryFutureExt, paths::PathStyle, serde::default_true};
+use util::{ResultExt, TryFutureExt, paths::PathStyle, rel_path::RelPath, serde::default_true};
 use uuid::Uuid;
 pub use workspace_settings::{
     AccessibleMode, AutosaveSetting, BottomDockLayout, EncodingDisplayOptions, FocusFollowsMouse,
