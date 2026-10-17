@@ -14,7 +14,6 @@ use gpui::{AppContext as _, AsyncApp, Task};
 use rpc::proto::Envelope;
 use util::command::Child;
 
-#[cfg(any(test, debug_assertions, feature = "build-remote-server-binary"))]
 mod copied_server;
 pub mod docker;
 #[cfg(any(test, feature = "test-support"))]
@@ -260,6 +259,48 @@ fn handle_rpc_messages_over_child_process_stdio(
     })
 }
 
+struct LocalServerBinary {
+    path: std::path::PathBuf,
+    copied: bool,
+}
+
+async fn local_remote_server_binary(
+    copied_server_path: Option<std::path::PathBuf>,
+    platform: &crate::RemotePlatform,
+    delegate: &dyn crate::RemoteClientDelegate,
+    binary_exists_on_server: bool,
+    build_from_source: bool,
+    cx: &mut AsyncApp,
+) -> Result<Option<LocalServerBinary>> {
+    if let Some(path) = copied_server_path {
+        return Ok(Some(LocalServerBinary { path, copied: true }));
+    }
+    if build_from_source {
+        return Ok(build_remote_server_from_source(
+            platform,
+            delegate,
+            binary_exists_on_server,
+            cx,
+        )
+        .await?
+        .map(|path| LocalServerBinary {
+            path,
+            copied: false,
+        }));
+    }
+    Ok(None)
+}
+
+#[cfg(not(any(debug_assertions, feature = "build-remote-server-binary")))]
+async fn build_remote_server_from_source(
+    _platform: &crate::RemotePlatform,
+    _delegate: &dyn crate::RemoteClientDelegate,
+    _binary_exists_on_server: bool,
+    _cx: &mut AsyncApp,
+) -> Result<Option<std::path::PathBuf>> {
+    Ok(None)
+}
+
 #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
 async fn build_remote_server_from_source(
     platform: &crate::RemotePlatform,
@@ -269,18 +310,6 @@ async fn build_remote_server_from_source(
 ) -> Result<Option<std::path::PathBuf>> {
     use std::env::VarError;
     use util::command::{Command, Stdio, new_command};
-
-    if let Ok(path) = std::env::var("ZED_COPY_REMOTE_SERVER") {
-        let path = std::path::PathBuf::from(path);
-        if path.exists() {
-            return Ok(Some(path));
-        } else {
-            log::warn!(
-                "ZED_COPY_REMOTE_SERVER path does not exist, falling back to ZED_BUILD_REMOTE_SERVER: {}",
-                path.display()
-            );
-        }
-    }
 
     // By default, we make building remote server from source opt-out and we do not force artifact compression
     // for quicker builds.

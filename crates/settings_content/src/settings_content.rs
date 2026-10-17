@@ -1397,6 +1397,12 @@ pub enum ImageFileSizeUnit {
 #[with_fallible_options]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
 pub struct RemoteSettingsContent {
+    /// Local remote server binary (or archive) to upload when connecting.
+    /// Takes precedence over ZED_COPY_REMOTE_SERVER and automatic server installation.
+    /// Errors stop the connection and are shown to the user without falling back.
+    ///
+    /// Default: null
+    pub copy_remote_server: Option<String>,
     pub ssh_connections: Option<Vec<SshConnection>>,
     pub wsl_connections: Option<Vec<WslConnection>>,
     pub dev_container_connections: Option<Vec<DevContainerConnection>>,

@@ -49,7 +49,14 @@ pub(crate) struct RemoteServerRelease {
 }
 
 impl RemoteServerRelease {
-    pub fn for_client(channel: ReleaseChannel, version: Version) -> Result<Self> {
+    pub fn for_client(
+        channel: ReleaseChannel,
+        version: Version,
+        copy_remote_server: bool,
+    ) -> Result<Self> {
+        if copy_remote_server {
+            return Ok(Self::resolve(channel, version, None));
+        }
         let version_override = VERSION_OVERRIDE
             .as_ref()
             .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -111,6 +118,17 @@ impl RemoteServerRelease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copied_server_uses_client_release() -> Result<()> {
+        let version = Version::new(1, 30, 0);
+        let release =
+            RemoteServerRelease::for_client(ReleaseChannel::Preview, version.clone(), true)?;
+        assert_eq!(release.channel, ReleaseChannel::Preview);
+        assert_eq!(release.version, version);
+        assert!(!release.overridden);
+        Ok(())
+    }
 
     #[test]
     fn version_override_precedence_and_validation() {

@@ -1018,8 +1018,12 @@ impl SshRemoteConnection {
         version: Version,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
-        let release =
-            crate::server_release::RemoteServerRelease::for_client(release_channel, version)?;
+        let copied_server_path = super::copied_server::configured_path(cx).await?;
+        let release = crate::server_release::RemoteServerRelease::for_client(
+            release_channel,
+            version,
+            copied_server_path.is_some(),
+        )?;
         let release_channel = release.channel;
         let version = release.version.clone();
         let version_str = match release_channel {
@@ -1050,19 +1054,18 @@ impl SshRemoteConnection {
             .await
             .is_ok_and(|output| release.accepts_version_output(&output));
 
-        #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
-        if !release.overridden
-            && let Some(remote_server_path) = super::build_remote_server_from_source(
-                &self.ssh_platform,
-                delegate.as_ref(),
-                binary_exists_on_server,
-                cx,
-            )
-            .await?
+        if let Some(local_server_binary) = super::local_remote_server_binary(
+            copied_server_path,
+            &self.ssh_platform,
+            delegate.as_ref(),
+            binary_exists_on_server,
+            !release.overridden,
+            cx,
+        )
+        .await?
         {
-            let copied_digest = if !self.ssh_platform.os.is_windows()
-                && std::env::var("ZED_COPY_REMOTE_SERVER")
-                    .is_ok_and(|source| Path::new(&source) == remote_server_path)
+            let remote_server_path = local_server_binary.path;
+            let copied_digest = if local_server_binary.copied && !self.ssh_platform.os.is_windows()
             {
                 delegate.set_status(Some("Checking copied remote server SHA-256"), cx);
                 let path = remote_server_path.clone();
@@ -1098,12 +1101,21 @@ impl SshRemoteConnection {
                 RelPath::from_unix_str(&format!(
                     "download-{}-{}",
                     std::process::id(),
-                    remote_server_path.file_name().unwrap().to_string_lossy()
+                    remote_server_path
+                        .file_name()
+                        .context("Local remote server path has no file name")?
+                        .to_string_lossy()
                 ))
                 .unwrap(),
             );
             self.upload_local_server_binary(&remote_server_path, &tmp_path, delegate, cx)
-                .await?;
+                .await
+                .with_context(|| {
+                    format!(
+                        "Uploading local remote server from {}",
+                        remote_server_path.display()
+                    )
+                })?;
             if let Some(digest) = copied_digest {
                 delegate.set_status(Some("Verifying and installing copied remote server"), cx);
                 let script = super::copied_server::install_script(

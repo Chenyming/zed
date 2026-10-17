@@ -72,8 +72,26 @@ target/<target-triple>/release/remote_server
 ## 从 macOS 客户端自动上传 {#upload-from-macos}
 
 可以把 Linux 产物复制到 Mac，由客户端自动上传、命名并设置远端文件的执行权限，
-无需手动命名或安装到远端。客户端默认 release 构建不包含此功能，需在 Mac 上
-重新构建并安装带上传能力的应用：
+无需手动命名或安装到远端。在本地用户 `settings.json` 中配置：
+
+```json [settings]
+{
+  "copy_remote_server": "/Volumes/code/zed/tmp/remote_server"
+}
+```
+
+这是 Mac 上的文件路径，支持 `~/`，不是 Linux 上的安装路径。
+原始二进制和 `.gz` 都受支持，文件必须匹配远端 Linux 架构和客户端源码。
+该设置在默认 release 构建中也可用，无需启用额外 feature。
+保存后在下一次新建远程连接时生效；已有连接需要先关闭后重新连接。
+
+`copy_remote_server` 优先于 `ZED_COPY_REMOTE_SERVER` 和
+`ZED_REMOTE_SERVER_VERSION`，使用客户端自身的通道和版本命名远端文件。
+路径不存在、指向文件夹、文件无法读取、上传失败或校验失败时，连接会停止，
+并在连接错误界面显示原因，不会回退到源码编译、已有服务端或官方下载。
+删除该设置或设为 `null` 后，仍可使用原来的 `ZED_COPY_REMOTE_SERVER` 环境变量。
+
+如果还需要从源码自动构建服务端，可在 Mac 上启用原有构建选项：
 
 ```sh
 ./script/build-mac.sh --channel stable --with-copy-remote-server
@@ -103,8 +121,8 @@ ZED_BUILD_REMOTE_SERVER=never \
 /Applications/Zed.app/Contents/MacOS/zed
 ```
 
-随后正常连接 Linux。`ZED_COPY_REMOTE_SERVER` 是 Mac 上的文件路径，
-不是 Linux 上的安装路径；启动时指定即可，不需要在构建时提供。
+随后正常连接 Linux。环境变量同样只需在启动时指定，不需要在构建时提供；
+配置了 `copy_remote_server` 时使用配置文件中的路径。
 
 ### 自动复用与更新 {#copy-cache}
 
@@ -118,7 +136,7 @@ SSH 连接到 Linux 或 macOS 时，客户端按解压后的二进制内容计�
 
 远端安装成功后，在二进制旁保存 `.copy-sha256` 记录，包含内容摘要和安装文件标识。
 后续连接中，远端程序可运行、摘要及文件标识一致时直接复用，可以始终保留
-`ZED_COPY_REMOTE_SERVER`。文件或记录缺失、内容变化或安装文件标识不符时重新上传。
+`copy_remote_server`。文件或记录缺失、内容变化或安装文件标识不符时重新上传。
 首次使用这项缓存功能时，原先已上传但没有记录的文件需要重新上传一次。
 
 上传后先校验解压后的 SHA-256，并确认二进制的 `version` 命令可运行，再替换
@@ -140,9 +158,9 @@ ZED_BUILD_REMOTE_SERVER=never \
 它只强制上传，不要求未变化的本地文件重新计算摘要。
 Windows SSH、WSL 和容器连接暂时保留原有上传行为。
 
-> **Warn:** 该 feature 也包含从源码自动构建服务端的路径。启动时设置
-> `ZED_BUILD_REMOTE_SERVER=never`，防止未指定上传文件或文件路径无效时
-> 自动触发编译；路径无效时仍可能走已有服务端或官方下载流程。
+> **Warn:** 该 feature 也包含从源码自动构建服务端的路径。未配置上传文件时，
+> 可通过 `ZED_BUILD_REMOTE_SERVER=never` 禁用自动编译。
+> 已配置的上传文件无效时直接报错，不会触发自动编译。
 
 ## 远程 ACP 版本兼容 {#acp-compatibility}
 

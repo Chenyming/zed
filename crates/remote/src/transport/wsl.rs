@@ -219,8 +219,12 @@ impl WslRemoteConnection {
         version: Version,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
-        let release =
-            crate::server_release::RemoteServerRelease::for_client(release_channel, version)?;
+        let copied_server_path = super::copied_server::configured_path(cx).await?;
+        let release = crate::server_release::RemoteServerRelease::for_client(
+            release_channel,
+            version,
+            copied_server_path.is_some(),
+        )?;
         let release_channel = release.channel;
         let version = release.version.clone();
         let version_str = match release_channel {
@@ -250,26 +254,36 @@ impl WslRemoteConnection {
             .await
             .is_ok_and(|output| release.accepts_version_output(&output));
 
-        #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
-        if !release.overridden
-            && let Some(remote_server_path) = super::build_remote_server_from_source(
-                &self.platform,
-                delegate.as_ref(),
-                binary_exists_on_server,
-                cx,
-            )
-            .await?
+        if let Some(local_server_binary) = super::local_remote_server_binary(
+            copied_server_path,
+            &self.platform,
+            delegate.as_ref(),
+            binary_exists_on_server,
+            !release.overridden,
+            cx,
+        )
+        .await?
         {
+            let remote_server_path = local_server_binary.path;
             let tmp_path = paths::remote_server_dir_relative().join(
                 &RelPath::from_unix_str(&format!(
                     "download-{}-{}",
                     std::process::id(),
-                    remote_server_path.file_name().unwrap().to_string_lossy()
+                    remote_server_path
+                        .file_name()
+                        .context("Local remote server path has no file name")?
+                        .to_string_lossy()
                 ))
                 .unwrap(),
             );
             self.upload_file(&remote_server_path, &tmp_path, delegate, cx)
-                .await?;
+                .await
+                .with_context(|| {
+                    format!(
+                        "Uploading local remote server from {}",
+                        remote_server_path.display()
+                    )
+                })?;
             self.extract_and_install(&tmp_path, &dst_path, delegate, cx)
                 .await?;
             return Ok(dst_path.into());

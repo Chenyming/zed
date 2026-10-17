@@ -2,8 +2,11 @@ use anyhow::{Context as _, Result};
 use async_compression::futures::bufread::GzipDecoder;
 use collections::HashMap;
 use futures::{AsyncRead, AsyncReadExt as _, io::BufReader, lock::Mutex};
+use gpui::AsyncApp;
+use settings::{RegisterSetting, Settings};
 use sha2::{Digest as _, Sha256};
 use std::{
+    ffi::OsString,
     fs::Metadata,
     path::{Path, PathBuf},
     sync::LazyLock,
@@ -12,6 +15,55 @@ use std::{
 use util::shell::ShellKind;
 
 static CONTENT_DIGESTS: LazyLock<ContentDigestCache> = LazyLock::new(ContentDigestCache::default);
+
+#[derive(RegisterSetting)]
+struct CopiedServerSettings {
+    path: Option<String>,
+}
+
+impl Settings for CopiedServerSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        Self {
+            path: content.remote.copy_remote_server.clone(),
+        }
+    }
+}
+
+pub(super) async fn configured_path(cx: &mut AsyncApp) -> Result<Option<PathBuf>> {
+    let configured = cx
+        .update(|cx| CopiedServerSettings::try_get(cx).and_then(|settings| settings.path.clone()));
+    resolve_path(
+        configured.as_deref(),
+        std::env::var_os("ZED_COPY_REMOTE_SERVER"),
+    )
+    .await
+}
+
+async fn resolve_path(
+    configured: Option<&str>,
+    environment: Option<OsString>,
+) -> Result<Option<PathBuf>> {
+    let Some(path) = configured
+        .map(PathBuf::from)
+        .or_else(|| environment.map(PathBuf::from))
+    else {
+        return Ok(None);
+    };
+    let path = if let Ok(relative_path) = path.strip_prefix("~") {
+        util::paths::home_dir().join(relative_path)
+    } else {
+        path
+    };
+    let metadata = smol::fs::metadata(&path)
+        .await
+        .with_context(|| format!("Reading copy_remote_server file at {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "copy_remote_server must point to a file: {}",
+        path.display()
+    );
+    Ok(Some(path))
+}
 
 #[derive(Default)]
 struct ContentDigestCache {
@@ -239,6 +291,80 @@ mod tests {
         encoder.write_all(contents).await?;
         encoder.close().await?;
         Ok(encoder.into_inner().into_inner())
+    }
+
+    #[gpui::test]
+    fn copy_remote_server_setting_updates(cx: &mut gpui::App) {
+        let mut store = settings::SettingsStore::new(cx, &settings::default_settings());
+        assert!(store.get::<CopiedServerSettings>(None).path.is_none());
+        for (json, expected) in [
+            (
+                r#"{"copy_remote_server":"~/servers/remote_server"}"#,
+                Some("~/servers/remote_server"),
+            ),
+            (
+                r#"{"copy_remote_server":"~/servers/remote_server.gz"}"#,
+                Some("~/servers/remote_server.gz"),
+            ),
+            (r#"{"copy_remote_server":null}"#, None),
+        ] {
+            let result = store.set_user_settings(json, cx);
+            assert_eq!(result.parse_status, settings::ParseStatus::Success);
+            assert_eq!(
+                store.get::<CopiedServerSettings>(None).path.as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn configured_path_precedes_environment_without_fallback() -> Result<()> {
+        smol::block_on(async {
+            let directory = temporary_directory()?;
+            let binary = directory.path().join("server");
+            let missing = directory.path().join("missing");
+            std::fs::write(&binary, b"server")?;
+            let binary_string = binary.to_str().context("binary path")?;
+            let missing_string = missing.to_str().context("missing path")?;
+
+            assert_eq!(resolve_path(None, None).await?, None);
+            assert_eq!(
+                resolve_path(None, Some(binary.clone().into())).await?,
+                Some(binary.clone())
+            );
+            assert_eq!(
+                resolve_path(Some(binary_string), Some(missing.clone().into())).await?,
+                Some(binary.clone())
+            );
+            let error = resolve_path(Some(missing_string), Some(binary.into()))
+                .await
+                .expect_err("Missing configured file must stop the connection");
+            assert!(error.to_string().contains("copy_remote_server"));
+            assert!(error.to_string().contains(missing_string));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn invalid_paths_do_not_fall_back_to_environment() -> Result<()> {
+        smol::block_on(async {
+            let directory = temporary_directory()?;
+            let binary = directory.path().join("server");
+            std::fs::write(&binary, b"server")?;
+            for invalid in ["", directory.path().to_str().context("directory path")?] {
+                assert!(
+                    resolve_path(Some(invalid), Some(binary.clone().into()))
+                        .await
+                        .is_err()
+                );
+            }
+            assert!(
+                resolve_path(None, Some(directory.path().join("missing").into()))
+                    .await
+                    .is_err()
+            );
+            Ok(())
+        })
     }
 
     #[test]

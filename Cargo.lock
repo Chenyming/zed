@@ -14983,6 +14983,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "settings",
  "settings_content",
  "sha2",
  "smol",
