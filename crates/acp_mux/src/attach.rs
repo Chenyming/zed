@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result, bail};
 use std::{
     fs::OpenOptions,
-    io::{self, Write as _},
+    io::{self, Read, Write},
     net::Shutdown,
     os::unix::{net::UnixStream, process::CommandExt as _},
     process::Stdio,
@@ -57,9 +57,7 @@ pub fn run(agent: String, key_env: Vec<String>, command: Vec<String>) -> Result<
     let to_stdout = std::thread::spawn({
         let stdin_closed = stdin_closed.clone();
         move || {
-            let mut stdout = io::stdout().lock();
-            let result = io::copy(&mut from_daemon, &mut stdout).and_then(|_| stdout.flush());
-            if let Err(error) = result {
+            if let Err(error) = forward(&mut from_daemon, &mut io::stdout().lock()) {
                 eprintln!("acp-mux: forwarding agent output failed: {error}");
             }
             // The main thread is blocked reading stdin, so exit from here when
@@ -72,8 +70,7 @@ pub fn run(agent: String, key_env: Vec<String>, command: Vec<String>) -> Result<
     });
 
     let mut to_daemon = stream.try_clone()?;
-    let mut stdin = io::stdin().lock();
-    let result = io::copy(&mut stdin, &mut to_daemon);
+    let result = forward(&mut io::stdin().lock(), &mut to_daemon);
     stdin_closed.store(true, Ordering::SeqCst);
     // Zed closed the agent's stdin: detach and let the daemon close its side.
     to_daemon.shutdown(Shutdown::Write).ok();
@@ -82,6 +79,24 @@ pub fn run(agent: String, key_env: Vec<String>, command: Vec<String>) -> Result<
     }
     result.context("forwarding input to the acp-mux daemon")?;
     Ok(())
+}
+
+/// Copies until EOF, passing each chunk on as soon as it is read. `io::copy`
+/// cannot be used: on Linux it splices from the socket into the stdout pipe, and
+/// older kernels hold the pipe lock while that splice waits for more socket data,
+/// so the reader never sees a response until the connection closes.
+fn forward(reader: &mut impl Read, writer: &mut impl Write) -> io::Result<()> {
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        writer.write_all(&buffer[..count])?;
+        writer.flush()?;
+    }
 }
 
 /// Connects to the daemon, starting it first if it is not running.
