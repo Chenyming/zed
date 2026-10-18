@@ -467,9 +467,16 @@ fn handle_mux_turn_state(notification: MuxTurnState, cx: &mut AsyncApp, ctx: &Cl
 
 合计约 **2.5–3 周**。M1+M2 完成后已经可以按 tmux 的方式使用;M3 完善"正在执行"状态的显示。
 
-## 11. 实现进度(2026-10-17)
+## 11. 实现进度(更新于 2026-10-18)
 
-代码在分支 `ymzed` 的工作区里,**尚未提交**。
+代码在分支 `ymzed` 上,尚未推送:
+
+| 提交 | 内容 | 状态 |
+|---|---|---|
+| `32a87900f1` | acp_mux: Keep remote external agents running across disconnects(11.1–11.5 的全部代码和本文档) | 已提交 |
+| `d27b3679e0` | Strip debug info from the Linux remote server build(11.6 的编译脚本) | 已提交 |
+| `090fc48595` | acp_mux: Forward attach output as soon as it arrives(11.7 发现的 bug 的修复) | 已提交 |
+| 本次提交 | `script/strip-remote-server.sh`、两个脚本只选能运行的 objcopy、构建文档和本文档的更新(11.6、11.7) | 已提交 |
 
 ### 11.1 里程碑状态
 
@@ -530,8 +537,46 @@ fn handle_mux_turn_state(notification: MuxTurnState, cx: &mut AsyncApp, ctx: &Cl
 
 注:在这台 Mac 上编译 remote_server 时,`gpui_apple` 的 Metal shader 编译会失败(本机环境问题,与本次改动无关),check 和 clippy 时加了 `-p gpui_apple --features gpui_apple/runtime_shaders` 绕过。
 
-### 11.6 下一步
+### 11.6 部署工具:缩小 remote_server 产物
 
-1. 在 Linux 上用 `./script/build-linux-remote-server.sh` 构建,写好 `~/.config/zed/acp_mux.json`,按第 7 节做手动端到端测试。
+`./script/build-linux-remote-server.sh` 编译出的二进制超过 600MB,原因是 release 配置保留了调试信息(`debug = "limited"`),而脚本不像官方的 `script/bundle-linux` 那样去掉调试信息。第 8 节第 3 步把产物拷到 Mac 再上传,体积直接影响部署。
+
+| 项 | 内容 | 状态 |
+|---|---|---|
+| 编译脚本 | `build-linux-remote-server.sh` 编译后用 LLVM objcopy 执行 `--strip-debug --discard-all`,再 gzip,产物在 `target/remote-server-dist/<triple>/remote_server` 和 `.gz`;未处理的原始文件留在 `target/<triple>/release/` 用于调试;`--no-strip` 保留旧行为 | 已提交 |
+| macOS 上处理 | 新增 `script/strip-remote-server.sh`:在 Mac 上处理已下载的 Linux 产物(原始文件或 `.gz`)。macOS 自带的 `strip` 不能处理 ELF,脚本改用 LLVM objcopy(依次找 `llvm-objcopy`、Homebrew 的 llvm、Rust 工具链自带的 `rust-objcopy`,可用 `--objcopy` 指定)。根据 ELF 头识别架构,根据动态链接器识别 GNU / musl,`--target` 与文件不符时报错。产物默认在 `tmp/remote-server-dist/<triple>/` | 已提交 |
+| 文档 | `docs/src/development/linux-remote-server-build.zh-CN.md`:产物表、`--no-strip`、"在 macOS 上去掉调试信息"一节 | 已提交 |
+| objcopy 检查 | 两个脚本只选择能运行的 objcopy(执行 `--version` 检查)。t228 上 rustup 的 `rust-objcopy` 因缺少 `libLLVM.so` 无法运行,原先会直接失败 | 已提交 |
+
+验证情况:
+
+- 两个脚本都通过了 `bash -n`。
+- `strip-remote-server.sh` 在 Mac 上用 clang + rust-lld 生成的带调试信息的 Linux ELF(x86_64 / aarch64,静态 / 动态链接)测试:自动识别、指定 `--target`、`.gz` 输入、默认输出路径都正确,处理后不再含调试信息,`.gz` 解压后与产物一致;架构不符、libc 不符、非 ELF、无法识别 libc、objcopy 不存在、缺少参数时都以退出码 2 报错。
+- 在 t228(Ubuntu 20.04,x86_64)上处理真实的 remote_server:660M → 108M,`.gz` 为 37M(回退到 GNU objcopy 2.34)。
+
+### 11.7 t228 上的验证(2026-10-18)
+
+在 t228 上用假 agent 验证 acp-mux 的基本功能。测试放在单独的 `~/acp-mux-test` 文件夹,通过 `XDG_DATA_HOME`、`XDG_CONFIG_HOME` 隔离状态和配置,不影响已安装的 remote server。Mac 上的驱动程序经 ssh 扮演 Zed,远端是按脚本运行的 Python 假 agent。
+
+**发现并修复的 bug(`090fc48595`):** attach 进程要等连接关闭才把 agent 的回复转给 Zed,导致 agent 无法完成初始化。原因是 Linux 上 `std::io::copy` 从 socket 到 stdout 管道使用 `splice(2)`,5.4 内核在下一次 splice 等待 socket 数据时持有管道锁,读端读不到已经写进管道的数据。macOS 没有 splice,所以本地测试没有发现。改为普通的读、写、flush 循环。此前编译的 Linux 二进制都带有这个 bug,需要重新编译。
+
+修复后 27 项检查全部通过:
+
+| 场景 | 结果 |
+|---|---|
+| initialize:带 mux 标记,宣告 load / list / close;agent 只初始化一次,fs 和 terminal 被关闭 | 通过 |
+| detach:client 断开后 agent 继续执行,停在授权请求上;`acp-mux list` 显示 `waiting`、`detached` | 通过 |
+| attach:`session/list` 列出会话;load 不存在的会话返回 `-32002`;load 时依次收到重放(用户消息、合并后的消息块)→ `turn_state: running` → load 响应(含 modes)→ 补发的授权请求 | 通过 |
+| 回答授权后 agent 继续,结束时收到 `turn_state: idle, end_turn`;client 自己发起的 prompt 只收到普通响应 | 通过 |
+| 第三个 client 接管会话,被挤掉的 client 不再收到更新 | 通过 |
+| cancel 以 `cancelled` 结束轮次;`session/close`、`load`、`list` 不会到达 agent | 通过 |
+| `kill <session>`、`kill --agent`(同时断开该 agent 的 client)、`restart` | 通过 |
+| 终端登录绕过:`ssh -tt` 下直接执行命令,daemon 不会收到 | 通过 |
+
+**仍未验证:** 真实 Zed 客户端的完整链路(按 `acp_mux.json` 改写命令、Mac 端补丁在 attach 后显示"生成中"),以及 Claude Code 等真实 agent。
+
+### 11.8 下一步
+
+1. 在 Linux 上用 `./script/build-linux-remote-server.sh` 重新构建(必须包含 `090fc48595`);把 `target/remote-server-dist/<triple>/remote_server.gz` 拷到 Mac 上传(或在 Mac 上用 `strip-remote-server.sh` 处理原始产物)。写好 `~/.config/zed/acp_mux.json`,按第 7 节做手动端到端测试。
 2. 实测第 9 节第 3、4、5 项(断线后是否自动重新加载、自定义 agent 的配置位置、线程历史里 `session/list` 的入口)。
 3. 根据实测结果决定是否做持久化(M4 可选项)和 systemd 文档。

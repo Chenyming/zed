@@ -110,10 +110,15 @@ if [[ "$strip_binary" == false ]]; then
 fi
 
 # 优先使用 llvm-objcopy：较旧发行版的 GNU objcopy 不认识新版 LLVM 生成的 CREL 节。
+# rustup 的 rust-objcopy 可能因缺少 libLLVM 无法运行，只选能运行的候选。
+runs() {
+    "$1" --version >/dev/null 2>&1
+}
+
 find_objcopy() {
     local candidate
     for candidate in llvm-objcopy $(compgen -c llvm-objcopy- | sort -t- -k3 -rn | uniq); do
-        if command -v "$candidate" >/dev/null 2>&1; then
+        if command -v "$candidate" >/dev/null 2>&1 && runs "$candidate"; then
             command -v "$candidate"
             return
         fi
@@ -124,7 +129,7 @@ find_objcopy() {
     # rustc 自带 rust-objcopy（LLVM objcopy）；llvm-tools 组件提供 llvm-objcopy。
     for candidate in rust-objcopy llvm-objcopy; do
         candidate="${sysroot}/lib/rustlib/${host}/bin/${candidate}"
-        if [[ -x "$candidate" ]]; then
+        if [[ -x "$candidate" ]] && runs "$candidate"; then
             echo "$candidate"
             return
         fi

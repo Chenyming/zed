@@ -78,6 +78,26 @@ objcopy 依次查找 `llvm-objcopy`、`llvm-objcopy-<版本>`、Rust 工具链�
 编译完成后仍需自行部署。远端文件名以客户端实际请求的通道和完整版本为准，
 不要将新产物伪装成旧的官方版本。
 
+## 在 macOS 上去掉调试信息 {#strip-on-macos}
+
+如果拿到的是未去掉调试信息的产物（例如用 `--no-strip` 编译，或复制了
+`target/<target-triple>/release/remote_server`），可以在 Mac 上处理：
+
+```sh
+./script/strip-remote-server.sh ~/Downloads/remote_server
+./script/strip-remote-server.sh --target aarch64-unknown-linux-gnu ~/Downloads/remote_server.gz
+```
+
+macOS 自带的 `strip` 只能处理 Mach-O，脚本改用 LLVM objcopy：依次查找
+`llvm-objcopy`、Homebrew 的 llvm、Rust 工具链自带的 `rust-objcopy`，也可用
+`--objcopy` 指定。处理选项与上面的编译脚本相同。
+
+脚本根据 ELF 头识别架构，根据动态链接器识别 GNU 或 musl。指定 `--target` 时，
+与文件不符会报错；无法识别 libc 时需要用 `--target` 指定。输入可以是原始二进制或
+`.gz`，不会修改输入文件。产物默认位于
+`tmp/remote-server-dist/<target-triple>/remote_server` 和同名 `.gz`，
+可用 `--output-dir` 修改。
+
 ## 从 macOS 客户端自动上传 {#upload-from-macos}
 
 可以把 Linux 产物复制到 Mac，由客户端自动上传、命名并设置远端文件的执行权限，
