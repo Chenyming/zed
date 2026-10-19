@@ -164,8 +164,10 @@ ZED_REMOTE_SERVER_VERSION= /Applications/Zed.app/Contents/MacOS/zed
 ## 签名说明
 
 如果没有配置 `MACOS_CERTIFICATE`、`APPLE_NOTARIZATION_KEY` 等 Apple 发布凭据，
-脚本使用 `MACOS_SIGNING_KEY` 指定的本地签名身份；未指定时使用 ad-hoc 临时签名。
-该方式不会执行 Apple 公证，通用链接等依赖完整 entitlement 的功能可能不可用。
+`script/bundle-mac` 使用 `MACOS_SIGNING_KEY` 指定的本地签名身份；未指定时使用 ad-hoc 临时签名。
+`script/build-mac.sh` 默认导出下文中的固定证书指纹，可用 `MACOS_SIGNING_KEY` 覆盖；
+显式设置为 `-` 可使用 ad-hoc 签名。
+本地签名方式不会执行 Apple 公证，通用链接等依赖完整 entitlement 的功能可能不可用。
 
 ### 使用固定证书签名
 
@@ -184,14 +186,14 @@ security find-identity -v -p codesigning
 1) 73C71571A1E993B2B628A5F4998CC201DB8336FA "Apple Development: cym8677@gmail.com (J8QP4MUX59)"
 ```
 
-使用该证书的指纹构建并签名 stable 应用：
+`script/build-mac.sh` 默认使用该证书，直接构建并签名 stable 应用：
 
 ```sh
-MACOS_SIGNING_KEY=73C71571A1E993B2B628A5F4998CC201DB8336FA \
-  ./script/build-mac.sh --channel stable
+./script/build-mac.sh --channel stable
 ```
 
-在其他机器上或证书更新后，使用查询结果中的有效指纹。
+在其他机器上或证书更新后，通过 `MACOS_SIGNING_KEY` 指定查询结果中的有效指纹。
+默认身份在钥匙串中不可用时，签名会失败，不会自动退回 ad-hoc 签名。
 `MACOS_SIGNING_KEY` 指定的是钥匙串中已有的证书及其私钥身份，不是文件路径或密码。
 当前脚本未对该变量展开加引号，因此使用无空格的指纹，避免证书全名被拆分为多个参数。
 每次构建使用相同身份；`binaries` 模式仅编译二进制，不执行应用签名。
