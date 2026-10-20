@@ -2,6 +2,7 @@ use serde_json::{Map, Value, json};
 use std::{collections::VecDeque, time::SystemTime};
 
 use crate::{
+    META_KEY,
     agent::AgentId,
     control::{SessionState, SessionSummary},
     router::ClientId,
@@ -17,7 +18,8 @@ pub struct MuxSession {
     pub updated_at: SystemTime,
     pub snapshot: SessionSnapshot,
     pub turn: TurnState,
-    pub observer: Option<ClientId>,
+    /// Clients that receive this session's updates, in the order they attached.
+    pub observers: Vec<ClientId>,
     /// Set when the agent process exited. The session can still be replayed.
     pub dead: bool,
     /// Prompts that arrived while a turn was running, sent once it ends.
@@ -67,7 +69,7 @@ impl MuxSession {
             turn: TurnState::Idle {
                 last_stop_reason: None,
             },
-            observer,
+            observers: observer.into_iter().collect(),
             dead: false,
             queued_prompts: VecDeque::new(),
             modes: None,
@@ -113,12 +115,14 @@ impl MuxSession {
         self.snapshot.apply(update.clone());
     }
 
-    /// Records the user's prompt so that replaying the session shows what was asked.
-    pub fn record_prompt(&mut self, params: &Value) {
+    /// Records the user's prompt so that replaying the session shows what was
+    /// asked, returning the updates that other observers need to see it live.
+    pub fn record_prompt(&mut self, params: &Value) -> Vec<Value> {
         let message_id = params.get("messageId").cloned();
         let Some(blocks) = params.get("prompt").and_then(Value::as_array) else {
-            return;
+            return Vec::new();
         };
+        let mut updates = Vec::new();
         for block in blocks {
             let mut update = json!({
                 "sessionUpdate": "user_message_chunk",
@@ -128,6 +132,30 @@ impl MuxSession {
                 update.insert("messageId".into(), message_id.clone());
             }
             self.record_update(&update);
+            updates.push(update);
+        }
+        updates
+    }
+
+    pub fn add_observer(&mut self, client: ClientId) {
+        if !self.observers.contains(&client) {
+            self.observers.push(client);
+        }
+    }
+
+    /// Stops sending updates to `client`, including the end of a running turn.
+    pub fn remove_observer(&mut self, client: ClientId) {
+        self.observers.retain(|observer| *observer != client);
+        if let TurnState::Running(turn) = &mut self.turn {
+            turn.notified.retain(|notified| *notified != client);
+        }
+    }
+
+    /// A short name for notifications and logs.
+    pub fn display_title(&self) -> String {
+        match &self.title {
+            Some(title) if !title.is_empty() => title.clone(),
+            _ => self.cwd.clone(),
         }
     }
 
@@ -178,8 +206,8 @@ impl MuxSession {
         Value::Object(response)
     }
 
-    pub fn summary(&self, waiting_for_permission: bool) -> SessionSummary {
-        let state = if self.dead {
+    pub fn state(&self, waiting_for_permission: bool) -> SessionState {
+        if self.dead {
             SessionState::Dead
         } else if waiting_for_permission {
             SessionState::WaitingForPermission
@@ -187,23 +215,36 @@ impl MuxSession {
             SessionState::Running
         } else {
             SessionState::Idle
-        };
+        }
+    }
+
+    pub fn summary(&self, waiting_for_permission: bool) -> SessionSummary {
         SessionSummary {
             session_id: self.session_id.clone(),
             agent: self.agent_name.clone(),
             cwd: self.cwd.clone(),
             title: self.title.clone(),
-            state,
-            attached: self.observer.is_some(),
+            state: self.state(waiting_for_permission),
+            attached: !self.observers.is_empty(),
+            observers: self.observers.len(),
             updated_at: format_timestamp(self.updated_at),
         }
     }
 
-    pub fn list_entry(&self) -> Value {
+    /// An entry of a `session/list` response. The `_meta` lets clients that are
+    /// not tied to one agent (observers) show which agent owns the session.
+    pub fn list_entry(&self, waiting_for_permission: bool) -> Value {
         let mut entry = json!({
             "sessionId": self.session_id,
             "cwd": self.cwd,
             "updatedAt": format_timestamp(self.updated_at),
+            "_meta": {
+                META_KEY: {
+                    "agent": self.agent_name,
+                    "state": self.state(waiting_for_permission).label(),
+                    "observers": self.observers.len(),
+                },
+            },
         });
         if let (Some(title), Some(entry)) = (&self.title, entry.as_object_mut()) {
             entry.insert("title".into(), Value::String(title.clone()));

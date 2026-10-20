@@ -72,12 +72,13 @@ pub enum CallKind {
 }
 
 /// A request from the agent (such as `session/request_permission`) that waits
-/// for an answer from whichever client is attached.
+/// for an answer from one of the attached clients. The first answer wins.
 pub struct PendingAgentRequest {
     pub agent_request_id: Value,
     pub session_id: Option<String>,
     pub message: Value,
-    pub forwarded_to: Option<(ClientId, i64)>,
+    /// Clients the request was sent to, with the request id each of them sees.
+    pub forwarded: Vec<(ClientId, i64)>,
 }
 
 impl AgentState {
@@ -338,7 +339,7 @@ mod tests {
                     "sessionCapabilities": {"list": {}, "close": {}},
                 },
                 "authMethods": [],
-                "_meta": {"zed.dev/acpMux": {"protocol": 1}},
+                "_meta": {"zed.dev/acpMux": {"protocol": PROTOCOL_VERSION}},
             })
         );
     }

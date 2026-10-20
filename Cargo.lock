@@ -87,6 +87,7 @@ name = "acp_mux"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-tungstenite",
  "chrono",
  "clap",
  "env_logger 0.11.8",
@@ -95,10 +96,12 @@ dependencies = [
  "log",
  "paths",
  "pretty_assertions",
+ "rand 0.9.4",
  "serde",
  "serde_json",
  "smol",
  "tempfile",
+ "url",
 ]
 
 [[package]]

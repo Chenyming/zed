@@ -7,6 +7,8 @@ mod agent;
 mod attach;
 mod control;
 mod daemon;
+mod gateway;
+mod notify;
 mod router;
 mod session;
 mod snapshot;
@@ -85,6 +87,49 @@ pub struct Config {
     pub agents: Option<Vec<String>>,
     /// Tool kinds (such as `read`) whose permission requests the daemon approves itself.
     pub auto_approve: Vec<String>,
+    /// Serves the web client and its WebSocket API when present.
+    pub gateway: Option<GatewayConfig>,
+    /// Publishes notifications when present.
+    pub notify: Option<NotifyConfig>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct GatewayConfig {
+    /// Address to listen on, such as `127.0.0.1:8765`. TLS is expected to be
+    /// provided in front of it, by a VPN or a reverse proxy such as frp.
+    pub listen: String,
+    /// File holding the login token. Created with a random token when missing.
+    #[serde(default)]
+    pub token_file: Option<String>,
+    /// Marks the login cookie `Secure`. Only disable it when the web client is
+    /// reached over plain HTTP inside a VPN, since browsers drop `Secure`
+    /// cookies set over HTTP.
+    #[serde(default = "default_true")]
+    pub cookie_secure: bool,
+    /// Extra origins (such as `https://agent.example.com`) allowed to open the
+    /// WebSocket, for proxies that rewrite the `Host` header.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct NotifyConfig {
+    /// ntfy topic URL, such as `https://ntfy.sh/my-topic`.
+    pub ntfy_url: String,
+    /// File holding an ntfy access token, for protected topics.
+    #[serde(default)]
+    pub ntfy_token_file: Option<String>,
+    /// How long a permission request may stay unanswered before notifying.
+    #[serde(default = "default_permission_delay_seconds")]
+    pub permission_delay_seconds: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_permission_delay_seconds() -> u64 {
+    30
 }
 
 impl Config {
@@ -158,6 +203,17 @@ fn config_path() -> PathBuf {
     paths::config_dir().join("acp_mux.json")
 }
 
+fn default_token_path() -> PathBuf {
+    paths::config_dir().join("acp_mux_token")
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => paths::home_dir().join(rest),
+        None => PathBuf::from(path),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,8 +282,7 @@ mod tests {
     fn wraps_only_configured_agents() {
         let all = Config {
             enabled: true,
-            agents: None,
-            auto_approve: Vec::new(),
+            ..Config::default()
         };
         assert!(all.wraps_agent("anything"));
         let some = Config {

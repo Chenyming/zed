@@ -12,17 +12,31 @@ use std::{
         fd::AsRawFd,
         unix::{fs::PermissionsExt as _, net::UnixStream as StdUnixStream},
     },
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use crate::{
     Config, PROTOCOL_VERSION,
     agent::{ProcessLauncher, write_messages},
-    control::{ControlRequest, Handshake, HandshakeReply, HandshakeRequest},
-    pid_path,
+    control::{ControlRequest, Handshake, HandshakeReply, HandshakeRequest, MIN_PROTOCOL_VERSION},
+    gateway, notify, pid_path,
     router::{ClientId, Event, Flow, Router},
     socket_path, state_dir,
 };
+
+/// Hands out client ids shared by unix socket and gateway connections.
+#[derive(Clone, Default)]
+pub struct ClientIds(Arc<AtomicU64>);
+
+impl ClientIds {
+    pub fn next(&self) -> ClientId {
+        self.0.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -113,13 +127,43 @@ async fn serve(
 ) -> Result<()> {
     let listener = UnixListener::try_from(listener)?;
     let (events, events_rx) = smol::channel::unbounded();
+    let client_ids = ClientIds::default();
+
+    let notices = match &config.notify {
+        Some(notify_config) => match notify::ntfy(notify_config) {
+            Ok(send) => {
+                let (notices, receiver) = smol::channel::unbounded();
+                let delay = Duration::from_secs(notify_config.permission_delay_seconds);
+                smol::spawn(notify::run(receiver, delay, send)).detach();
+                log::info!("publishing notifications to {}", notify_config.ntfy_url);
+                Some(notices)
+            }
+            Err(error) => {
+                log::error!("notifications are disabled: {error:#}");
+                None
+            }
+        },
+        None => None,
+    };
+    let _gateway_task = config.gateway.clone().map(|gateway_config| {
+        let events = events.clone();
+        let client_ids = client_ids.clone();
+        let version = version.clone();
+        smol::spawn(async move {
+            if let Err(error) = gateway::serve(gateway_config, events, client_ids, version).await {
+                log::error!("the web gateway stopped: {error:#}");
+            }
+        })
+    });
+
     let mut router = Router::new(
         version.clone(),
         config,
         Box::new(ProcessLauncher),
         events.clone(),
+        notices,
     );
-    let _accept_task = smol::spawn(accept_loop(listener, events, version));
+    let _accept_task = smol::spawn(accept_loop(listener, events, client_ids, version));
     while let Ok(event) = events_rx.recv().await {
         if router.handle(event) == Flow::Exit {
             break;
@@ -128,10 +172,14 @@ async fn serve(
     Ok(())
 }
 
-async fn accept_loop(listener: UnixListener, events: Sender<Event>, version: String) {
+async fn accept_loop(
+    listener: UnixListener,
+    events: Sender<Event>,
+    client_ids: ClientIds,
+    version: String,
+) {
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
-    let mut next_client: ClientId = 0;
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
@@ -151,8 +199,7 @@ async fn accept_loop(listener: UnixListener, events: Sender<Event>, version: Str
                 continue;
             }
         }
-        next_client += 1;
-        let client = next_client;
+        let client = client_ids.next();
         smol::spawn({
             let events = events.clone();
             let version = version.clone();
@@ -193,15 +240,20 @@ async fn serve_connection(
         error: Some(error),
     };
     let handshake: Value = serde_json::from_str(&line).context("parsing the handshake")?;
-    let protocol = handshake.get("acp_mux").and_then(Value::as_u64);
-    if protocol != Some(u64::from(PROTOCOL_VERSION)) {
+    let protocol = handshake
+        .get("acp_mux")
+        .and_then(Value::as_u64)
+        .and_then(|protocol| u32::try_from(protocol).ok())
+        .filter(|protocol| (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(protocol));
+    let Some(protocol) = protocol else {
         let error = format!(
-            "client protocol {protocol:?} is not supported by acp-mux daemon {version} \
-             (protocol {PROTOCOL_VERSION}); run `acp-mux restart`"
+            "client protocol {:?} is not supported by acp-mux daemon {version} \
+             (protocols {MIN_PROTOCOL_VERSION} to {PROTOCOL_VERSION}); run `acp-mux restart`",
+            handshake.get("acp_mux")
         );
         write_line(&mut writer, &refuse(error)).await?;
         return Ok(());
-    }
+    };
     let handshake: Handshake = match serde_json::from_value(handshake) {
         Ok(handshake) => handshake,
         Err(error) => {
@@ -209,10 +261,11 @@ async fn serve_connection(
             return Ok(());
         }
     };
+    // Older clients check that the daemon answers with their own version.
     let accepted = HandshakeReply {
         ok: true,
         daemon_version: Some(version.clone()),
-        protocol: Some(PROTOCOL_VERSION),
+        protocol: Some(protocol),
         error: None,
     };
 
@@ -234,31 +287,29 @@ async fn serve_connection(
                 return Ok(());
             }
             write_line(&mut writer, &accepted).await?;
-
-            let writer_task = smol::spawn(write_messages(writer, outgoing_rx));
-            let mut lines = reader.lines();
-            while let Some(line) = lines.next().await {
-                let line = match line {
-                    Ok(line) => line,
-                    Err(error) => {
-                        log::info!("reading from client {client}: {error}");
-                        break;
-                    }
-                };
-                if line.trim().is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Value>(&line) {
-                    Ok(message) => {
-                        events
-                            .send(Event::ClientMessage { client, message })
-                            .await?
-                    }
-                    Err(error) => log::warn!("client {client} wrote invalid JSON: {error}"),
-                }
+            pump_client(reader, writer, client, &events, outgoing_rx).await?;
+        }
+        HandshakeRequest::Observe { observe } => {
+            if protocol < 2 {
+                write_line(
+                    &mut writer,
+                    &refuse("observing requires protocol 2".to_string()),
+                )
+                .await?;
+                return Ok(());
             }
-            events.send(Event::ClientDisconnected { client }).await.ok();
-            writer_task.await;
+            let (outgoing, outgoing_rx) = smol::channel::unbounded();
+            events
+                .send(Event::Observe {
+                    client,
+                    label: observe
+                        .label
+                        .unwrap_or_else(|| "local observer".to_string()),
+                    outgoing,
+                })
+                .await?;
+            write_line(&mut writer, &accepted).await?;
+            pump_client(reader, writer, client, &events, outgoing_rx).await?;
         }
         HandshakeRequest::Control { control } => {
             let is_shutdown = control == ControlRequest::Shutdown;
@@ -281,6 +332,42 @@ async fn serve_connection(
             written?;
         }
     }
+    Ok(())
+}
+
+/// Passes the client's lines to the router and the router's messages back
+/// until the client disconnects.
+async fn pump_client(
+    reader: futures::io::BufReader<UnixStream>,
+    writer: UnixStream,
+    client: ClientId,
+    events: &Sender<Event>,
+    outgoing: smol::channel::Receiver<Value>,
+) -> Result<()> {
+    let writer_task = smol::spawn(write_messages(writer, outgoing));
+    let mut lines = reader.lines();
+    while let Some(line) = lines.next().await {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => {
+                log::info!("reading from client {client}: {error}");
+                break;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(&line) {
+            Ok(message) => {
+                events
+                    .send(Event::ClientMessage { client, message })
+                    .await?
+            }
+            Err(error) => log::warn!("client {client} wrote invalid JSON: {error}"),
+        }
+    }
+    events.send(Event::ClientDisconnected { client }).await.ok();
+    writer_task.await;
     Ok(())
 }
 
@@ -347,26 +434,41 @@ read -r line
         reader: BufReader<StdUnixStream>,
     }
 
+    fn fake_agent(script: &str) -> HandshakeRequest {
+        HandshakeRequest::Attach {
+            agent: "fake".into(),
+            command: AgentSpec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into()],
+                env: [("PATH".to_string(), "/usr/bin:/bin".to_string())].into(),
+                cwd: None,
+                key_env: Vec::new(),
+            },
+        }
+    }
+
+    fn start_daemon() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().expect("creating a temporary directory");
+        let socket = directory.path().join("daemon.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("binding the test socket");
+        std::thread::spawn(move || {
+            smol::block_on(serve(listener, Config::default(), "test".into())).ok();
+        });
+        (directory, socket)
+    }
+
     impl TestClient {
         fn connect(socket: &std::path::Path) -> Self {
+            Self::connect_with(socket, fake_agent(FAKE_AGENT))
+        }
+
+        fn connect_with(socket: &std::path::Path, request: HandshakeRequest) -> Self {
             let stream = StdUnixStream::connect(socket).expect("connecting to the daemon");
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .expect("setting a read timeout");
-            let reader = handshake(
-                &stream,
-                HandshakeRequest::Attach {
-                    agent: "fake".into(),
-                    command: AgentSpec {
-                        program: "/bin/sh".into(),
-                        args: vec!["-c".into(), FAKE_AGENT.into()],
-                        env: [("PATH".to_string(), "/usr/bin:/bin".to_string())].into(),
-                        cwd: None,
-                        key_env: Vec::new(),
-                    },
-                },
-            )
-            .expect("handshake");
+            let reader = handshake(&stream, request).expect("handshake");
             Self { stream, reader }
         }
 
@@ -397,7 +499,7 @@ read -r line
         first.send(json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": 1}}));
         assert_eq!(
             first.receive()["result"]["_meta"]["zed.dev/acpMux"]["protocol"],
-            1
+            PROTOCOL_VERSION
         );
         first.send(json!({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/", "mcpServers": []}}));
         assert_eq!(first.receive()["result"]["sessionId"], "s1");
@@ -453,6 +555,103 @@ read -r line
             json!({"jsonrpc": "2.0", "method": crate::TURN_STATE_METHOD, "params": {
                 "sessionId": "s1", "state": "idle", "stopReason": "end_turn",
             }})
+        );
+    }
+
+    #[test]
+    fn accepts_attach_handshakes_from_older_clients() {
+        let (_directory, socket) = start_daemon();
+        let mut stream = StdUnixStream::connect(&socket).expect("connecting to the daemon");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("setting a read timeout");
+        let mut handshake = serde_json::to_value(Handshake {
+            acp_mux: PROTOCOL_VERSION,
+            request: fake_agent(FAKE_AGENT),
+        })
+        .expect("serializing the handshake");
+        handshake["acp_mux"] = json!(1);
+        crate::control::write_line(&mut stream, &handshake).expect("writing the handshake");
+        let mut reader = BufReader::new(stream.try_clone().expect("cloning the stream"));
+        let reply: HandshakeReply =
+            serde_json::from_str(&crate::control::read_line(&mut reader).expect("reading"))
+                .expect("parsing the reply");
+        assert!(reply.ok);
+        assert_eq!(reply.protocol, Some(1));
+    }
+
+    #[test]
+    fn observers_share_sessions_with_attached_clients() {
+        const AGENT: &str = r#"
+read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}'
+read -r line
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+read -r line
+"#;
+        let (_directory, socket) = start_daemon();
+        let mut zed = TestClient::connect_with(&socket, fake_agent(AGENT));
+        zed.send(json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": 1}}));
+        zed.receive();
+        zed.send(json!({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/", "mcpServers": []}}));
+        assert_eq!(zed.receive()["result"]["sessionId"], "s1");
+
+        let mut phone = TestClient::connect_with(
+            &socket,
+            HandshakeRequest::Observe {
+                observe: crate::control::ObserveRequest {
+                    label: Some("phone".into()),
+                },
+            },
+        );
+        phone.send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1}}));
+        assert_eq!(
+            phone.receive()["result"]["_meta"]["zed.dev/acpMux"]["observer"],
+            true
+        );
+        phone.send(json!({"jsonrpc": "2.0", "id": 2, "method": "session/list", "params": {}}));
+        let list = phone.receive();
+        assert_eq!(list["result"]["sessions"][0]["sessionId"], "s1");
+        assert_eq!(
+            list["result"]["sessions"][0]["_meta"]["zed.dev/acpMux"]["agent"],
+            "fake"
+        );
+        phone.send(json!({"jsonrpc": "2.0", "id": 3, "method": "session/load", "params": {"sessionId": "s1", "cwd": "/", "mcpServers": []}}));
+        assert_eq!(
+            phone.receive(),
+            json!({"jsonrpc": "2.0", "id": 3, "result": {}})
+        );
+
+        phone.send(
+            json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt", "params": {
+                "sessionId": "s1", "prompt": [{"type": "text", "text": "from the phone"}],
+            }}),
+        );
+        assert_eq!(
+            zed.receive()["params"]["update"]["content"]["text"],
+            "from the phone"
+        );
+        assert_eq!(zed.receive()["params"]["state"], "running");
+        assert_eq!(
+            zed.receive()["params"]["update"]["content"]["text"],
+            "hello"
+        );
+        assert_eq!(
+            zed.receive(),
+            json!({"jsonrpc": "2.0", "method": crate::TURN_STATE_METHOD, "params": {
+                "sessionId": "s1", "state": "idle", "stopReason": "end_turn",
+            }})
+        );
+        assert_eq!(
+            phone.receive()["params"]["update"]["content"]["text"],
+            "hello"
+        );
+        assert_eq!(
+            phone.receive(),
+            json!({"jsonrpc": "2.0", "id": 4, "result": {"stopReason": "end_turn"}})
         );
     }
 }

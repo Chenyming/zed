@@ -4,7 +4,7 @@ use smol::channel::Sender;
 use std::{collections::HashMap, mem, time::SystemTime};
 
 use crate::{
-    Config, TURN_STATE_METHOD,
+    Config, META_KEY, PROTOCOL_VERSION, TURN_STATE_METHOD,
     agent::{
         AgentId, AgentKey, AgentLauncher, AgentState, CallKind, InitState, PendingAgentRequest,
         PendingCall, client_initialize_response, daemon_initialize_params,
@@ -13,6 +13,7 @@ use crate::{
         AgentSpec, AgentSummary, ControlRequest, KillResponse, KillTarget, ListResponse,
         ShutdownResponse,
     },
+    notify::Notice,
     session::{MuxSession, QueuedPrompt, RunningTurn, TurnState},
 };
 
@@ -31,6 +32,13 @@ pub enum Event {
         spec: AgentSpec,
         outgoing: Sender<Value>,
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// A client that is not tied to an agent, such as a web or mobile client.
+    /// It can only list and use existing sessions.
+    Observe {
+        client: ClientId,
+        label: String,
+        outgoing: Sender<Value>,
     },
     ClientMessage {
         client: ClientId,
@@ -63,7 +71,10 @@ pub enum Flow {
 }
 
 struct ClientState {
-    agent: AgentId,
+    /// The agent this client was started for, or `None` for an observer.
+    agent: Option<AgentId>,
+    /// Identifies the client in logs.
+    label: String,
     outgoing: Sender<Value>,
     next_request_id: i64,
     /// Requests forwarded from an agent to this client, keyed by the id the client sees.
@@ -139,6 +150,13 @@ fn with_id(mut message: Value, id: Value) -> Value {
     message
 }
 
+fn session_update_message(session_id: &str, update: &Value) -> Value {
+    notification_message(
+        "session/update",
+        json!({"sessionId": session_id, "update": update}),
+    )
+}
+
 fn turn_state_running(session_id: &str) -> Value {
     notification_message(
         TURN_STATE_METHOD,
@@ -157,11 +175,28 @@ fn cancel_request_message(request_id: Value) -> Value {
     notification_message("$/cancel_request", json!({"requestId": request_id}))
 }
 
+/// What a notification says about a request that waits for the user.
+fn request_detail(message: &Value) -> String {
+    let params = message.get("params").unwrap_or(&Value::Null);
+    params
+        .get("toolCall")
+        .and_then(|tool_call| tool_call.get("title"))
+        .or_else(|| params.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("需要你的回答")
+        .to_string()
+}
+
+fn notice_key(agent: AgentId, request_key: &str) -> String {
+    format!("{agent}:{request_key}")
+}
+
 pub struct Router {
     version: String,
     config: Config,
     launcher: Box<dyn AgentLauncher>,
     events: Sender<Event>,
+    notices: Option<Sender<Notice>>,
     next_agent_id: AgentId,
     agents: HashMap<AgentId, AgentState>,
     clients: HashMap<ClientId, ClientState>,
@@ -174,12 +209,14 @@ impl Router {
         config: Config,
         launcher: Box<dyn AgentLauncher>,
         events: Sender<Event>,
+        notices: Option<Sender<Notice>>,
     ) -> Self {
         Self {
             version,
             config,
             launcher,
             events,
+            notices,
             next_agent_id: 0,
             agents: HashMap::new(),
             clients: HashMap::new(),
@@ -201,6 +238,23 @@ impl Router {
                     log::info!("client {client} went away during the handshake");
                     self.disconnect_client(client);
                 }
+            }
+            Event::Observe {
+                client,
+                label,
+                outgoing,
+            } => {
+                log::info!("observer {client} connected ({label})");
+                self.clients.insert(
+                    client,
+                    ClientState {
+                        agent: None,
+                        label,
+                        outgoing,
+                        next_request_id: 0,
+                        forwarded: HashMap::new(),
+                    },
+                );
             }
             Event::ClientMessage { client, message } => self.handle_client_message(client, message),
             Event::ClientDisconnected { client } => self.disconnect_client(client),
@@ -225,10 +279,57 @@ impl Router {
         }
     }
 
+    fn notify(&self, notice: Notice) {
+        if let Some(notices) = &self.notices
+            && notices.try_send(notice).is_err()
+        {
+            log::warn!("the notifier stopped");
+        }
+    }
+
+    /// The agent a client was started for and that agent's name. `None` for
+    /// observers.
     fn client_agent(&self, client: ClientId) -> Option<(AgentId, String)> {
-        let agent = self.clients.get(&client)?.agent;
+        let agent = self.clients.get(&client)?.agent?;
         let name = self.agents.get(&agent)?.key.name.clone();
         Some((agent, name))
+    }
+
+    fn client_label(&self, client: ClientId) -> &str {
+        self.clients
+            .get(&client)
+            .map_or("disconnected", |state| state.label.as_str())
+    }
+
+    /// Finds the session a client refers to. Clients started for an agent only
+    /// see that agent's sessions; observers see every session, preferring a live
+    /// one when an id is reused across agents.
+    fn session_key(&self, client: ClientId, session_id: &str) -> Option<SessionKey> {
+        if let Some((_, agent_name)) = self.client_agent(client) {
+            let key = (agent_name, session_id.to_string());
+            return self.sessions.contains_key(&key).then_some(key);
+        }
+        if self
+            .clients
+            .get(&client)
+            .is_none_or(|state| state.agent.is_some())
+        {
+            return None;
+        }
+        self.sessions
+            .iter()
+            .filter(|((_, id), _)| id == session_id)
+            .max_by_key(|(_, session)| (!session.dead, session.updated_at))
+            .map(|(key, _)| key.clone())
+    }
+
+    fn is_waiting_for_input(&self, session: &MuxSession) -> bool {
+        self.agents.get(&session.agent).is_some_and(|agent| {
+            agent
+                .pending_requests
+                .iter()
+                .any(|request| request.session_id.as_ref() == Some(&session.session_id))
+        })
     }
 
     fn attach_client(
@@ -265,7 +366,8 @@ impl Router {
         self.clients.insert(
             client,
             ClientState {
-                agent,
+                agent: Some(agent),
+                label: format!("attach {}", key.name),
                 outgoing,
                 next_request_id: 0,
                 forwarded: HashMap::new(),
@@ -298,12 +400,17 @@ impl Router {
         params: Value,
         message: Value,
     ) {
-        let Some((agent, agent_name)) = self.client_agent(client) else {
-            return;
-        };
+        let client_agent = self.client_agent(client);
         match method {
-            "initialize" => self.handle_initialize(client, agent, id, &params),
+            "initialize" => match client_agent {
+                Some((agent, _)) => self.handle_initialize(client, agent, id, &params),
+                None => self.initialize_observer(client, id, &params),
+            },
             "session/new" => {
+                let Some((agent, _)) = client_agent else {
+                    self.reject_observer(client, id);
+                    return;
+                };
                 let cwd = params
                     .get("cwd")
                     .and_then(Value::as_str)
@@ -311,34 +418,44 @@ impl Router {
                     .to_string();
                 self.forward_request(client, agent, id, message, CallKind::NewSession { cwd });
             }
-            "session/list" => self.handle_list(client, &agent_name, id, &params),
-            "session/load" | "session/resume" => {
-                self.handle_load(client, agent, agent_name, id, params)
+            "session/list" => {
+                let agent_name = client_agent.map(|(_, name)| name);
+                self.handle_list(client, agent_name.as_deref(), id, &params);
             }
-            "session/close" => self.handle_close(client, &agent_name, id, &params),
-            "session/prompt" => self.handle_prompt(client, agent, agent_name, id, params, message),
+            "session/load" | "session/resume" => self.handle_load(client, client_agent, id, params),
+            "session/close" => self.handle_close(client, id, &params),
+            "session/prompt" => self.handle_prompt(client, client_agent, id, params, message),
             _ => {
                 let session_id = session_id_of(&params);
-                let mut target = agent;
-                if let Some(session) = session_id
-                    .as_ref()
-                    .and_then(|session_id| self.sessions.get(&(agent_name, session_id.clone())))
-                {
-                    if session.dead {
-                        Self::send_to_client(
-                            &self.clients,
-                            client,
-                            error_message(
-                                id,
-                                INTERNAL_ERROR,
-                                "The agent process for this session has exited",
-                            ),
-                        );
+                let key = session_id
+                    .as_deref()
+                    .and_then(|session_id| self.session_key(client, session_id));
+                let target = match (&key, &client_agent) {
+                    (Some(key), _) => {
+                        let Some(session) = self.sessions.get(key) else {
+                            return;
+                        };
+                        if session.dead {
+                            Self::send_to_client(
+                                &self.clients,
+                                client,
+                                error_message(
+                                    id,
+                                    INTERNAL_ERROR,
+                                    "The agent process for this session has exited",
+                                ),
+                            );
+                            return;
+                        }
+                        session.agent
+                    }
+                    (None, Some((agent, _))) => *agent,
+                    (None, None) => {
+                        self.reject_observer(client, id);
                         return;
                     }
-                    target = session.agent;
-                }
-                let kind = match (method, session_id) {
+                };
+                let kind = match (method, key.map(|(_, session_id)| session_id).or(session_id)) {
                     ("session/set_mode", Some(session_id)) => CallKind::SetMode {
                         session_id,
                         mode_id: params.get("modeId").cloned().unwrap_or(Value::Null),
@@ -356,6 +473,37 @@ impl Router {
                 self.forward_request(client, target, id, message, kind);
             }
         }
+    }
+
+    /// Observers cannot start agents or sessions, only use existing sessions.
+    fn reject_observer(&self, client: ClientId, id: Value) {
+        Self::send_to_client(
+            &self.clients,
+            client,
+            error_message(
+                id,
+                METHOD_NOT_FOUND,
+                "Method not available to observers, which can only use existing sessions",
+            ),
+        );
+    }
+
+    fn initialize_observer(&self, client: ClientId, id: Value, params: &Value) {
+        let protocol_version = params
+            .get("protocolVersion")
+            .cloned()
+            .unwrap_or_else(|| json!(1));
+        let response = json!({
+            "protocolVersion": protocol_version,
+            "agentCapabilities": {
+                "loadSession": true,
+                "sessionCapabilities": {"list": {}, "close": {}},
+            },
+            "agentInfo": {"name": "acp-mux", "version": self.version},
+            "authMethods": [],
+            "_meta": {META_KEY: {"protocol": PROTOCOL_VERSION, "observer": true}},
+        });
+        Self::send_to_client(&self.clients, client, response_message(id, response));
     }
 
     fn forward_request(
@@ -418,18 +566,25 @@ impl Router {
         }
     }
 
-    fn handle_list(&mut self, client: ClientId, agent_name: &str, id: Value, params: &Value) {
+    /// Lists one agent's sessions, or every session for observers.
+    fn handle_list(
+        &mut self,
+        client: ClientId,
+        agent_name: Option<&str>,
+        id: Value,
+        params: &Value,
+    ) {
         let cwd = params.get("cwd").and_then(Value::as_str);
         let mut sessions = self
             .sessions
             .values()
-            .filter(|session| session.agent_name == agent_name)
+            .filter(|session| agent_name.is_none_or(|name| session.agent_name == name))
             .filter(|session| cwd.is_none_or(|cwd| session.cwd == cwd))
             .collect::<Vec<_>>();
         sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
         let sessions = sessions
             .into_iter()
-            .map(MuxSession::list_entry)
+            .map(|session| session.list_entry(self.is_waiting_for_input(session)))
             .collect::<Vec<_>>();
         Self::send_to_client(
             &self.clients,
@@ -441,8 +596,7 @@ impl Router {
     fn handle_load(
         &mut self,
         client: ClientId,
-        agent: AgentId,
-        agent_name: String,
+        client_agent: Option<(AgentId, String)>,
         id: Value,
         params: Value,
     ) {
@@ -454,24 +608,24 @@ impl Router {
             );
             return;
         };
-        let key = (agent_name.clone(), session_id.clone());
-        if self.sessions.contains_key(&key) {
+        if let Some(key) = self.session_key(client, &session_id) {
             self.attach_session(client, id, &key);
             return;
         }
 
-        let agent_supports_load = self
-            .agents
-            .get(&agent)
-            .is_some_and(|agent| agent.supports(&["loadSession"]));
-        if !agent_supports_load {
+        let agent_supports_load = client_agent.as_ref().is_some_and(|(agent, _)| {
+            self.agents
+                .get(agent)
+                .is_some_and(|agent| agent.supports(&["loadSession"]))
+        });
+        let Some((agent, agent_name)) = client_agent.filter(|_| agent_supports_load) else {
             Self::send_to_client(
                 &self.clients,
                 client,
                 error_message(id, RESOURCE_NOT_FOUND, "Session not found"),
             );
             return;
-        }
+        };
 
         // The agent replays the history it persisted itself as `session/update`
         // notifications, which are recorded and forwarded as they arrive.
@@ -481,7 +635,7 @@ impl Router {
             .unwrap_or_default()
             .to_string();
         self.sessions.insert(
-            key,
+            (agent_name.clone(), session_id.clone()),
             MuxSession::new(session_id.clone(), agent, agent_name, cwd, Some(client)),
         );
         let message =
@@ -495,26 +649,23 @@ impl Router {
         );
     }
 
-    /// Makes `client` the observer of an existing session (like `tmux attach -d`)
-    /// and brings it up to date: replayed history, the running turn, then any
-    /// requests waiting for an answer. The running-turn notification must come
-    /// before the requests, because the client cancels outstanding permission
-    /// requests when it starts mirroring a turn.
+    /// Adds `client` to the observers of an existing session and brings it up to
+    /// date: replayed history, the running turn, then any requests waiting for an
+    /// answer. The running-turn notification must come before the requests,
+    /// because Zed cancels outstanding permission requests when it starts
+    /// mirroring a turn.
     fn attach_session(&mut self, client: ClientId, id: Value, key: &SessionKey) {
         let Some(session) = self.sessions.get_mut(key) else {
             return;
         };
-        let previous = session.observer.replace(client);
+        session.add_observer(client);
         let agent = session.agent;
         let session_id = session.session_id.clone();
         for update in session.snapshot.updates() {
             Self::send_to_client(
                 &self.clients,
                 client,
-                notification_message(
-                    "session/update",
-                    json!({"sessionId": session_id, "update": update}),
-                ),
+                session_update_message(&session_id, update),
             );
         }
         if let TurnState::Running(turn) = &mut session.turn
@@ -527,25 +678,25 @@ impl Router {
         }
         let load_response = session.load_response();
         Self::send_to_client(&self.clients, client, response_message(id, load_response));
-
-        if let Some(previous) = previous.filter(|previous| *previous != client) {
-            log::info!("client {client} took over session {session_id} from client {previous}");
-            self.unforward_requests(agent, Some(&session_id), previous, true);
-        }
-        self.forward_pending_requests(agent, key);
+        log::info!(
+            "{} is observing session {session_id}",
+            self.client_label(client)
+        );
+        self.forward_pending_requests(agent, &session_id, client);
     }
 
-    fn forward_pending_requests(&mut self, agent: AgentId, key: &SessionKey) {
-        let Some(observer) = self.sessions.get(key).and_then(|session| session.observer) else {
-            return;
-        };
+    fn forward_pending_requests(&mut self, agent: AgentId, session_id: &str, client: ClientId) {
         let Some(agent_state) = self.agents.get_mut(&agent) else {
             return;
         };
         for request in agent_state.pending_requests.iter_mut().filter(|request| {
-            request.forwarded_to.is_none() && request.session_id.as_ref() == Some(&key.1)
+            request.session_id.as_deref() == Some(session_id)
+                && !request
+                    .forwarded
+                    .iter()
+                    .any(|(forwarded, _)| *forwarded == client)
         }) {
-            Self::forward_agent_request(&mut self.clients, agent, request, observer);
+            Self::forward_agent_request(&mut self.clients, agent, request, client);
         }
     }
 
@@ -554,75 +705,82 @@ impl Router {
         agent: AgentId,
         request: &mut PendingAgentRequest,
         client: ClientId,
-    ) -> bool {
+    ) {
         let Some(state) = clients.get_mut(&client) else {
-            return false;
+            return;
         };
         state.next_request_id += 1;
         let client_request_id = state.next_request_id;
+        let message = with_id(request.message.clone(), json!(client_request_id));
+        if state.outgoing.try_send(message).is_err() {
+            return;
+        }
         state.forwarded.insert(
             client_request_id,
             (agent, request_id_key(&request.agent_request_id)),
         );
-        let message = with_id(request.message.clone(), json!(client_request_id));
-        if state.outgoing.try_send(message).is_err() {
-            state.forwarded.remove(&client_request_id);
-            return false;
-        }
-        request.forwarded_to = Some((client, client_request_id));
-        true
+        request.forwarded.push((client, client_request_id));
     }
 
-    /// Takes back requests forwarded to `client`, so they can be sent to the
-    /// next client that attaches.
-    fn unforward_requests(
-        &mut self,
-        agent: AgentId,
-        session_id: Option<&str>,
-        client: ClientId,
-        notify_client: bool,
+    /// Withdraws a request from the clients it was forwarded to, except `keep`
+    /// (the client that answered it), so their prompts disappear.
+    fn withdraw_request(
+        clients: &mut HashMap<ClientId, ClientState>,
+        request: &PendingAgentRequest,
+        keep: Option<ClientId>,
     ) {
+        for (client, client_request_id) in &request.forwarded {
+            if Some(*client) == keep {
+                continue;
+            }
+            if let Some(state) = clients.get_mut(client) {
+                state.forwarded.remove(client_request_id);
+                state
+                    .outgoing
+                    .try_send(cancel_request_message(json!(client_request_id)))
+                    .ok();
+            }
+        }
+    }
+
+    /// Forgets the requests of `session_id` forwarded to `client`, which stopped
+    /// observing it. They stay pending for the other observers and are sent
+    /// again when the client loads the session.
+    fn forget_forwarded_requests(&mut self, agent: AgentId, session_id: &str, client: ClientId) {
         let Some(agent_state) = self.agents.get_mut(&agent) else {
             return;
         };
         for request in &mut agent_state.pending_requests {
-            let Some((forwarded_client, client_request_id)) = request.forwarded_to else {
-                continue;
-            };
-            if forwarded_client != client
-                || session_id
-                    .is_some_and(|session_id| request.session_id.as_deref() != Some(session_id))
-            {
+            if request.session_id.as_deref() != Some(session_id) {
                 continue;
             }
-            request.forwarded_to = None;
-            if let Some(state) = self.clients.get_mut(&client) {
-                state.forwarded.remove(&client_request_id);
-                if notify_client {
-                    state
-                        .outgoing
-                        .try_send(cancel_request_message(json!(client_request_id)))
-                        .ok();
+            request.forwarded.retain(|(forwarded, client_request_id)| {
+                if *forwarded != client {
+                    return true;
                 }
-            }
+                if let Some(state) = self.clients.get_mut(&client) {
+                    state.forwarded.remove(client_request_id);
+                }
+                false
+            });
         }
     }
 
-    fn handle_close(&mut self, client: ClientId, agent_name: &str, id: Value, params: &Value) {
-        let session_id = session_id_of(params);
-        let detached = session_id.as_ref().and_then(|session_id| {
-            let session = self
-                .sessions
-                .get_mut(&(agent_name.to_string(), session_id.clone()))?;
-            if session.observer != Some(client) {
-                return None;
-            }
-            session.observer = None;
-            Some(session.agent)
-        });
-        if let (Some(agent), Some(session_id)) = (detached, &session_id) {
-            log::info!("client {client} detached from session {session_id}");
-            self.unforward_requests(agent, Some(session_id), client, false);
+    fn handle_close(&mut self, client: ClientId, id: Value, params: &Value) {
+        let key =
+            session_id_of(params).and_then(|session_id| self.session_key(client, &session_id));
+        if let Some(key) = key
+            && let Some(session) = self.sessions.get_mut(&key)
+            && session.observers.contains(&client)
+        {
+            session.remove_observer(client);
+            let agent = session.agent;
+            log::info!(
+                "{} stopped observing session {}",
+                self.client_label(client),
+                key.1
+            );
+            self.forget_forwarded_requests(agent, &key.1, client);
         }
         Self::send_to_client(&self.clients, client, response_message(id, json!({})));
     }
@@ -630,19 +788,27 @@ impl Router {
     fn handle_prompt(
         &mut self,
         client: ClientId,
-        agent: AgentId,
-        agent_name: String,
+        client_agent: Option<(AgentId, String)>,
         id: Value,
         params: Value,
         message: Value,
     ) {
-        let Some(session_id) = session_id_of(&params) else {
-            self.forward_request(client, agent, id, message, CallKind::Plain);
+        let key =
+            session_id_of(&params).and_then(|session_id| self.session_key(client, &session_id));
+        let Some(key) = key else {
+            match client_agent {
+                Some((agent, _)) => {
+                    self.forward_request(client, agent, id, message, CallKind::Plain);
+                }
+                None => Self::send_to_client(
+                    &self.clients,
+                    client,
+                    error_message(id, RESOURCE_NOT_FOUND, "Session not found"),
+                ),
+            }
             return;
         };
-        let key = (agent_name, session_id.clone());
         let Some(session) = self.sessions.get_mut(&key) else {
-            self.forward_request(client, agent, id, message, CallKind::Plain);
             return;
         };
         if session.dead {
@@ -658,7 +824,9 @@ impl Router {
             return;
         }
         if session.is_running() {
-            // Only clients that cannot mirror a running turn send a prompt now.
+            // Clients that mirror a running turn cancel it before sending a
+            // prompt; others (such as Zed without the acp-mux changes) send it
+            // right away, so the running turn is cancelled for them.
             session.queued_prompts.push_back(QueuedPrompt {
                 client,
                 request_id: id,
@@ -667,7 +835,7 @@ impl Router {
             if let Some(agent) = self.agents.get(&session.agent) {
                 agent.send(notification_message(
                     "session/cancel",
-                    json!({"sessionId": session_id}),
+                    json!({"sessionId": key.1}),
                 ));
             }
             return;
@@ -675,6 +843,8 @@ impl Router {
         self.start_prompt(&key, client, id, params);
     }
 
+    /// Sends a prompt to the agent. The other observers see the user's message
+    /// and learn that a turn is running, as if they had sent it themselves.
     fn start_prompt(&mut self, key: &SessionKey, client: ClientId, id: Value, params: Value) {
         let Some(session) = self.sessions.get_mut(key) else {
             return;
@@ -687,7 +857,7 @@ impl Router {
             );
             return;
         };
-        session.record_prompt(&params);
+        let user_updates = session.record_prompt(&params);
         let agent_request_id = agent.request(
             "session/prompt",
             params,
@@ -699,11 +869,31 @@ impl Router {
                 },
             },
         );
+        let others = session
+            .observers
+            .iter()
+            .copied()
+            .filter(|observer| *observer != client)
+            .collect::<Vec<_>>();
+        for observer in &others {
+            for update in &user_updates {
+                Self::send_to_client(
+                    &self.clients,
+                    *observer,
+                    session_update_message(&session.session_id, update),
+                );
+            }
+            Self::send_to_client(
+                &self.clients,
+                *observer,
+                turn_state_running(&session.session_id),
+            );
+        }
         session.turn = TurnState::Running(RunningTurn {
             agent_request_id,
             originator: client,
             started_at: SystemTime::now(),
-            notified: Vec::new(),
+            notified: others,
         });
     }
 
@@ -714,9 +904,6 @@ impl Router {
         params: Value,
         message: Value,
     ) {
-        let Some((agent, agent_name)) = self.client_agent(client) else {
-            return;
-        };
         if method == "$/cancel_request" {
             let Some(request_id) = params.get("requestId") else {
                 return;
@@ -751,11 +938,13 @@ impl Router {
         }
 
         let target = session_id_of(&params)
-            .and_then(|session_id| self.sessions.get(&(agent_name, session_id)))
+            .and_then(|session_id| self.session_key(client, &session_id))
+            .and_then(|key| self.sessions.get(&key))
             .map(|session| session.agent)
-            .unwrap_or(agent);
-        if let Some(agent) = self.agents.get(&target) {
-            agent.send(message);
+            .or_else(|| self.client_agent(client).map(|(agent, _)| agent));
+        match target.and_then(|target| self.agents.get(&target)) {
+            Some(agent) => agent.send(message),
+            None => log::debug!("dropping {method} from client {client}: no agent to receive it"),
         }
     }
 
@@ -769,9 +958,11 @@ impl Router {
             .get_mut(&client)
             .and_then(|state| state.forwarded.remove(&client_request_id))
         else {
-            log::warn!("client {client} answered unknown request {id}");
+            // Another observer answered first, or the agent withdrew the request.
+            log::debug!("client {client} answered request {id}, which is no longer pending");
             return;
         };
+        let label = self.client_label(client).to_string();
         let Some(agent_state) = self.agents.get_mut(&agent) else {
             return;
         };
@@ -783,19 +974,24 @@ impl Router {
             return;
         };
         let request = agent_state.pending_requests.remove(index);
-        if request.message.get("method").and_then(Value::as_str)
-            == Some("session/request_permission")
-        {
-            log::info!(
-                "client {client} answered a permission request in session {:?}: {}",
-                request.session_id,
-                message
-                    .get("result")
-                    .or_else(|| message.get("error"))
-                    .unwrap_or(&Value::Null)
-            );
-        }
-        agent_state.send(with_id(message, request.agent_request_id));
+        log::info!(
+            "{label} (client {client}) answered {} in session {:?}: {}",
+            request
+                .message
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("a request"),
+            request.session_id,
+            message
+                .get("result")
+                .or_else(|| message.get("error"))
+                .unwrap_or(&Value::Null)
+        );
+        agent_state.send(with_id(message, request.agent_request_id.clone()));
+        Self::withdraw_request(&mut self.clients, &request, Some(client));
+        self.notify(Notice::InputResolved {
+            key: notice_key(agent, &request_key),
+        });
     }
 
     fn handle_agent_message(&mut self, agent: AgentId, message: Value) {
@@ -1023,9 +1219,15 @@ impl Router {
                 );
             }
         }
+        let notice = Notice::TurnEnded {
+            agent: session.agent_name.clone(),
+            title: session.display_title(),
+            stop_reason: stop_reason.clone(),
+        };
         session.turn = TurnState::Idle {
             last_stop_reason: Some(stop_reason),
         };
+        self.notify(notice);
     }
 
     fn start_queued_prompt(&mut self, key: &SessionKey) {
@@ -1065,7 +1267,7 @@ impl Router {
     fn any_client_of(&self, agent: AgentId) -> Option<ClientId> {
         self.clients
             .iter()
-            .filter(|(_, state)| state.agent == agent)
+            .filter(|(_, state)| state.agent == Some(agent))
             .map(|(client, _)| *client)
             .min()
     }
@@ -1124,14 +1326,19 @@ impl Router {
 
         let session = session_id
             .as_ref()
-            .and_then(|session_id| self.sessions.get(&(agent_name, session_id.clone())));
-        let known_session = session.is_some();
-        let target = match (session, owner) {
-            (Some(session), _) => session.observer,
-            (None, Some(owner)) => Some(owner),
-            (None, None) => self.any_client_of(agent),
+            .and_then(|session_id| self.sessions.get(&(agent_name.clone(), session_id.clone())));
+        let targets = match (session, owner) {
+            (Some(session), _) => session.observers.clone(),
+            (None, Some(owner)) => vec![owner],
+            (None, None) => self.any_client_of(agent).into_iter().collect(),
         };
-        if target.is_none() && !known_session {
+        let notice = session.map(|session| Notice::InputRequested {
+            key: notice_key(agent, &request_id_key(&id)),
+            agent: agent_name,
+            title: session.display_title(),
+            detail: request_detail(&message),
+        });
+        if targets.is_empty() && notice.is_none() {
             if let Some(agent_state) = self.agents.get(&agent) {
                 agent_state.send(error_message(
                     id,
@@ -1146,13 +1353,16 @@ impl Router {
             agent_request_id: id,
             session_id,
             message,
-            forwarded_to: None,
+            forwarded: Vec::new(),
         };
-        if let Some(target) = target {
+        for target in targets {
             Self::forward_agent_request(&mut self.clients, agent, &mut request, target);
         }
         if let Some(agent_state) = self.agents.get_mut(&agent) {
             agent_state.pending_requests.push(request);
+        }
+        if let Some(notice) = notice {
+            self.notify(notice);
         }
     }
 
@@ -1180,15 +1390,10 @@ impl Router {
                 .position(|request| request_id_key(&request.agent_request_id) == key)
             {
                 let request = agent_state.pending_requests.remove(index);
-                if let Some((client, client_request_id)) = request.forwarded_to
-                    && let Some(state) = self.clients.get_mut(&client)
-                {
-                    state.forwarded.remove(&client_request_id);
-                    state
-                        .outgoing
-                        .try_send(cancel_request_message(json!(client_request_id)))
-                        .ok();
-                }
+                Self::withdraw_request(&mut self.clients, &request, None);
+                self.notify(Notice::InputResolved {
+                    key: notice_key(agent, &key),
+                });
             }
             return;
         }
@@ -1202,13 +1407,15 @@ impl Router {
                 {
                     session.record_update(update);
                 }
-                if let Some(observer) = session.observer {
-                    Self::send_to_client(&self.clients, observer, message);
+                for observer in &session.observers {
+                    Self::send_to_client(&self.clients, *observer, message.clone());
                 }
             }
             None => {
                 for (client, state) in &self.clients {
-                    if state.agent == agent && state.outgoing.try_send(message.clone()).is_err() {
+                    if state.agent == Some(agent)
+                        && state.outgoing.try_send(message.clone()).is_err()
+                    {
                         log::info!("client {client} is no longer accepting messages");
                     }
                 }
@@ -1217,14 +1424,12 @@ impl Router {
     }
 
     fn disconnect_client(&mut self, client: ClientId) {
-        if self.clients.remove(&client).is_none() {
+        let Some(state) = self.clients.remove(&client) else {
             return;
-        }
-        log::info!("client {client} disconnected");
+        };
+        log::info!("{} (client {client}) disconnected", state.label);
         for session in self.sessions.values_mut() {
-            if session.observer == Some(client) {
-                session.observer = None;
-            }
+            session.remove_observer(client);
         }
         for agent_state in self.agents.values_mut() {
             if let InitState::InFlight { waiters } = &mut agent_state.init {
@@ -1233,18 +1438,15 @@ impl Router {
             let agent_name = agent_state.key.name.clone();
             let outgoing = agent_state.handle.outgoing.clone();
             agent_state.pending_requests.retain_mut(|request| {
-                if request
-                    .forwarded_to
-                    .is_some_and(|(forwarded_client, _)| forwarded_client == client)
-                {
-                    request.forwarded_to = None;
-                }
-                let waits_for_attach = request.forwarded_to.is_some()
+                request
+                    .forwarded
+                    .retain(|(forwarded, _)| *forwarded != client);
+                let still_answerable = !request.forwarded.is_empty()
                     || request.session_id.as_ref().is_some_and(|session_id| {
                         self.sessions
                             .contains_key(&(agent_name.clone(), session_id.clone()))
                     });
-                if !waits_for_attach {
+                if !still_answerable {
                     outgoing
                         .try_send(error_message(
                             request.agent_request_id.clone(),
@@ -1253,7 +1455,7 @@ impl Router {
                         ))
                         .ok();
                 }
-                waits_for_attach
+                still_answerable
             });
         }
     }
@@ -1291,16 +1493,11 @@ impl Router {
                 );
             }
         }
-        for request in agent_state.pending_requests {
-            if let Some((client, client_request_id)) = request.forwarded_to
-                && let Some(state) = self.clients.get_mut(&client)
-            {
-                state.forwarded.remove(&client_request_id);
-                state
-                    .outgoing
-                    .try_send(cancel_request_message(json!(client_request_id)))
-                    .ok();
-            }
+        for request in &agent_state.pending_requests {
+            Self::withdraw_request(&mut self.clients, request, None);
+            self.notify(Notice::InputResolved {
+                key: notice_key(agent, &request_id_key(&request.agent_request_id)),
+            });
         }
         for session in self.sessions.values_mut() {
             if session.agent != agent {
@@ -1334,12 +1531,13 @@ impl Router {
             }
         }
 
-        // Clients of the exited agent cannot continue without it, so close their
-        // connections and let Zed report the exit.
+        // Clients started for the exited agent cannot continue without it, so
+        // close their connections and let Zed report the exit. Observers stay
+        // connected and can still replay the session.
         let orphaned = self
             .clients
             .iter()
-            .filter(|(_, state)| state.agent == agent)
+            .filter(|(_, state)| state.agent == Some(agent))
             .map(|(client, _)| *client)
             .collect::<Vec<_>>();
         for client in orphaned {
@@ -1392,7 +1590,7 @@ impl Router {
                 clients: self
                     .clients
                     .values()
-                    .filter(|client| client.agent == *id)
+                    .filter(|client| client.agent == Some(*id))
                     .count(),
                 sessions: self
                     .sessions
@@ -1406,17 +1604,18 @@ impl Router {
         sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
         let sessions = sessions
             .into_iter()
-            .map(|session| {
-                let waiting = self.agents.get(&session.agent).is_some_and(|agent| {
-                    agent
-                        .pending_requests
-                        .iter()
-                        .any(|request| request.session_id.as_ref() == Some(&session.session_id))
-                });
-                session.summary(waiting)
-            })
+            .map(|session| session.summary(self.is_waiting_for_input(session)))
             .collect();
-        ListResponse { agents, sessions }
+        let observers = self
+            .clients
+            .values()
+            .filter(|client| client.agent.is_none())
+            .count();
+        ListResponse {
+            agents,
+            sessions,
+            observers,
+        }
     }
 
     fn kill_session(&mut self, session_id: &str) -> usize {
@@ -1431,7 +1630,8 @@ impl Router {
                 continue;
             };
             log::info!("killing session {session_id} on request");
-            if let Some(agent_state) = self.agents.get_mut(&session.agent) {
+            let agent = session.agent;
+            if let Some(agent_state) = self.agents.get_mut(&agent) {
                 if session.is_running() {
                     agent_state.send(notification_message(
                         "session/cancel",
@@ -1454,17 +1654,10 @@ impl Router {
                     });
                 agent_state.pending_requests = kept;
                 for request in cancelled {
-                    if let Some((client, client_request_id)) = request.forwarded_to
-                        && let Some(state) = self.clients.get_mut(&client)
-                    {
-                        state.forwarded.remove(&client_request_id);
-                        state
-                            .outgoing
-                            .try_send(cancel_request_message(json!(client_request_id)))
-                            .ok();
-                    }
+                    Self::withdraw_request(&mut self.clients, &request, None);
                     let is_permission = request.message.get("method").and_then(Value::as_str)
                         == Some("session/request_permission");
+                    let key = notice_key(agent, &request_id_key(&request.agent_request_id));
                     agent_state.send(if is_permission {
                         response_message(
                             request.agent_request_id,
@@ -1477,6 +1670,9 @@ impl Router {
                             "Request cancelled",
                         )
                     });
+                    if let Some(notices) = &self.notices {
+                        notices.try_send(Notice::InputResolved { key }).ok();
+                    }
                 }
             }
             if let TurnState::Running(turn) = &session.turn {
@@ -1542,6 +1738,7 @@ mod tests {
         router: Router,
         launcher: FakeLauncher,
         clients: HashMap<ClientId, Receiver<Value>>,
+        notices: Receiver<Notice>,
     }
 
     impl Harness {
@@ -1552,11 +1749,33 @@ mod tests {
         fn with_config(config: Config) -> Self {
             let launcher = FakeLauncher::default();
             let (events, _) = smol::channel::unbounded();
+            let (notices, notices_receiver) = smol::channel::unbounded();
             Self {
-                router: Router::new("1.0.0".into(), config, Box::new(launcher.clone()), events),
+                router: Router::new(
+                    "1.0.0".into(),
+                    config,
+                    Box::new(launcher.clone()),
+                    events,
+                    Some(notices),
+                ),
                 launcher,
                 clients: HashMap::new(),
+                notices: notices_receiver,
             }
+        }
+
+        fn observe(&mut self, client: ClientId) {
+            let (outgoing, incoming) = smol::channel::unbounded();
+            self.router.handle(Event::Observe {
+                client,
+                label: format!("test observer {client}"),
+                outgoing,
+            });
+            self.clients.insert(client, incoming);
+        }
+
+        fn notices(&self) -> Vec<Notice> {
+            std::iter::from_fn(|| self.notices.try_recv().ok()).collect()
         }
 
         fn attach(&mut self, client: ClientId) {
@@ -1709,7 +1928,7 @@ mod tests {
                 "loadSession": true,
                 "sessionCapabilities": {"list": {}, "close": {}},
             },
-            "_meta": {"zed.dev/acpMux": {"protocol": 1}},
+            "_meta": {"zed.dev/acpMux": {"protocol": PROTOCOL_VERSION}},
         });
         assert_eq!(
             harness.client_messages(1),
@@ -1808,7 +2027,7 @@ mod tests {
         harness.update("s1", "detached output");
         assert!(harness.client_messages(1).is_empty());
         let session = &harness.router.sessions[&("claude".to_string(), "s1".to_string())];
-        assert_eq!(session.observer, None);
+        assert!(session.observers.is_empty());
         assert!(session.is_running());
     }
 
@@ -1937,7 +2156,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_client_takes_over_the_session_and_its_permission_requests() {
+    fn several_clients_observe_a_session_and_the_first_answer_wins() {
         let mut harness = Harness::new();
         harness.attach(1);
         harness.initialize(1);
@@ -1952,21 +2171,37 @@ mod tests {
         harness.attach(2);
         harness.initialize(2);
         harness.load(2, "s1");
-        assert_eq!(
-            harness.client_messages(1),
-            vec![cancel_request_message(json!(1))]
-        );
+        assert!(harness.client_messages(1).is_empty());
         let messages = harness.client_messages(2);
         assert_eq!(
             messages.last(),
             Some(&with_id(permission_request(json!(11), "s1"), json!(1)))
         );
 
-        harness.update("s1", "only for the new observer");
-        assert!(harness.client_messages(1).is_empty());
+        harness.update("s1", "for everyone");
+        assert_eq!(harness.client_messages(1).len(), 1);
         assert_eq!(harness.client_messages(2).len(), 1);
 
-        // A late answer from the displaced client is ignored.
+        harness.from_client(
+            2,
+            response_message(
+                json!(1),
+                json!({"outcome": {"outcome": "selected", "optionId": "yes"}}),
+            ),
+        );
+        assert_eq!(
+            harness.agent_messages(),
+            vec![response_message(
+                json!(11),
+                json!({"outcome": {"outcome": "selected", "optionId": "yes"}})
+            )]
+        );
+        assert_eq!(
+            harness.client_messages(1),
+            vec![cancel_request_message(json!(1))]
+        );
+
+        // A late answer from the other client is ignored.
         harness.from_client(
             1,
             response_message(
@@ -1975,6 +2210,174 @@ mod tests {
             ),
         );
         assert!(harness.agent_messages().is_empty());
+    }
+
+    #[test]
+    fn observers_list_every_session_but_cannot_start_sessions() {
+        let mut harness = Harness::new();
+        harness.attach(1);
+        harness.initialize(1);
+        harness.new_session(1, "s1");
+        harness.observe(9);
+
+        harness.from_client(
+            9,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1}}),
+        );
+        let initialize = harness.client_messages(9).remove(0);
+        assert_eq!(
+            initialize["result"]["_meta"]["zed.dev/acpMux"]["observer"],
+            true
+        );
+        assert!(harness.agent_messages().is_empty());
+
+        harness.from_client(
+            9,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/list", "params": {}}),
+        );
+        let list = harness.client_messages(9).remove(0);
+        assert_eq!(list["result"]["sessions"][0]["sessionId"], "s1");
+        assert_eq!(
+            list["result"]["sessions"][0]["_meta"]["zed.dev/acpMux"],
+            json!({"agent": "claude", "state": "idle", "observers": 1})
+        );
+
+        for (id, method) in [(3, "session/new"), (4, "authenticate")] {
+            harness.from_client(
+                9,
+                json!({"jsonrpc": "2.0", "id": id, "method": method, "params": {"cwd": "/", "mcpServers": []}}),
+            );
+            assert_eq!(
+                harness.client_messages(9)[0]["error"]["code"],
+                METHOD_NOT_FOUND
+            );
+        }
+        harness.load(9, "missing");
+        assert_eq!(
+            harness.client_messages(9)[0]["error"]["code"],
+            RESOURCE_NOT_FOUND
+        );
+        assert!(harness.agent_messages().is_empty());
+    }
+
+    #[test]
+    fn prompts_from_one_observer_are_mirrored_to_the_others() {
+        let mut harness = Harness::new();
+        harness.attach(1);
+        harness.initialize(1);
+        harness.new_session(1, "s1");
+        harness.observe(9);
+        harness.load(9, "s1");
+        harness.client_messages(9);
+
+        harness.from_client(
+            9,
+            json!({"jsonrpc": "2.0", "id": "phone", "method": "session/prompt", "params": {
+                "sessionId": "s1",
+                "prompt": [{"type": "text", "text": "from the phone"}],
+            }}),
+        );
+        let prompt = harness.agent_messages().remove(0);
+        assert_eq!(prompt["method"], "session/prompt");
+        assert_eq!(
+            harness.client_messages(1),
+            vec![
+                session_update_message(
+                    "s1",
+                    &json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "from the phone"}}),
+                ),
+                turn_state_running("s1"),
+            ]
+        );
+        assert!(harness.client_messages(9).is_empty());
+
+        harness.update("s1", "answer");
+        assert_eq!(harness.client_messages(1).len(), 1);
+        assert_eq!(harness.client_messages(9).len(), 1);
+
+        harness.from_agent(response_message(
+            prompt["id"].clone(),
+            json!({"stopReason": "end_turn"}),
+        ));
+        assert_eq!(
+            harness.client_messages(9),
+            vec![response_message(
+                json!("phone"),
+                json!({"stopReason": "end_turn"})
+            )]
+        );
+        assert_eq!(
+            harness.client_messages(1),
+            vec![turn_state_idle("s1", "end_turn")]
+        );
+    }
+
+    #[test]
+    fn closing_or_disconnecting_an_observer_keeps_requests_for_the_others() {
+        let mut harness = Harness::new();
+        harness.attach(1);
+        harness.initialize(1);
+        harness.new_session(1, "s1");
+        harness.observe(9);
+        harness.load(9, "s1");
+        harness.from_agent(permission_request(json!(5), "s1"));
+        harness.client_messages(1);
+        harness.client_messages(9);
+
+        harness.disconnect(9);
+        assert!(harness.agent_messages().is_empty());
+        harness.from_client(
+            1,
+            json!({"jsonrpc": "2.0", "id": 4, "method": "session/close", "params": {"sessionId": "s1"}}),
+        );
+        harness.client_messages(1);
+        assert!(harness.agent_messages().is_empty());
+
+        harness.observe(10);
+        harness.load(10, "s1");
+        assert_eq!(
+            harness.client_messages(10).last(),
+            Some(&with_id(permission_request(json!(5), "s1"), json!(1)))
+        );
+    }
+
+    #[test]
+    fn reports_notices_for_requests_and_finished_turns() {
+        let mut harness = Harness::new();
+        harness.attach(1);
+        harness.initialize(1);
+        harness.new_session(1, "s1");
+        let prompt_id = harness.prompt(1, "s1", "hi");
+        harness.from_agent(permission_request(json!(5), "s1"));
+        harness.from_client(
+            1,
+            response_message(
+                json!(1),
+                json!({"outcome": {"outcome": "selected", "optionId": "yes"}}),
+            ),
+        );
+        harness.from_agent(response_message(
+            prompt_id,
+            json!({"stopReason": "end_turn"}),
+        ));
+
+        assert_eq!(
+            harness.notices(),
+            vec![
+                Notice::InputRequested {
+                    key: "1:5".into(),
+                    agent: "claude".into(),
+                    title: "/project".into(),
+                    detail: "需要你的回答".into(),
+                },
+                Notice::InputResolved { key: "1:5".into() },
+                Notice::TurnEnded {
+                    agent: "claude".into(),
+                    title: "/project".into(),
+                    stop_reason: "end_turn".into(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -2060,8 +2463,8 @@ mod tests {
     fn auto_approves_configured_tool_kinds() {
         let mut harness = Harness::with_config(Config {
             enabled: true,
-            agents: None,
             auto_approve: vec!["edit".to_string()],
+            ..Config::default()
         });
         harness.attach(1);
         harness.initialize(1);

@@ -11,7 +11,11 @@ use std::{
 use crate::{attach, pid_path, socket_path};
 
 /// Version of the line protocol between `attach`/control clients and the daemon.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Version 2 added observer connections.
+pub const PROTOCOL_VERSION: u32 = 2;
+/// The oldest client protocol the daemon still accepts, so that `attach`
+/// processes started by an older remote server keep working after an upgrade.
+pub const MIN_PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Handshake {
@@ -25,6 +29,15 @@ pub struct Handshake {
 pub enum HandshakeRequest {
     Attach { agent: String, command: AgentSpec },
     Control { control: ControlRequest },
+    Observe { observe: ObserveRequest },
+}
+
+/// Connects without an agent: the client can only list and use existing sessions.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct ObserveRequest {
+    /// Describes the client in the daemon's log, for example the remote address.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -88,6 +101,9 @@ pub struct HandshakeReply {
 pub struct ListResponse {
     pub agents: Vec<AgentSummary>,
     pub sessions: Vec<SessionSummary>,
+    /// Connected clients that are not tied to an agent, such as the web gateway's.
+    #[serde(default)]
+    pub observers: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -107,6 +123,8 @@ pub struct SessionSummary {
     pub title: Option<String>,
     pub state: SessionState,
     pub attached: bool,
+    #[serde(default)]
+    pub observers: usize,
     pub updated_at: String,
 }
 
@@ -120,7 +138,7 @@ pub enum SessionState {
 }
 
 impl SessionState {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             SessionState::Idle => "idle",
             SessionState::Running => "running",
@@ -219,6 +237,7 @@ pub fn list() -> Result<()> {
             agent.program,
         )?;
     }
+    writeln!(stdout, "OBSERVERS {}", response.observers)?;
     writeln!(stdout, "SESSIONS")?;
     if response.sessions.is_empty() {
         writeln!(stdout, "  (none)")?;
@@ -226,14 +245,14 @@ pub fn list() -> Result<()> {
     for session in &response.sessions {
         writeln!(
             stdout,
-            "  {:<38} {:<16} {:<8} {:<9} {} {} {}",
+            "  {:<38} {:<16} {:<8} {:<11} {} {} {}",
             session.session_id,
             session.agent,
             session.state.label(),
             if session.attached {
-                "attached"
+                format!("attached({})", session.observers)
             } else {
-                "detached"
+                "detached".to_string()
             },
             session.updated_at,
             session.cwd,

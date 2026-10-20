@@ -1,0 +1,12 @@
+{
+  "name": "Zed Agent",
+  "short_name": "Agent",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#1f2328",
+  "theme_color": "#1f2328",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
