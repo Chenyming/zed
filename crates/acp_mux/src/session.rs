@@ -176,20 +176,10 @@ impl MuxSession {
         }
     }
 
-    pub fn set_current_mode(&mut self, mode_id: Value) {
-        if let Some(modes) = self.modes.as_mut().and_then(Value::as_object_mut) {
-            modes.insert("currentModeId".into(), mode_id);
-        }
-    }
-
     pub fn set_current_model(&mut self, model_id: Value) {
         if let Some(models) = self.models.as_mut().and_then(Value::as_object_mut) {
             models.insert("currentModelId".into(), model_id);
         }
-    }
-
-    pub fn set_config_options(&mut self, config_options: Value) {
-        self.config_options = Some(config_options);
     }
 
     pub fn load_response(&self) -> Value {

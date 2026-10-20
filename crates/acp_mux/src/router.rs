@@ -1098,10 +1098,12 @@ impl Router {
                         session_id,
                         mode_id,
                     } => {
-                        if result.is_some()
-                            && let Some(session) = self.sessions.get_mut(&(agent_name, session_id))
-                        {
-                            session.set_current_mode(mode_id);
+                        if result.is_some() {
+                            self.share_session_change(
+                                &(agent_name, session_id),
+                                json!({"sessionUpdate": "current_mode_update", "currentModeId": mode_id}),
+                                client,
+                            );
                         }
                     }
                     CallKind::SetModel {
@@ -1117,9 +1119,15 @@ impl Router {
                     CallKind::SetConfigOption { session_id } => {
                         if let Some(config_options) =
                             result.and_then(|result| result.get("configOptions"))
-                            && let Some(session) = self.sessions.get_mut(&(agent_name, session_id))
                         {
-                            session.set_config_options(config_options.clone());
+                            self.share_session_change(
+                                &(agent_name, session_id),
+                                json!({
+                                    "sessionUpdate": "config_option_update",
+                                    "configOptions": config_options,
+                                }),
+                                client,
+                            );
                         }
                     }
                     CallKind::DeleteSession { session_id } => {
@@ -1132,6 +1140,21 @@ impl Router {
                 if let Some(key) = next_prompt {
                     self.start_queued_prompt(&key);
                 }
+            }
+        }
+    }
+
+    /// Records a change one client made to a session and tells its other
+    /// observers, because agents do not notify about changes their client asked for.
+    fn share_session_change(&mut self, key: &SessionKey, update: Value, author: ClientId) {
+        let Some(session) = self.sessions.get_mut(key) else {
+            return;
+        };
+        session.record_update(&update);
+        let message = session_update_message(&session.session_id, &update);
+        for observer in &session.observers {
+            if *observer != author {
+                Self::send_to_client(&self.clients, *observer, message.clone());
             }
         }
     }
@@ -2310,6 +2333,68 @@ mod tests {
             harness.client_messages(1),
             vec![turn_state_idle("s1", "end_turn")]
         );
+    }
+
+    #[test]
+    fn mode_and_config_changes_reach_the_other_observers() {
+        let mut harness = Harness::new();
+        harness.attach(1);
+        harness.initialize(1);
+        harness.new_session(1, "s1");
+        harness.observe(9);
+        harness.load(9, "s1");
+        harness.client_messages(9);
+
+        harness.from_client(
+            9,
+            json!({"jsonrpc": "2.0", "id": 5, "method": "session/set_config_option", "params": {
+                "sessionId": "s1", "configId": "model", "value": "fast",
+            }}),
+        );
+        let request = harness.agent_messages().remove(0);
+        let config_options = json!([{"id": "model", "type": "select", "currentValue": "fast"}]);
+        harness.from_agent(response_message(
+            request["id"].clone(),
+            json!({"configOptions": config_options}),
+        ));
+        assert_eq!(
+            harness.client_messages(9),
+            vec![response_message(
+                json!(5),
+                json!({"configOptions": config_options})
+            )]
+        );
+        assert_eq!(
+            harness.client_messages(1),
+            vec![session_update_message(
+                "s1",
+                &json!({"sessionUpdate": "config_option_update", "configOptions": config_options}),
+            )]
+        );
+
+        harness.from_client(
+            9,
+            json!({"jsonrpc": "2.0", "id": 6, "method": "session/set_mode", "params": {
+                "sessionId": "s1", "modeId": "code",
+            }}),
+        );
+        let request = harness.agent_messages().remove(0);
+        harness.from_agent(response_message(request["id"].clone(), json!({})));
+        assert_eq!(
+            harness.client_messages(1),
+            vec![session_update_message(
+                "s1",
+                &json!({"sessionUpdate": "current_mode_update", "currentModeId": "code"}),
+            )]
+        );
+        harness.client_messages(9);
+
+        // A client that opens the session later sees the current values.
+        harness.observe(10);
+        harness.load(10, "s1");
+        let response = harness.client_messages(10).pop().expect("a load response");
+        assert_eq!(response["result"]["configOptions"], config_options);
+        assert_eq!(response["result"]["modes"]["currentModeId"], "code");
     }
 
     #[test]
