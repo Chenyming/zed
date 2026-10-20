@@ -7,6 +7,8 @@
 const META_KEY = "zed.dev/acpMux";
 const TURN_STATE_METHOD = "_zed.dev/acpMux/turn_state";
 const LIST_REFRESH_MS = 5000;
+const WIDE = window.matchMedia("(min-width: 900px)");
+const COARSE = window.matchMedia("(pointer: coarse)");
 
 const STATE_LABELS = {
   running: "运行中",
@@ -14,18 +16,16 @@ const STATE_LABELS = {
   idle: "空闲",
   dead: "已退出",
 };
-const TOOL_STATUS_ICONS = { pending: "○", in_progress: "◐", completed: "✓", failed: "✕" };
-const TOOL_KIND_LABELS = {
-  read: "读取",
-  edit: "编辑",
-  delete: "删除",
-  move: "移动",
-  search: "搜索",
-  execute: "执行",
-  think: "思考",
-  fetch: "获取",
-  switch_mode: "切换模式",
-  other: "其他",
+const TOOL_ICONS = {
+  read: "read",
+  edit: "edit",
+  delete: "delete",
+  move: "move",
+  search: "search",
+  execute: "execute",
+  think: "think",
+  fetch: "fetch",
+  switch_mode: "switch",
 };
 const STOP_REASON_LABELS = {
   end_turn: "已完成",
@@ -40,8 +40,65 @@ const $ = (id) => document.getElementById(id);
 function element(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
+  if (text !== undefined && text !== null) node.textContent = text;
   return node;
+}
+
+function icon(name, className) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", className ? `icon ${className}` : "icon");
+  svg.setAttribute("aria-hidden", "true");
+  const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+  use.setAttribute("href", `#i-${name}`);
+  svg.appendChild(use);
+  return svg;
+}
+
+function stateMark(state, label) {
+  const mark = element("span", `state ${state}`);
+  if (state === "running" || state === "in_progress") mark.appendChild(icon("spinner"));
+  else if (state === "completed") mark.appendChild(icon("check"));
+  else if (state === "failed") mark.appendChild(icon("x"));
+  else if (state === "pending") mark.appendChild(icon("pending"));
+  else if (state === "dead") mark.appendChild(icon("x"));
+  if (label) {
+    mark.setAttribute("role", "img");
+    mark.setAttribute("aria-label", label);
+  } else {
+    mark.setAttribute("aria-hidden", "true");
+  }
+  return mark;
+}
+
+// Long paths are cut from the left so the file name stays visible. The text sits
+// in an isolated left-to-right span, otherwise the right-to-left container
+// would move leading slashes to the end.
+function pathElement(className, path) {
+  const container = element("span", className);
+  container.title = path;
+  container.appendChild(element("span", "ltr", path));
+  return container;
+}
+
+function basename(path) {
+  const trimmed = (path || "").replace(/\/+$/, "");
+  return trimmed.slice(trimmed.lastIndexOf("/") + 1) || trimmed || "/";
+}
+
+function dirname(path) {
+  const trimmed = (path || "").replace(/\/+$/, "");
+  const index = trimmed.lastIndexOf("/");
+  return index > 0 ? trimmed.slice(0, index) : "";
+}
+
+function relativeTime(timestamp) {
+  if (!timestamp) return "";
+  const seconds = (Date.now() - Date.parse(timestamp)) / 1000;
+  if (seconds < 45) return "刚刚";
+  if (seconds < 3600) return `${Math.max(1, Math.round(seconds / 60))} 分钟前`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)} 小时前`;
+  if (seconds < 7 * 86400) return `${Math.round(seconds / 86400)} 天前`;
+  return new Date(timestamp).toLocaleDateString();
 }
 
 // ---------------------------------------------------------------------------
@@ -58,10 +115,11 @@ const connection = {
 
 function connect() {
   clearTimeout(connection.retryTimer);
+  showApp();
   const scheme = location.protocol === "https:" ? "wss://" : "ws://";
   const socket = new WebSocket(`${scheme}${location.host}/api/v1/acp`);
   connection.socket = socket;
-  setStatus("连接中", "offline");
+  setConnection("connecting");
 
   socket.addEventListener("open", async () => {
     connection.connected = true;
@@ -70,11 +128,13 @@ function connect() {
       await request("initialize", {
         protocolVersion: 1,
         clientCapabilities: {},
-        clientInfo: { name: "acp-mux-web", version: "1" },
+        clientInfo: { name: "acp-mux-web", version: "2" },
       });
+      setConnection("online");
+      refreshList();
       route();
     } catch (error) {
-      showBanner(`初始化失败：${error.message}`);
+      showListBanner(`初始化失败：${error.message}`);
     }
   });
   socket.addEventListener("message", (event) => {
@@ -91,7 +151,10 @@ function connect() {
     connection.connected = false;
     for (const { reject } of connection.pending.values()) reject(new Error("连接已断开"));
     connection.pending.clear();
-    setStatus("已断开", "offline");
+    // The daemon forgets this observer with the connection, so the open
+    // session has to be loaded again after reconnecting.
+    if (session) session.stale = true;
+    setConnection("offline");
     scheduleReconnect();
   });
 }
@@ -104,12 +167,14 @@ async function scheduleReconnect() {
     showLogin();
     return;
   }
+  const seconds = Math.round(connection.retryDelay / 1000);
+  showListBanner(`连接已断开，${seconds} 秒后重试`);
   connection.retryTimer = setTimeout(connect, connection.retryDelay);
   connection.retryDelay = Math.min(connection.retryDelay * 2, 30000);
 }
 
 function send(message) {
-  if (!connection.connected) throw new Error("未连接");
+  if (!connection.connected) throw new Error("未连接到服务器");
   connection.socket.send(JSON.stringify({ jsonrpc: "2.0", ...message }));
 }
 
@@ -124,10 +189,6 @@ function request(method, params) {
       reject(error);
     }
   });
-}
-
-function respond(id, result) {
-  send({ id, result });
 }
 
 function handleMessage(message) {
@@ -154,9 +215,7 @@ function handleMessage(message) {
     case TURN_STATE_METHOD:
       if (session && params.sessionId === session.id) {
         setRunning(params.state === "running");
-        if (params.state === "idle" && params.stopReason && params.stopReason !== "end_turn") {
-          showBanner(`本轮${STOP_REASON_LABELS[params.stopReason] || "出错"}`);
-        }
+        if (params.state === "idle") reportStop(params.stopReason);
       }
       break;
     case "$/cancel_request":
@@ -167,57 +226,58 @@ function handleMessage(message) {
 
 async function fetchHealth() {
   try {
-    const response = await fetch("/api/v1/health", { credentials: "same-origin" });
+    const response = await fetch("/api/v1/health", { credentials: "same-origin", cache: "no-store" });
     return await response.json();
   } catch {
     return null;
   }
 }
 
+function setConnection(state) {
+  const node = $("connection");
+  node.className = `connection ${state}`;
+  node.textContent = { online: "已连接", connecting: "连接中", offline: "已断开" }[state];
+  if (state === "online") $("list-banner").hidden = true;
+  if (session) {
+    updateStatus();
+    updateComposer();
+  }
+}
+
+function showListBanner(text) {
+  const banner = $("list-banner");
+  banner.replaceChildren(icon("alert"), element("span", "", text));
+  banner.hidden = false;
+}
+
 // ---------------------------------------------------------------------------
-// Views and routing
+// Layout and routing
 
-function show(view) {
-  for (const id of ["login-view", "list-view", "session-view"]) {
-    $(id).classList.toggle("hidden", id !== view);
-  }
-  $("back").classList.toggle("hidden", view !== "session-view");
+function showApp() {
+  $("login").hidden = true;
+  $("app").classList.remove("logged-out");
 }
 
-function setStatus(text, kind) {
-  const status = $("status");
-  status.textContent = text;
-  status.className = `chip ${kind || ""}`;
-}
-
-function setTitle(title, subtitle) {
-  $("title").textContent = title;
-  $("subtitle").textContent = subtitle || "";
-  document.title = title;
-}
-
-function showBanner(text) {
-  const entries = $("entries");
-  const banner = element("p", "banner", text);
-  if (!$("session-view").classList.contains("hidden")) {
-    entries.appendChild(banner);
-    scrollToBottom(true);
-  } else {
-    $("sessions").prepend(banner);
-  }
+function currentRoute() {
+  const match = location.hash.match(/^#\/s\/(.+)$/);
+  return match ? decodeURIComponent(match[1]) : null;
 }
 
 function route() {
-  const match = location.hash.match(/^#\/session\/(.+)$/);
-  if (match) {
-    openSession(decodeURIComponent(match[1]));
+  const id = currentRoute();
+  $("app").dataset.view = id ? "thread" : "list";
+  if (id) {
+    if (!session || session.id !== id || session.stale) openSession(id);
   } else {
-    openList();
+    closeSession();
+    showThreadEmpty();
   }
+  highlightSelection();
 }
 
 window.addEventListener("hashchange", () => {
   if (connection.connected) route();
+  else $("app").dataset.view = currentRoute() ? "thread" : "list";
 });
 
 $("back").addEventListener("click", () => {
@@ -227,17 +287,34 @@ $("back").addEventListener("click", () => {
 // ---------------------------------------------------------------------------
 // Login
 
-function showLogin() {
+function showLogin(message) {
   closeSession();
-  show("login-view");
-  setTitle("Zed Agent");
-  setStatus("未登录", "offline");
-  $("token").focus();
+  clearTimeout(listTimer);
+  $("app").classList.add("logged-out");
+  $("login").hidden = false;
+  setLoginError(message);
+  setTimeout(() => $("token").focus(), 50);
 }
+
+function setLoginError(message) {
+  $("login-error").hidden = !message;
+  $("login-error").textContent = message || "";
+}
+
+$("token-toggle").addEventListener("click", () => {
+  const input = $("token");
+  const reveal = input.type === "password";
+  input.type = reveal ? "text" : "password";
+  $("token-toggle").setAttribute("aria-label", reveal ? "隐藏 token" : "显示 token");
+  $("token-toggle").replaceChildren(icon(reveal ? "eye-off" : "eye"));
+});
 
 $("login-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  $("login-error").textContent = "";
+  setLoginError(null);
+  const submit = $("login-submit");
+  submit.disabled = true;
+  submit.textContent = "正在登录…";
   try {
     const response = await fetch("/api/v1/login", {
       method: "POST",
@@ -246,20 +323,42 @@ $("login-form").addEventListener("submit", async (event) => {
       body: JSON.stringify({ token: $("token").value.trim() }),
     });
     if (!response.ok) {
-      const body = await response.json().catch(() => ({}));
-      $("login-error").textContent = response.status === 429 ? "尝试次数过多，请稍后再试" : body.error || "登录失败";
+      setLoginError(
+        response.status === 429
+          ? "失败次数太多，请一分钟后再试。"
+          : response.status === 401
+            ? "token 不正确。请复制服务器上 token 文件的完整内容。"
+            : `登录失败（${response.status}）。`,
+      );
+      return;
+    }
+    // The login is a cookie. Browsers drop `Secure` cookies on plain HTTP,
+    // which looks like a login that silently does nothing.
+    const health = await fetchHealth();
+    if (!health || !health.authenticated) {
+      setLoginError(
+        location.protocol === "http:"
+          ? "token 正确，但浏览器没有保存登录 cookie。通过 http 访问时，需要在 acp_mux.json 的 gateway 中设置 \"cookie_secure\": false 并执行 acp-mux restart，或改用 https。"
+          : "token 正确，但浏览器没有保存登录 cookie。请检查浏览器是否禁用了 cookie。",
+      );
       return;
     }
     $("token").value = "";
     connect();
   } catch (error) {
-    $("login-error").textContent = error.message;
+    setLoginError(`无法连接到服务器：${error.message}`);
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "登录";
   }
 });
 
 $("logout").addEventListener("click", async () => {
   await fetch("/api/v1/logout", { method: "POST", credentials: "same-origin" }).catch(() => {});
-  connection.socket?.close();
+  const socket = connection.socket;
+  connection.socket = null;
+  connection.connected = false;
+  socket?.close();
   showLogin();
 });
 
@@ -267,86 +366,147 @@ $("logout").addEventListener("click", async () => {
 // Session list
 
 let listTimer = null;
+let listLoaded = false;
 const knownSessions = new Map();
-
-function openList() {
-  closeSession();
-  show("list-view");
-  setTitle("会话");
-  setStatus("已连接", "");
-  refreshList();
-}
 
 async function refreshList() {
   clearTimeout(listTimer);
-  if ($("list-view").classList.contains("hidden") || !connection.connected) return;
+  if (!connection.connected) return;
+  if (!listLoaded) renderListSkeleton();
   try {
     const result = await request("session/list", {});
+    listLoaded = true;
     renderList(result.sessions || []);
   } catch (error) {
-    showBanner(`获取会话列表失败：${error.message}`);
+    if (connection.connected) showListBanner(`获取会话失败：${error.message}`);
   }
   listTimer = setTimeout(refreshList, LIST_REFRESH_MS);
 }
 
 function sessionMeta(entry) {
-  return (entry._meta && entry._meta[META_KEY]) || {};
+  return (entry?._meta && entry._meta[META_KEY]) || {};
 }
 
-function stateOrder(state) {
-  return { waiting: 0, running: 1, idle: 2, dead: 3 }[state] ?? 2;
+function renderListSkeleton() {
+  const list = $("session-list");
+  list.replaceChildren();
+  for (let index = 0; index < 4; index++) {
+    const row = element("div", "skeleton-row");
+    row.appendChild(element("div", "skeleton skeleton-line"));
+    const lines = element("div");
+    lines.append(element("div", "skeleton skeleton-line"), element("div", "skeleton skeleton-line short"));
+    row.appendChild(lines);
+    list.appendChild(row);
+  }
 }
 
-function relativeTime(timestamp) {
-  if (!timestamp) return "";
-  const seconds = (Date.now() - Date.parse(timestamp)) / 1000;
-  if (seconds < 60) return "刚刚";
-  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`;
-  return new Date(timestamp).toLocaleString();
-}
-
-function renderList(sessions) {
-  const container = $("sessions");
-  container.replaceChildren();
-  $("sessions-empty").classList.toggle("hidden", sessions.length > 0);
+function renderList(entries) {
+  const list = $("session-list");
+  const scroll = list.scrollTop;
+  list.replaceChildren();
   knownSessions.clear();
+  for (const entry of entries) knownSessions.set(entry.sessionId, entry);
 
-  const groups = new Map();
-  for (const entry of sessions) {
-    knownSessions.set(entry.sessionId, entry);
-    const agent = sessionMeta(entry).agent || "agent";
-    if (!groups.has(agent)) groups.set(agent, []);
-    groups.get(agent).push(entry);
-  }
-  for (const [agent, entries] of groups) {
-    container.appendChild(element("div", "group-title", agent));
-    entries.sort(
-      (a, b) =>
-        stateOrder(sessionMeta(a).state) - stateOrder(sessionMeta(b).state) ||
-        Date.parse(b.updatedAt || 0) - Date.parse(a.updatedAt || 0),
+  if (entries.length === 0) {
+    const empty = element("div", "list-empty");
+    empty.appendChild(element("strong", "", "还没有会话"));
+    empty.appendChild(element("span", "", "这里会列出 acp-mux 管理的 agent 会话："));
+    const steps = element("ol");
+    steps.append(
+      element("li", "", "在服务器上开启 acp-mux"),
+      element("li", "", "在 Zed 的远程项目里打开 agent 并发起任务"),
+      element("li", "", "回到这里查看和操作"),
     );
-    for (const entry of entries) {
-      const meta = sessionMeta(entry);
-      const button = element("button", "card session-item");
-      button.type = "button";
-      const row = element("div", "row");
-      row.appendChild(element("span", "name", entry.title || entry.cwd || entry.sessionId));
-      const state = meta.state || "idle";
-      row.appendChild(element("span", `chip ${state}`, STATE_LABELS[state] || state));
-      button.appendChild(row);
-      const observers = meta.observers ? ` · ${meta.observers} 处在看` : "";
-      button.appendChild(element("div", "meta", `${entry.cwd || ""} · ${relativeTime(entry.updatedAt)}${observers}`));
-      button.addEventListener("click", () => {
-        location.hash = `#/session/${encodeURIComponent(entry.sessionId)}`;
-      });
-      container.appendChild(button);
-    }
+    empty.appendChild(steps);
+    list.appendChild(empty);
+    updateDocumentTitle(0);
+    return;
   }
+
+  const waiting = entries.filter((entry) => sessionMeta(entry).state === "waiting");
+  if (waiting.length) {
+    list.appendChild(renderGroup("需要你处理", null, waiting, "attention-group", "shield"));
+  }
+
+  const projects = new Map();
+  for (const entry of entries) {
+    if (sessionMeta(entry).state === "waiting") continue;
+    const key = entry.cwd || "";
+    if (!projects.has(key)) projects.set(key, []);
+    projects.get(key).push(entry);
+  }
+  const ordered = [...projects.entries()].sort(
+    ([, a], [, b]) => Date.parse(b[0].updatedAt || 0) - Date.parse(a[0].updatedAt || 0),
+  );
+  for (const [cwd, group] of ordered) {
+    list.appendChild(renderGroup(basename(cwd), dirname(cwd), group, "", "folder"));
+  }
+  list.scrollTop = scroll;
+  updateDocumentTitle(waiting.length);
+  highlightSelection();
+  const open = session && knownSessions.get(session.id);
+  if (open) {
+    $("thread-meta").textContent = [sessionMeta(open).agent, open.cwd].filter(Boolean).join(" · ");
+    $("thread-meta").title = open.cwd || "";
+    if (open.title) $("thread-title").textContent = open.title;
+  }
+}
+
+function renderGroup(name, path, entries, className, iconName) {
+  const group = element("section", `group ${className}`);
+  const head = element("h2", "group-head");
+  head.appendChild(icon(iconName));
+  head.appendChild(element("span", "", name));
+  if (path) head.appendChild(pathElement("group-path", path));
+  group.appendChild(head);
+  for (const entry of entries) group.appendChild(renderRow(entry));
+  return group;
+}
+
+function renderRow(entry) {
+  const meta = sessionMeta(entry);
+  const state = meta.state || "idle";
+  const row = element("button", "session-row");
+  row.type = "button";
+  row.dataset.sessionId = entry.sessionId;
+  row.appendChild(stateMark(state, STATE_LABELS[state]));
+
+  const text = element("div");
+  const title = element("div", entry.title ? "row-title" : "row-title untitled", entry.title || "未命名会话");
+  const details = element("div", "row-meta");
+  details.appendChild(element("span", "agent", meta.agent || "agent"));
+  if (state === "running" || state === "waiting" || state === "dead") {
+    details.appendChild(element("span", "", `· ${STATE_LABELS[state]}`));
+  }
+  if (meta.observers) {
+    const watchers = element("span", "watchers");
+    watchers.title = `${meta.observers} 处正在查看`;
+    watchers.append(icon("eye"), document.createTextNode(String(meta.observers)));
+    details.appendChild(watchers);
+  }
+  text.append(title, details);
+  row.appendChild(text);
+  row.appendChild(element("span", "row-time", relativeTime(entry.updatedAt)));
+  row.addEventListener("click", () => {
+    location.hash = `#/s/${encodeURIComponent(entry.sessionId)}`;
+  });
+  return row;
+}
+
+function highlightSelection() {
+  const id = currentRoute();
+  for (const row of document.querySelectorAll(".session-row")) {
+    if (row.dataset.sessionId === id) row.setAttribute("aria-current", "page");
+    else row.removeAttribute("aria-current");
+  }
+}
+
+function updateDocumentTitle(waiting) {
+  document.title = waiting ? `(${waiting}) Zed Agent` : "Zed Agent";
 }
 
 // ---------------------------------------------------------------------------
-// Session view
+// Thread view
 
 let session = null;
 
@@ -360,70 +520,133 @@ function newSessionState(id) {
     configOptions: null,
     running: false,
     dead: false,
+    loading: true,
     requests: new Map(),
     renderScheduled: false,
+    unseen: false,
   };
+}
+
+function showThreadEmpty() {
+  $("thread-empty").hidden = false;
+  for (const id of ["thread-head", "stream", "dock", "jump"]) $(id).hidden = true;
 }
 
 async function openSession(id) {
   closeSession();
-  clearTimeout(listTimer);
   session = newSessionState(id);
   const known = knownSessions.get(id);
-  const meta = known ? sessionMeta(known) : {};
+  const meta = sessionMeta(known);
   session.dead = meta.state === "dead";
-  show("session-view");
-  setTitle(known?.title || known?.cwd || "会话", known ? `${meta.agent || ""} · ${known.cwd || ""}` : "");
-  $("entries").replaceChildren();
-  $("requests").replaceChildren();
-  $("plan").classList.add("hidden");
-  $("session-controls").classList.add("hidden");
-  setRunning(false);
+
+  $("thread-empty").hidden = true;
+  $("thread-head").hidden = false;
+  $("stream").hidden = false;
+  $("dock").hidden = false;
+  $("jump").hidden = true;
+  $("attention").hidden = true;
+  $("plan").hidden = true;
+  $("controls").replaceChildren();
+  setThreadHeading(known?.title, meta.agent, known?.cwd);
+  renderStreamSkeleton();
+  updateStatus();
   updateComposer();
 
   const current = session;
   try {
     const result = await request("session/load", { sessionId: id, cwd: known?.cwd || "/", mcpServers: [] });
     if (session !== current) return;
+    session.loading = false;
     session.modes = result.modes || null;
     session.configOptions = result.configOptions || null;
+    $("entries").querySelectorAll(".stream-skeleton").forEach((node) => node.remove());
     renderControls();
-    scheduleRender();
+    renderEntries();
     scrollToBottom(true);
+    if (!COARSE.matches && !session.dead) $("message").focus({ preventScroll: true });
   } catch (error) {
     if (session !== current) return;
-    showBanner(`打开会话失败：${error.message}`);
+    session.loading = false;
+    $("entries").replaceChildren();
+    appendNotice(`打开会话失败：${error.message}`, true);
     session.dead = true;
-    updateComposer();
   }
+  updateStatus();
+  updateComposer();
 }
 
 function closeSession() {
   if (!session) return;
-  const id = session.id;
+  const { id, stale } = session;
   session = null;
-  if (connection.connected) request("session/close", { sessionId: id }).catch(() => {});
+  $("entries").replaceChildren();
+  $("generating").hidden = true;
+  if (connection.connected && !stale) request("session/close", { sessionId: id }).catch(() => {});
+}
+
+function setThreadHeading(title, agent, cwd) {
+  $("thread-title").textContent = title || "未命名会话";
+  $("thread-meta").textContent = [agent, cwd].filter(Boolean).join(" · ");
+  $("thread-meta").title = cwd || "";
+}
+
+function renderStreamSkeleton() {
+  const entries = $("entries");
+  entries.replaceChildren();
+  for (const width of ["62%", "90%", "75%"]) {
+    const block = element("div", "stream-skeleton entry");
+    for (let line = 0; line < 3; line++) {
+      const bar = element("div", "skeleton skeleton-line");
+      bar.style.width = line === 2 ? "40%" : width;
+      block.appendChild(bar);
+    }
+    entries.appendChild(block);
+  }
+}
+
+function sessionState() {
+  if (!session) return "idle";
+  if (session.dead) return "dead";
+  if (session.requests.size > 0) return "waiting";
+  return session.running ? "running" : "idle";
+}
+
+function updateStatus() {
+  if (!session) return;
+  const pill = $("thread-status");
+  if (!connection.connected) {
+    pill.className = "status-pill offline";
+    pill.replaceChildren(icon("alert"), element("span", "", "已断开"));
+  } else if (session.loading) {
+    pill.className = "status-pill";
+    pill.replaceChildren(element("span", "", "加载中"));
+  } else {
+    const state = sessionState();
+    pill.className = `status-pill ${state}`;
+    pill.replaceChildren(stateMark(state), element("span", "", STATE_LABELS[state]));
+  }
+  $("generating").hidden = !(session.running && !session.loading && session.requests.size === 0);
+  updateAttention();
 }
 
 function setRunning(running) {
   if (!session) return;
   session.running = running;
-  if (session.dead) {
-    setStatus("已退出", "dead");
-  } else if (session.requests.size > 0) {
-    setStatus("等待授权", "waiting");
-  } else {
-    setStatus(running ? "运行中" : "空闲", running ? "running" : "");
-  }
+  updateStatus();
   updateComposer();
 }
 
-function updateComposer() {
-  if (!session) return;
-  $("stop").classList.toggle("hidden", !session.running);
-  $("composer").classList.toggle("hidden", session.dead);
-  $("session-note").classList.toggle("hidden", !session.dead);
-  $("session-note").textContent = session.dead ? "agent 进程已退出，只能查看。" : "";
+function reportStop(stopReason) {
+  if (stopReason && stopReason !== "end_turn") {
+    appendNotice(`本轮${STOP_REASON_LABELS[stopReason] || "出错"}`, stopReason !== "cancelled");
+  }
+}
+
+function appendNotice(text, isError) {
+  const notice = element("div", isError ? "notice error" : "notice");
+  notice.append(icon(isError ? "alert" : "check"), element("span", "", text));
+  $("entries").appendChild(notice);
+  scrollToBottom(false);
 }
 
 // Applies one `session/update` with the same merge rules as the daemon's
@@ -441,7 +664,7 @@ function applyUpdate(update) {
       if (last && last.kind === role && last.messageId === messageId) {
         appendContent(last, content);
       } else {
-        const entry = { kind: role, messageId, text: "", extras: [], dirty: true };
+        const entry = { kind: role, messageId, text: "", attachments: [], dirty: true };
         appendContent(entry, content);
         session.entries.push(entry);
       }
@@ -465,21 +688,22 @@ function applyUpdate(update) {
     case "plan":
       session.plan = update.entries || [];
       renderPlan();
-      break;
+      return;
     case "current_mode_update":
       if (session.modes) session.modes.currentModeId = update.currentModeId;
       renderControls();
-      break;
+      return;
     case "config_option_update":
       session.configOptions = update.configOptions || null;
       renderControls();
-      break;
+      return;
     case "session_info_update":
-      if (update.title) setTitle(update.title, $("subtitle").textContent);
-      break;
+      if (update.title) $("thread-title").textContent = update.title;
+      return;
     default:
       return;
   }
+  session.unseen = true;
   scheduleRender();
 }
 
@@ -488,41 +712,47 @@ function appendContent(entry, content) {
   if (content.type === "text") {
     entry.text += content.text || "";
   } else if (content.type === "resource_link") {
-    entry.extras.push(`🔗 ${content.name || content.uri}`);
+    entry.attachments.push({ icon: "link", label: content.name || content.uri });
   } else if (content.type === "resource") {
-    entry.extras.push(`📎 ${content.resource?.uri || "资源"}`);
+    entry.attachments.push({ icon: "read", label: content.resource?.uri || "附加内容" });
   } else if (content.type === "image") {
-    entry.extras.push("🖼 图片");
+    entry.attachments.push({ icon: "image", label: "图片" });
   } else {
-    entry.extras.push(`[${content.type}]`);
+    entry.attachments.push({ icon: "read", label: content.type });
   }
   entry.dirty = true;
 }
 
 function scheduleRender() {
-  if (!session || session.renderScheduled) return;
+  if (!session || session.renderScheduled || session.loading) return;
   session.renderScheduled = true;
   setTimeout(() => {
     if (!session) return;
     session.renderScheduled = false;
     renderEntries();
-  }, 80);
+  }, 60);
 }
 
 function isNearBottom() {
-  return window.innerHeight + window.scrollY >= document.body.scrollHeight - 120;
+  const stream = $("stream");
+  return stream.scrollHeight - stream.scrollTop - stream.clientHeight < 120;
 }
 
 function scrollToBottom(force) {
-  if (force || isNearBottom()) window.scrollTo(0, document.body.scrollHeight);
+  const stream = $("stream");
+  if (force || isNearBottom()) {
+    stream.scrollTop = stream.scrollHeight;
+    $("jump").hidden = true;
+  }
 }
 
 function renderEntries() {
+  if (!session) return;
   const stick = isNearBottom();
   const container = $("entries");
   for (const entry of session.entries) {
     if (!entry.node) {
-      entry.node = element("div", `entry ${entry.kind}`);
+      entry.node = element("div", `entry ${entry.kind}-entry`);
       container.appendChild(entry.node);
       entry.dirty = true;
     }
@@ -531,33 +761,67 @@ function renderEntries() {
     if (entry.kind === "tool") {
       renderToolCall(entry);
     } else if (entry.kind === "thought") {
-      const details = entry.node.querySelector("details") || element("details", "thought");
-      details.replaceChildren(element("summary", "", "💭 思考"), renderMarkdown(entry.text));
-      entry.node.replaceChildren(details);
+      renderThought(entry);
     } else {
-      entry.node.replaceChildren(renderMarkdown(entry.text));
-      for (const extra of entry.extras) entry.node.appendChild(element("div", "muted", extra));
+      const body = element("div", "markdown");
+      body.appendChild(renderMarkdown(entry.text));
+      entry.node.replaceChildren(body);
+      for (const attachment of entry.attachments) {
+        const chip = element("span", "attachment");
+        chip.append(icon(attachment.icon), element("span", "", attachment.label));
+        entry.node.appendChild(chip);
+      }
     }
   }
-  if (stick) scrollToBottom(true);
+  // Requests for tool calls that arrived before the tool call itself.
+  for (const [id, request] of session.requests) {
+    if (request.standalone && attachRequest(id, request)) request.standalone = false;
+  }
+  if (stick) {
+    scrollToBottom(true);
+  } else if (session.unseen) {
+    $("jump").hidden = false;
+  }
+  session.unseen = false;
+}
+
+function renderThought(entry) {
+  let details = entry.node.querySelector("details");
+  if (!details) {
+    details = element("details", "thought");
+    const summary = element("summary", "disclosure");
+    summary.append(icon("chevron-right", "chevron"), element("span", "", "思考过程"));
+    details.appendChild(summary);
+    details.appendChild(element("div", "markdown"));
+    entry.node.replaceChildren(details);
+  }
+  details.querySelector(".markdown").replaceChildren(renderMarkdown(entry.text));
 }
 
 function renderToolCall(entry) {
   const data = entry.data;
-  const details = entry.node.querySelector("details") || element("details", "tool");
-  const wasOpen = details.open;
-  const summary = element("summary");
-  const head = element("div", "tool-head");
+  let details = entry.node.querySelector(":scope > details");
+  const wasOpen = details?.open;
+  if (!details) {
+    details = element("details", "tool");
+    entry.node.replaceChildren(details);
+  }
   const status = data.status || "pending";
-  head.appendChild(element("span", `status-icon ${status}`, TOOL_STATUS_ICONS[status] || "○"));
-  head.appendChild(element("span", "tool-title", data.title || "工具调用"));
-  if (data.kind) head.appendChild(element("span", "tool-kind", TOOL_KIND_LABELS[data.kind] || data.kind));
-  summary.appendChild(head);
+  const head = element("summary", "tool-head");
+  head.appendChild(stateMark(status, { pending: "等待中", in_progress: "执行中", completed: "已完成", failed: "失败" }[status]));
+  const title = element("span", "tool-title");
+  title.appendChild(icon(TOOL_ICONS[data.kind] || "tool", "tool-kind"));
+  title.appendChild(element("span", "", data.title || "工具调用"));
+  head.appendChild(title);
+  head.appendChild(element("span"));
+  head.appendChild(icon("chevron-down", "chevron"));
 
   const body = element("div", "tool-body");
   if (Array.isArray(data.locations) && data.locations.length) {
     const locations = element("div", "locations");
-    locations.textContent = data.locations.map((location) => location.path + (location.line ? `:${location.line}` : "")).join("\n");
+    for (const location of data.locations) {
+      locations.appendChild(pathElement("location", location.path + (location.line ? `:${location.line}` : "")));
+    }
     body.appendChild(locations);
   }
   let hasDiff = false;
@@ -567,19 +831,25 @@ function renderToolCall(entry) {
       body.appendChild(renderDiff(item));
     } else if (item.type === "content" && item.content) {
       if (item.content.type === "text") {
-        body.appendChild(renderMarkdown(item.content.text || ""));
+        const output = element("div", "markdown tool-output");
+        output.appendChild(renderMarkdown(item.content.text || ""));
+        body.appendChild(output);
       } else {
-        body.appendChild(element("div", "muted", `[${item.content.type}]`));
+        body.appendChild(element("div", "attachment", item.content.type));
       }
     } else if (item.type === "terminal") {
-      body.appendChild(element("div", "muted", "终端输出不在此显示"));
+      body.appendChild(element("p", "notice", "命令输出由 agent 在服务器上执行，这里不显示终端。"));
     }
   }
-  details.replaceChildren(summary, body);
-  // Edits are the part worth reviewing on a phone, so show them unfolded.
-  details.open = wasOpen || (hasDiff && !entry.opened);
+
+  const requestNode = details.querySelector(":scope > .request");
+  details.replaceChildren(head);
+  if (body.childElementCount) details.appendChild(body);
+  if (requestNode) details.appendChild(requestNode);
+  details.classList.toggle("awaiting", Boolean(requestNode));
+  // Edits are what people review on the go, so a diff opens on its own once.
+  details.open = Boolean(wasOpen || requestNode || (hasDiff && !entry.opened));
   if (hasDiff) entry.opened = true;
-  entry.node.replaceChildren(details);
 }
 
 // ---------------------------------------------------------------------------
@@ -593,8 +863,8 @@ function diffLines(oldLines, newLines) {
   const columns = newLines.length;
   if (rows * columns > MAX_DIFF_CELLS) {
     return [
-      ...oldLines.map((line) => ({ type: "removed", line })),
-      ...newLines.map((line) => ({ type: "added", line })),
+      ...oldLines.map((line, index) => ({ type: "removed", line, number: index + 1 })),
+      ...newLines.map((line, index) => ({ type: "added", line, number: index + 1 })),
     ];
   }
   // Longest common subsequence, filled from the end so the walk goes forward.
@@ -613,27 +883,44 @@ function diffLines(oldLines, newLines) {
   let column = 0;
   while (row < rows && column < columns) {
     if (oldLines[row] === newLines[column]) {
-      result.push({ type: "same", line: oldLines[row] });
+      result.push({ type: "same", line: newLines[column], number: column + 1 });
       row++;
       column++;
     } else if (lengths[(row + 1) * width + column] >= lengths[row * width + column + 1]) {
-      result.push({ type: "removed", line: oldLines[row++] });
+      result.push({ type: "removed", line: oldLines[row], number: row + 1 });
+      row++;
     } else {
-      result.push({ type: "added", line: newLines[column++] });
+      result.push({ type: "added", line: newLines[column], number: column + 1 });
+      column++;
     }
   }
-  while (row < rows) result.push({ type: "removed", line: oldLines[row++] });
-  while (column < columns) result.push({ type: "added", line: newLines[column++] });
+  while (row < rows) result.push({ type: "removed", line: oldLines[row], number: ++row });
+  while (column < columns) result.push({ type: "added", line: newLines[column], number: ++column });
   return result;
+}
+
+function splitLines(text) {
+  if (!text) return [];
+  const lines = text.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  return lines;
 }
 
 function renderDiff(item) {
   const container = element("div", "diff");
-  container.appendChild(element("div", "diff-path", item.path || ""));
+  const changes = diffLines(splitLines(item.oldText), splitLines(item.newText));
+  const added = changes.filter((change) => change.type === "added").length;
+  const removed = changes.filter((change) => change.type === "removed").length;
+
+  const head = element("div", "diff-head");
+  head.appendChild(element("span", "diff-name", basename(item.path)));
+  head.appendChild(pathElement("diff-dir", dirname(item.path)));
+  const stats = element("span", "diff-stats");
+  stats.append(element("span", "plus", `+${added}`), document.createTextNode(" "), element("span", "minus", `−${removed}`));
+  head.appendChild(stats);
+  container.appendChild(head);
+
   const lines = element("div", "diff-lines");
-  const oldLines = item.oldText ? item.oldText.split("\n") : [];
-  const newLines = (item.newText || "").split("\n");
-  const changes = diffLines(oldLines, newLines);
   const visible = changes.map(() => false);
   changes.forEach((change, index) => {
     if (change.type === "same") return;
@@ -643,7 +930,7 @@ function renderDiff(item) {
   });
   let skipped = 0;
   const flushSkipped = () => {
-    if (skipped > 0) lines.appendChild(element("div", "skipped", `… ${skipped} 行未改动`));
+    if (skipped > 0) lines.appendChild(element("div", "diff-skip", `${skipped} 行未改动`));
     skipped = 0;
   };
   changes.forEach((change, index) => {
@@ -652,8 +939,13 @@ function renderDiff(item) {
       return;
     }
     flushSkipped();
-    const prefix = { same: " ", added: "+", removed: "-" }[change.type];
-    lines.appendChild(element("div", change.type, `${prefix} ${change.line}`));
+    const line = element("div", `diff-line ${change.type}`);
+    line.append(
+      element("span", "number", String(change.number)),
+      element("span", "mark"),
+      element("span", "text", change.line || " "),
+    );
+    lines.appendChild(line);
   });
   flushSkipped();
   container.appendChild(lines);
@@ -687,9 +979,7 @@ function renderMarkdown(text) {
       index++;
       while (index < lines.length && !lines[index].trim().startsWith(fence[1])) code.push(lines[index++]);
       index++;
-      const pre = element("pre");
-      pre.appendChild(element("code", "", code.join("\n")));
-      fragment.appendChild(pre);
+      fragment.appendChild(renderCodeBlock(code.join("\n")));
       continue;
     }
     const heading = line.match(/^(#{1,6})\s+(.*)$/);
@@ -743,6 +1033,46 @@ function renderMarkdown(text) {
   return fragment;
 }
 
+function renderCodeBlock(code) {
+  const block = element("div", "code-block");
+  const pre = element("pre");
+  pre.appendChild(element("code", "", code));
+  const copy = element("button", "icon-button copy");
+  copy.type = "button";
+  copy.setAttribute("aria-label", "复制代码");
+  copy.appendChild(icon("copy"));
+  copy.addEventListener("click", async () => {
+    if (await copyText(code)) {
+      copy.classList.add("copied");
+      copy.replaceChildren(icon("check"));
+      setTimeout(() => {
+        copy.classList.remove("copied");
+        copy.replaceChildren(icon("copy"));
+      }, 1500);
+    }
+  });
+  block.append(pre, copy);
+  return block;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // The clipboard API needs HTTPS; plain HTTP inside a VPN falls back here.
+    const area = element("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.className = "visually-hidden";
+    document.body.appendChild(area);
+    area.select();
+    const copied = document.execCommand("copy");
+    area.remove();
+    return copied;
+  }
+}
+
 const INLINE_PATTERN = /(`+)([\s\S]*?)\1|\*\*([\s\S]+?)\*\*|__([\s\S]+?)__|\*([^*\n]+)\*|_([^_\n]+)_|\[([^\]]+)\]\(([^)\s]+)\)/g;
 
 function appendInline(parent, text) {
@@ -788,94 +1118,116 @@ function appendText(parent, text) {
 // Plan, modes and config options
 
 function renderPlan() {
-  const container = $("plan");
+  requestAnimationFrame(updateAttention);
   const entries = session.plan || [];
-  container.classList.toggle("hidden", entries.length === 0);
-  const list = element("ol");
+  const plan = $("plan");
+  plan.hidden = entries.length === 0;
+  const done = entries.filter((entry) => entry.status === "completed").length;
+  $("plan-progress").textContent = `${done}/${entries.length}`;
+  const current = entries.find((entry) => entry.status === "in_progress");
+  const currentNode = $("plan-current");
+  currentNode.replaceChildren();
+  if (current) appendInline(currentNode, current.content || "");
+  else if (done === entries.length) currentNode.textContent = "全部完成";
+  const list = $("plan-list");
+  list.replaceChildren();
   for (const entry of entries) {
-    const item = element("li", entry.status || "");
-    appendInline(item, entry.content || "");
+    const item = element("li", entry.status || "pending");
+    item.appendChild(stateMark(entry.status || "pending"));
+    const text = element("span", "plan-text");
+    appendInline(text, entry.content || "");
+    item.appendChild(text);
     list.appendChild(item);
   }
-  container.replaceChildren(element("strong", "", "计划"), list);
+  updateDockHeight();
 }
 
 function renderControls() {
   if (!session) return;
-  const container = $("session-controls");
+  const container = $("controls");
   container.replaceChildren();
-  const modes = session.modes;
+  // Agents that offer config options often repeat their modes there (Codex's
+  // "mode" option, for instance). Like Zed, prefer the config options and
+  // ignore the older modes whenever an agent provides both.
+  const modes = session.configOptions ? null : session.modes;
   if (modes && Array.isArray(modes.availableModes) && modes.availableModes.length > 1) {
-    const select = element("select");
-    for (const mode of modes.availableModes) {
-      const option = element("option", "", mode.name || mode.id);
-      option.value = mode.id;
-      option.selected = mode.id === modes.currentModeId;
-      select.appendChild(option);
-    }
-    select.addEventListener("change", async () => {
-      try {
-        await request("session/set_mode", { sessionId: session.id, modeId: select.value });
-        session.modes.currentModeId = select.value;
-      } catch (error) {
-        showBanner(`切换模式失败：${error.message}`);
-        renderControls();
-      }
-    });
-    container.appendChild(labelled("模式", select));
+    const choices = modes.availableModes.map((mode) => ({ value: mode.id, name: mode.name || mode.id }));
+    container.appendChild(
+      selectControl("模式", choices, modes.currentModeId, async (value) => {
+        await request("session/set_mode", { sessionId: session.id, modeId: value });
+        session.modes.currentModeId = value;
+      }),
+    );
   }
   for (const option of session.configOptions || []) {
     const control = configControl(option);
-    if (control) container.appendChild(labelled(option.name || option.id, control));
+    if (control) container.appendChild(control);
   }
-  container.classList.toggle("hidden", container.childElementCount === 0);
 }
 
-function labelled(text, control) {
-  const label = element("label", "", text);
-  label.appendChild(control);
-  return label;
+function selectControl(label, choices, current, onChange) {
+  const wrapper = element("label", "select");
+  wrapper.title = label;
+  const select = element("select");
+  select.setAttribute("aria-label", label);
+  for (const choice of choices) {
+    const option = element("option", "", choice.name);
+    option.value = choice.value;
+    option.selected = choice.value === current;
+    select.appendChild(option);
+  }
+  select.addEventListener("change", async () => {
+    select.disabled = true;
+    try {
+      await onChange(select.value);
+    } catch (error) {
+      appendNotice(`修改${label}失败：${error.message}`, true);
+    }
+    renderControls();
+  });
+  wrapper.append(select, icon("chevron-down"));
+  return wrapper;
 }
 
 function configControl(option) {
-  const setOption = async (value) => {
-    try {
-      const result = await request("session/set_config_option", {
-        sessionId: session.id,
-        configId: option.id,
-        ...value,
-      });
-      if (result && result.configOptions) session.configOptions = result.configOptions;
-    } catch (error) {
-      showBanner(`修改设置失败：${error.message}`);
-    }
-    renderControls();
+  const label = option.name || option.id;
+  const apply = async (value) => {
+    const result = await request("session/set_config_option", {
+      sessionId: session.id,
+      configId: option.id,
+      ...value,
+    });
+    if (result && result.configOptions) session.configOptions = result.configOptions;
   };
   if (option.type === "boolean") {
+    const wrapper = element("label", "toggle");
     const checkbox = element("input");
     checkbox.type = "checkbox";
     checkbox.checked = option.currentValue === true;
-    checkbox.addEventListener("change", () => setOption({ type: "boolean", value: checkbox.checked }));
-    return checkbox;
+    checkbox.addEventListener("change", async () => {
+      checkbox.disabled = true;
+      try {
+        await apply({ type: "boolean", value: checkbox.checked });
+      } catch (error) {
+        appendNotice(`修改${label}失败：${error.message}`, true);
+      }
+      renderControls();
+    });
+    wrapper.append(checkbox, document.createTextNode(label));
+    return wrapper;
   }
   if (option.type === "select") {
-    const select = element("select");
-    const values = [];
+    const choices = [];
     for (const item of option.options || []) {
-      if (Array.isArray(item.options)) {
-        values.push(...item.options);
-      } else {
-        values.push(item);
-      }
+      if (Array.isArray(item.options)) choices.push(...item.options);
+      else choices.push(item);
     }
-    for (const value of values) {
-      const node = element("option", "", value.name || value.value);
-      node.value = value.value;
-      node.selected = value.value === option.currentValue;
-      select.appendChild(node);
-    }
-    select.addEventListener("change", () => setOption({ value: select.value }));
-    return select;
+    return selectControl(
+      label,
+      choices.map((choice) => ({ value: choice.value, name: choice.name || choice.value })),
+      option.currentValue,
+      (value) => apply({ value }),
+    );
   }
   return null;
 }
@@ -889,120 +1241,175 @@ function handleAgentRequest(message) {
     send({ id: message.id, error: { code: -32603, message: "The session is not open in this client" } });
     return;
   }
+  let node;
   if (message.method === "session/request_permission") {
-    session.requests.set(message.id, renderPermission(message));
+    node = renderPermission(message);
   } else if (message.method === "elicitation/create") {
-    session.requests.set(message.id, renderElicitation(message));
+    node = renderElicitation(message);
   } else {
     send({ id: message.id, error: { code: -32601, message: "Method not found" } });
     return;
   }
-  setRunning(session.running);
+  const request = { node, toolCallId: params.toolCall?.toolCallId, standalone: true };
+  session.requests.set(message.id, request);
+  if (attachRequest(message.id, request)) request.standalone = false;
+  else $("entries").appendChild(node);
+  updateStatus();
   scrollToBottom(true);
+}
+
+// Shows a permission request inside the tool call it is about, as Zed does.
+function attachRequest(id, request) {
+  const tool = request.toolCallId && session.toolCalls.get(request.toolCallId);
+  const details = tool?.node?.querySelector(":scope > details");
+  if (!details) return false;
+  details.appendChild(request.node);
+  details.classList.add("awaiting");
+  details.open = true;
+  return true;
 }
 
 function removeRequest(id) {
   if (!session) return;
-  const node = session.requests.get(id);
-  if (!node) return;
-  node.remove();
+  const request = session.requests.get(id);
+  if (!request) return;
+  const details = request.node.parentElement;
+  request.node.remove();
+  details?.classList.remove("awaiting");
   session.requests.delete(id);
-  setRunning(session.running);
+  updateStatus();
 }
 
 function answer(id, result) {
   try {
-    respond(id, result);
+    send({ id, result });
   } catch (error) {
-    showBanner(`回答失败：${error.message}`);
+    appendNotice(`回答失败：${error.message}`, true);
     return;
   }
   removeRequest(id);
 }
 
+function updateAttention() {
+  const bar = $("attention");
+  if (!session || session.requests.size === 0) {
+    bar.hidden = true;
+    updateDockHeight();
+    return;
+  }
+  const first = session.requests.values().next().value.node;
+  const stream = $("stream").getBoundingClientRect();
+  const box = first.getBoundingClientRect();
+  // A card with only its edge showing above the dock still needs the prompt.
+  const inView = box.bottom > stream.top + 48 && box.top < stream.bottom - 48;
+  bar.hidden = inView;
+  $("attention-text").textContent =
+    session.requests.size === 1 ? "有 1 个请求等待你处理" : `有 ${session.requests.size} 个请求等待你处理`;
+  updateDockHeight();
+}
+
+$("attention-go").addEventListener("click", () => {
+  const first = session?.requests.values().next().value;
+  first?.node.scrollIntoView({ behavior: "smooth", block: "center" });
+});
+
 function renderPermission(message) {
   const params = message.params;
-  const card = element("div", "card request");
-  const title = params.toolCall?.title || "agent 请求授权";
-  card.appendChild(element("p", "question", `🔐 ${title}`));
-  const options = element("div", "options");
+  const card = element("div", "request");
+  const head = element("div", "request-head");
+  head.append(icon("shield"), element("span", "", params.toolCall?.title || "agent 请求执行一个操作"));
+  card.appendChild(head);
+  const options = element("div", "request-options");
   for (const option of params.options || []) {
-    const style = option.kind?.startsWith("allow") ? "success" : option.kind?.startsWith("reject") ? "danger" : "";
-    const button = element("button", style, option.name || option.optionId);
+    const kind = option.kind || "";
+    const style = kind.startsWith("allow") ? "allow" : kind.startsWith("reject") ? "reject" : "";
+    const button = element("button", `button small ${style}`);
     button.type = "button";
+    button.appendChild(icon(style === "reject" ? "x" : "check"));
+    button.appendChild(element("span", "", option.name || option.optionId));
     button.addEventListener("click", () => {
       answer(message.id, { outcome: { outcome: "selected", optionId: option.optionId } });
     });
     options.appendChild(button);
   }
   card.appendChild(options);
-  $("requests").appendChild(card);
   return card;
 }
 
 function renderElicitation(message) {
   const params = message.params;
-  const card = element("div", "card request");
-  card.appendChild(element("p", "question", `❓ ${params.message || "agent 需要你的输入"}`));
+  const card = element("div", "request");
+  const head = element("div", "request-head");
+  head.append(icon("question"), element("span", "", params.message || "agent 需要你提供信息"));
+  card.appendChild(head);
 
   if (params.mode === "url") {
-    const options = element("div", "options");
-    const open = element("button", "primary", "打开链接");
+    const options = element("div", "request-options");
+    const open = element("button", "button small primary", "打开链接");
     open.type = "button";
     open.addEventListener("click", () => {
       window.open(params.url, "_blank", "noopener,noreferrer");
       answer(message.id, { action: "accept" });
     });
-    const decline = element("button", "danger", "拒绝");
+    const decline = element("button", "button small reject", "拒绝");
     decline.type = "button";
     decline.addEventListener("click", () => answer(message.id, { action: "decline" }));
     options.append(open, decline);
     card.appendChild(options);
-    $("requests").appendChild(card);
     return card;
   }
 
   const schema = params.requestedSchema || {};
   const required = new Set(schema.required || []);
-  const form = element("form");
+  const form = element("form", "request-form");
   const fields = [];
   for (const [name, property] of Object.entries(schema.properties || {})) {
-    const label = element("label", "", property.title || name);
     let input;
-    const choices = property.enum || property.oneOf?.map((choice) => choice.const) || property.anyOf?.map((choice) => choice.const);
+    let field;
+    const title = property.title || name;
+    const choices =
+      property.enum ||
+      property.oneOf?.map((choice) => choice.const) ||
+      property.anyOf?.map((choice) => choice.const);
     if (property.type === "boolean") {
+      field = element("label", "check");
       input = element("input");
       input.type = "checkbox";
       input.checked = property.default === true;
-    } else if (choices) {
-      input = element("select");
-      choices.forEach((choice, index) => {
-        const titles = property.enumNames || property.oneOf || property.anyOf;
-        const text = titles ? titles[index]?.title || titles[index] : choice;
-        const option = element("option", "", String(text ?? choice));
-        option.value = String(choice);
-        option.selected = choice === property.default;
-        input.appendChild(option);
-      });
+      field.append(input, document.createTextNode(title));
     } else {
-      input = element("input");
-      input.type = property.type === "number" || property.type === "integer" ? "number" : "text";
-      if (property.type === "integer") input.step = "1";
-      if (property.default !== undefined) input.value = String(property.default);
-      input.required = required.has(name);
+      field = element("label", "field");
+      field.appendChild(element("span", "field-label", required.has(name) ? `${title}（必填）` : title));
+      if (choices) {
+        input = element("select");
+        const titles = property.enumNames || property.oneOf || property.anyOf;
+        choices.forEach((choice, index) => {
+          const text = titles ? titles[index]?.title || titles[index] : choice;
+          const option = element("option", "", String(text ?? choice));
+          option.value = String(choice);
+          option.selected = choice === property.default;
+          input.appendChild(option);
+        });
+      } else {
+        input = element("input");
+        input.type = property.type === "number" || property.type === "integer" ? "number" : "text";
+        if (property.type === "integer") input.step = "1";
+        if (property.default !== undefined) input.value = String(property.default);
+        input.required = required.has(name);
+      }
+      field.appendChild(input);
+      if (property.description) field.appendChild(element("span", "field-hint", property.description));
     }
-    if (property.description) label.appendChild(element("span", "muted", property.description));
-    label.appendChild(input);
-    form.appendChild(label);
+    form.appendChild(field);
     fields.push({ name, property, input });
   }
-  const buttons = element("div", "options");
-  const submit = element("button", "primary", "提交");
+  const buttons = element("div", "request-options");
+  const submit = element("button", "button small primary", "提交");
   submit.type = "submit";
-  const decline = element("button", "danger", "拒绝");
+  const decline = element("button", "button small reject", "拒绝");
   decline.type = "button";
   decline.addEventListener("click", () => answer(message.id, { action: "decline" }));
-  const cancel = element("button", "", "取消");
+  const cancel = element("button", "button small ghost", "取消");
   cancel.type = "button";
   cancel.addEventListener("click", () => answer(message.id, { action: "cancel" }));
   buttons.append(submit, decline, cancel);
@@ -1024,7 +1431,6 @@ function renderElicitation(message) {
     answer(message.id, { action: "accept", content });
   });
   card.appendChild(form);
-  $("requests").appendChild(card);
   return card;
 }
 
@@ -1033,9 +1439,32 @@ function renderElicitation(message) {
 
 const textarea = $("message");
 
+function updateComposer() {
+  if (!session) return;
+  const dead = session.dead;
+  $("composer").hidden = dead;
+  $("dock-note").hidden = !dead;
+  $("dock-note").textContent = dead ? "agent 进程已经退出，这个会话只能查看。" : "";
+  const hasText = textarea.value.trim().length > 0;
+  // While a turn runs, the button stops it; typing turns it back into send,
+  // which interrupts the turn after confirmation.
+  const showStop = session.running && !hasText;
+  $("stop").hidden = !showStop;
+  $("send").hidden = showStop;
+  $("send").disabled = !hasText || session.loading || !connection.connected;
+  $("send-hint").textContent = COARSE.matches ? "" : `${navigator.platform.startsWith("Mac") ? "⌘" : "Ctrl"} ↵ 发送`;
+  updateDockHeight();
+}
+
+function updateDockHeight() {
+  const dock = $("dock");
+  if (!dock.hidden) $("thread").style.setProperty("--dock-height", `${dock.offsetHeight + 8}px`);
+}
+
 textarea.addEventListener("input", () => {
   textarea.style.height = "auto";
-  textarea.style.height = `${textarea.scrollHeight}px`;
+  textarea.style.height = `${Math.min(textarea.scrollHeight, window.innerHeight * 0.4)}px`;
+  updateComposer();
 });
 
 textarea.addEventListener("keydown", (event) => {
@@ -1047,17 +1476,18 @@ textarea.addEventListener("keydown", (event) => {
 
 $("composer").addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (!session) return;
+  if (!session || session.dead) return;
   const text = textarea.value.trim();
   if (!text) return;
-  if (session.running && !confirm("agent 正在执行，发送会中断当前轮次。继续？")) return;
+  if (session.running && !confirm("agent 正在执行。发送新消息会中断当前这一轮，继续吗？")) return;
 
   const current = session;
   textarea.value = "";
   textarea.style.height = "auto";
   applyUpdate({ sessionUpdate: "user_message_chunk", content: { type: "text", text } });
-  // Keeps the next agent reply out of the user's message.
+  // Keeps the next message the user sends out of this one.
   session.entries[session.entries.length - 1].messageId = `local-${Date.now()}`;
+  renderEntries();
   setRunning(true);
   scrollToBottom(true);
   try {
@@ -1065,12 +1495,9 @@ $("composer").addEventListener("submit", async (event) => {
       sessionId: current.id,
       prompt: [{ type: "text", text }],
     });
-    if (session !== current) return;
-    if (result.stopReason && result.stopReason !== "end_turn") {
-      showBanner(`本轮${STOP_REASON_LABELS[result.stopReason] || "出错"}`);
-    }
+    if (session === current) reportStop(result.stopReason);
   } catch (error) {
-    if (session === current) showBanner(`发送失败：${error.message}`);
+    if (session === current) appendNotice(`发送失败：${error.message}`, true);
   }
   if (session === current) setRunning(false);
 });
@@ -1079,10 +1506,30 @@ $("stop").addEventListener("click", () => {
   if (!session) return;
   try {
     send({ method: "session/cancel", params: { sessionId: session.id } });
+    $("stop").disabled = true;
+    setTimeout(() => ($("stop").disabled = false), 1500);
   } catch (error) {
-    showBanner(`停止失败：${error.message}`);
+    appendNotice(`停止失败：${error.message}`, true);
   }
 });
+
+$("stream").addEventListener(
+  "scroll",
+  () => {
+    if (isNearBottom()) $("jump").hidden = true;
+    updateAttention();
+  },
+  { passive: true },
+);
+
+$("jump").addEventListener("click", () => {
+  $("stream").scrollTo({ top: $("stream").scrollHeight, behavior: "smooth" });
+  $("jump").hidden = true;
+});
+
+window.addEventListener("resize", updateDockHeight);
+$("plan").addEventListener("toggle", () => requestAnimationFrame(updateAttention));
+WIDE.addEventListener("change", highlightSelection);
 
 // ---------------------------------------------------------------------------
 // Start
@@ -1092,6 +1539,8 @@ if ("serviceWorker" in navigator) {
 }
 
 (async () => {
+  $("app").dataset.view = currentRoute() ? "thread" : "list";
+  showThreadEmpty();
   const health = await fetchHealth();
   if (health && !health.authenticated) {
     showLogin();

@@ -1,6 +1,6 @@
 // Caches the app shell so the client opens without a connection. Network
 // first, because the gateway serves whatever the installed remote server has.
-const CACHE = "acp-mux-v1";
+const CACHE = "acp-mux-v2";
 const SHELL = ["/", "/app.js", "/style.css", "/icon.svg", "/manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {
