@@ -89,3 +89,7 @@
 | 客户端 | 需要 wasm 和 GPU 渲染器 | 普通网页或原生 UI |
 
 两者不冲突,可以共用同一套 WebSocket 服务和认证:用 D 处理日常的手机 agent 交互和通知,需要完整操作 Zed 时用 C。
+
+## 8. 基于 acp-mux 的版本(2026-10-19)
+
+acp-mux 实现后,方案 D 可以改为在 acp-mux 上实现:网页和手机 App 作为 acp-mux daemon 的 ACP 客户端,不再调用 Zed 内的 `AgentPanel` 和 `ThreadView`。第 5 节的坑 1、2、3、7、10 随之消失,但只能操作 SSH 远程项目里接入 acp-mux 的外部 agent。详见 [方案 D 的 acp-mux 版本](./ui_mirror_plan_d_on_acp_mux.md)。
