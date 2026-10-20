@@ -31,7 +31,6 @@ const PING_INTERVAL: Duration = Duration::from_secs(25);
 const LOGIN_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_FAILURES_PER_WINDOW: usize = 10;
-const MIN_TOKEN_LENGTH: usize = 16;
 const SESSION_COOKIE: &str = "acp_mux_session";
 
 struct Asset {
@@ -159,11 +158,9 @@ fn load_or_create_token(path: &Path) -> Result<String> {
     match std::fs::read_to_string(path) {
         Ok(contents) => {
             let token = contents.trim().to_string();
-            if token.len() < MIN_TOKEN_LENGTH {
-                bail!(
-                    "the token in {} must be at least {MIN_TOKEN_LENGTH} characters",
-                    path.display()
-                );
+            // An empty token would let anyone log in with an empty field.
+            if token.is_empty() {
+                bail!("the token file {} is empty", path.display());
             }
             Ok(token)
         }
@@ -891,6 +888,16 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn accepts_any_non_empty_token() {
+        let directory = tempfile::tempdir().expect("creating a temporary directory");
+        let path = directory.path().join("token");
+        std::fs::write(&path, "abc\n").expect("writing the token");
+        assert_eq!(load_or_create_token(&path).expect("a short token"), "abc");
+        std::fs::write(&path, " \n").expect("writing the token");
+        assert!(load_or_create_token(&path).is_err());
     }
 
     #[test]

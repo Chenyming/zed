@@ -207,6 +207,17 @@ daemon 内置一个网页网关：在浏览器或手机上可以列出会话、�
 cat ~/.config/zed/acp_mux_token
 ```
 
+也可以自定义 token：把任意非空内容写进 token 文件（首尾空白会被去掉），然后执行
+`acp-mux restart`。restart 后已登录的浏览器需要用新 token 重新登录。
+
+```sh
+printf '%s' '你的 token' > ~/.config/zed/acp_mux_token
+chmod 600 ~/.config/zed/acp_mux_token
+```
+
+token 是网页的唯一门槛，网关又会暴露在 frp 或 VPN 上，短 token 更容易被猜中或泄露。
+登录失败每分钟最多 10 次，能挡住在线猜测，但挡不住从别处泄露的 token。
+
 ### 外层访问
 
 网关本身不处理 TLS，需要由外层提供：
