@@ -5656,8 +5656,10 @@ impl AgentPanel {
             _ => None,
         };
 
-        let can_regenerate_thread_title =
-            conversation_view.as_ref().is_some_and(|conversation_view| {
+        // Regenerating asks the agent to name the thread, which users who
+        // only name threads themselves have turned off.
+        let can_regenerate_thread_title = AgentSettings::get_global(cx).auto_generate_thread_title
+            && conversation_view.as_ref().is_some_and(|conversation_view| {
                 let conversation_view = conversation_view.read(cx);
                 conversation_view.has_user_submitted_prompt(cx)
                     && conversation_view

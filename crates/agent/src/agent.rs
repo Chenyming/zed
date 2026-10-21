@@ -9158,6 +9158,16 @@ mod internal_tests {
     #[gpui::test]
     async fn test_save_load_thread(cx: &mut TestAppContext) {
         let fake = init_test(cx);
+        cx.update(|cx| {
+            <SettingsStore as gpui::UpdateGlobal>::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content
+                        .agent
+                        .get_or_insert_default()
+                        .auto_generate_thread_title = Some(true);
+                });
+            });
+        });
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
             "/",

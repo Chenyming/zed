@@ -4143,6 +4143,51 @@ async fn test_truncate_second_message(cx: &mut TestAppContext) {
     assert_first_message_state(cx);
 }
 
+fn set_auto_generate_thread_title(enabled: bool, cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content
+                    .agent
+                    .get_or_insert_default()
+                    .auto_generate_thread_title = Some(enabled);
+            });
+        });
+    });
+}
+
+#[gpui::test]
+async fn test_no_title_is_generated_unless_automatic_titles_are_enabled(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+
+    let summary_model = fake.model("summary");
+    thread.update(cx, |thread, cx| {
+        thread.set_summarization_model(Some(summary_model.clone()), cx)
+    });
+
+    let send = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Hey!");
+    fake.end_last(&model);
+    cx.run_until_parked();
+    send.collect::<Vec<_>>().await;
+
+    assert_eq!(fake.pending_completions_for(&summary_model), Vec::new());
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(thread.title(), None);
+        assert!(!thread.is_generating_title());
+    });
+}
+
 #[gpui::test]
 async fn test_title_generation(cx: &mut TestAppContext) {
     let ThreadTest {
@@ -4151,6 +4196,7 @@ async fn test_title_generation(cx: &mut TestAppContext) {
         thread,
         ..
     } = setup(cx, TestModel::Fake).await;
+    set_auto_generate_thread_title(true, cx);
 
     let summary_model = fake.model("summary");
     thread.update(cx, |thread, cx| {
@@ -4278,6 +4324,7 @@ async fn test_title_generation_failure_allows_retry(cx: &mut TestAppContext) {
         thread,
         ..
     } = setup(cx, TestModel::Fake).await;
+    set_auto_generate_thread_title(true, cx);
 
     let summary_model = fake.model("summary");
     thread.update(cx, |thread, cx| {

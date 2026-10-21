@@ -1408,6 +1408,13 @@
     //
     // Default: false
     "show_turn_stats": false,
+    // Whether thread titles may come from somewhere other than you: titles the
+    // Zed agent generates, titles external agents report, and the first message
+    // shown as a preview title. When disabled, threads are only named by you and
+    // show a placeholder until then.
+    //
+    // Default: false
+    "auto_generate_thread_title": false,
     // Whether to show the merge conflict indicator in the status bar
     // that offers to resolve conflicts using the agent.
     //

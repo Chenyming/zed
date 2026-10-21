@@ -118,6 +118,16 @@ pub fn init_test(cx: &mut TestAppContext) {
         release_channel::init("0.0.0".parse().unwrap(), cx);
         agent_panel::init(cx);
         crate::terminal_thread_metadata_store::TerminalThreadMetadataStore::init_global(cx);
+        // Tests built on this helper exercise upstream behavior, where threads
+        // are named by the agent or by their first message.
+        <SettingsStore as gpui::UpdateGlobal>::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content
+                    .agent
+                    .get_or_insert_default()
+                    .auto_generate_thread_title = Some(true);
+            });
+        });
     });
 }
 

@@ -5308,9 +5308,14 @@ impl AcpThread {
 
     pub fn update_session_info(
         &mut self,
-        update: acp_v2::SessionInfoUpdate,
+        mut update: acp_v2::SessionInfoUpdate,
         cx: &mut Context<Self>,
     ) {
+        // Titles the user sets go through `set_title`; when automatic titles are
+        // off, the agent's own titles are not taken.
+        if !AgentSettings::get_global(cx).auto_generate_thread_title {
+            update.title = MaybeUndefined::Undefined;
+        }
         let previous_title = self.session_info.title.clone();
         let had_provisional =
             !update.title.is_undefined() && self.provisional_title.take().is_some();
@@ -20875,10 +20880,65 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_agent_titles_are_ignored_unless_automatic_titles_are_enabled(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread.update_session_info(
+                acp_v2::SessionInfoUpdate::new()
+                    .title("Agent title")
+                    .updated_at("2026-03-04T05:06:07+02:30"),
+                cx,
+            );
+            assert_eq!(thread.title(), None, "the agent's title is ignored by default");
+            assert!(
+                thread.session_info().updated_at.is_some(),
+                "other session info still applies"
+            );
+        });
+
+        thread
+            .update(cx, |thread, cx| thread.set_title("User title".into(), cx))
+            .await
+            .unwrap();
+        thread.update(cx, |thread, cx| {
+            thread.update_session_info(acp_v2::SessionInfoUpdate::new().title("Agent title"), cx);
+            assert_eq!(
+                thread.title(),
+                Some("User title".into()),
+                "the agent cannot replace a title the user set"
+            );
+        });
+
+        set_auto_generate_thread_title(true, cx);
+        thread.update(cx, |thread, cx| {
+            thread.update_session_info(acp_v2::SessionInfoUpdate::new().title("Agent title"), cx);
+            assert_eq!(thread.title(), Some("Agent title".into()));
+        });
+    }
+
+    #[gpui::test]
     async fn test_session_info_update_replaces_provisional_title_and_emits_event(
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
+        set_auto_generate_thread_title(true, cx);
 
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
@@ -24193,6 +24253,16 @@ mod tests {
                 )
                 .expect("form elicitation should succeed")
         })
+    }
+
+    fn set_auto_generate_thread_title(enabled: bool, cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.agent.get_or_insert_default().auto_generate_thread_title = Some(enabled);
+                });
+            });
+        });
     }
 
     fn set_prevent_idle_sleep(enabled: bool, cx: &mut TestAppContext) {

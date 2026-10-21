@@ -6606,7 +6606,7 @@ impl Sidebar {
                     let markdown_title = markdown_title.clone();
                     let rename_title = rename_title.clone();
                     let folder_paths = folder_paths.clone();
-                    ContextMenu::build(_window, cx, move |mut menu, _window, _cx| {
+                    ContextMenu::build(_window, cx, move |mut menu, _window, cx| {
                         menu = menu.entry("Rename Title", None, {
                             let sidebar = sidebar.clone();
                             let rename_title = rename_title.clone();
@@ -6625,7 +6625,8 @@ impl Sidebar {
                             }
                         });
 
-                        if is_zed_thread {
+                        if is_zed_thread && AgentSettings::get_global(cx).auto_generate_thread_title
+                        {
                             menu = menu.entry("Regenerate Thread Title", None, {
                                 let session_id = session_id.clone();
                                 let sidebar = sidebar.clone();

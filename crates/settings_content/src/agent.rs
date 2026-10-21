@@ -389,6 +389,13 @@ pub struct AgentSettingsContent {
     ///
     /// Default: false
     pub show_turn_stats: Option<bool>,
+    /// Whether thread titles may come from somewhere other than the user: titles
+    /// the Zed agent generates, titles external agents report, and the first
+    /// message shown as a preview title. When disabled, a thread is only named
+    /// by the user and shows a placeholder until then.
+    ///
+    /// Default: false
+    pub auto_generate_thread_title: Option<bool>,
     /// Whether to show the merge conflict indicator in the status bar
     /// that offers to resolve conflicts using the agent.
     ///

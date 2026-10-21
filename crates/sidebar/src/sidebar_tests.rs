@@ -66,6 +66,20 @@ fn init_test(cx: &mut TestAppContext) {
         TerminalThreadMetadataStore::init_global(cx);
         language_model::LanguageModelRegistry::test(cx);
         prompt_store::init(cx);
+        enable_automatic_thread_titles(cx);
+    });
+}
+
+/// These tests identify threads by the titles agents and first messages give
+/// them, so they run with automatic titles on.
+fn enable_automatic_thread_titles(cx: &mut App) {
+    SettingsStore::update_global(cx, |store, cx| {
+        store.update_user_settings(cx, |content| {
+            content
+                .agent
+                .get_or_insert_default()
+                .auto_generate_thread_title = Some(true);
+        });
     });
 }
 

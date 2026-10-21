@@ -6556,6 +6556,7 @@ pub(crate) mod tests {
         use project::WorktreePaths;
 
         init_test(cx);
+        enable_automatic_thread_titles(cx);
         for (index, (title, title_override)) in [
             (None, None),
             (Some("Current agent title"), None),
@@ -7925,6 +7926,7 @@ pub(crate) mod tests {
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
+        enable_automatic_thread_titles(cx);
 
         let connection = StubAgentConnection::new().with_supports_set_title(false);
         let (conversation_view, cx) =
@@ -9465,6 +9467,19 @@ pub(crate) mod tests {
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
+    }
+
+    pub(crate) fn enable_automatic_thread_titles(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            <SettingsStore as gpui::UpdateGlobal>::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content
+                        .agent
+                        .get_or_insert_default()
+                        .auto_generate_thread_title = Some(true);
+                });
+            });
+        });
     }
 
     pub(crate) fn init_test(cx: &mut TestAppContext) {
@@ -15617,10 +15632,54 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_threads_are_only_named_by_the_user_by_default(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let active = active_thread(&conversation_view, cx);
+        let title_editor = cx.read(|cx| active.read(cx).title_editor.clone());
+        let thread = cx.read(|cx| active.read(cx).thread.clone());
+        let assert_title = |title: Option<&str>, cx: &VisualTestContext| {
+            thread.read_with(cx, |thread, _| {
+                assert_eq!(thread.title().as_deref(), title);
+            });
+            title_editor.read_with(cx, |editor, cx| {
+                assert_eq!(editor.text(cx), title.unwrap_or(DEFAULT_THREAD_TITLE));
+            });
+        };
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Fix the login bug", window, cx);
+        });
+        active.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert_title(None, cx);
+
+        thread.update(cx, |thread, cx| {
+            thread.update_session_info(acp_v2::SessionInfoUpdate::new().title("Agent title"), cx);
+        });
+        cx.run_until_parked();
+        assert_title(None, cx);
+
+        cx.focus(&title_editor);
+        cx.dispatch_action(editor::actions::DeleteLine);
+        cx.write_to_clipboard(ClipboardItem::new_string("Login fix".into()));
+        cx.dispatch_action(Paste);
+        cx.run_until_parked();
+        assert_title(Some("Login fix"), cx);
+    }
+
+    #[gpui::test]
     async fn test_manually_editing_title_updates_acp_thread_title(cx: &mut TestAppContext) {
         use agent_client_protocol::schema::MaybeUndefined;
 
         init_test(cx);
+        enable_automatic_thread_titles(cx);
 
         let connection = StubAgentConnection::new();
         let (conversation_view, cx) =

@@ -2064,7 +2064,12 @@ impl ThreadView {
                     .ok();
                 })
             });
-            if is_first_message && thread.read_with(cx, |thread, _cx| thread.title().is_none())? {
+            let auto_title =
+                cx.update(|_, cx| AgentSettings::get_global(cx).auto_generate_thread_title)?;
+            if auto_title
+                && is_first_message
+                && thread.read_with(cx, |thread, _cx| thread.title().is_none())?
+            {
                 let text: String = contents
                     .iter()
                     .filter_map(|block| match block {
