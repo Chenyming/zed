@@ -1493,6 +1493,7 @@ mod tests {
             cx.update(|cx| {
                 let store = settings::SettingsStore::test(cx);
                 cx.set_global(store);
+                super::super::enable_automatic_thread_titles(cx);
             });
             let filesystem = fs::FakeFs::new(cx.executor());
             filesystem
@@ -2756,6 +2757,7 @@ done
         cx.update(|cx| {
             let store = settings::SettingsStore::test(cx);
             cx.set_global(store);
+            super::super::enable_automatic_thread_titles(cx);
             release_channel::init("0.0.0".parse().expect("version"), cx);
         });
         cx.executor().allow_parking();

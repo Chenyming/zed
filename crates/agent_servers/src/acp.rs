@@ -850,6 +850,20 @@ fn mux_turn_state_notification(
     )
 }
 
+/// Lets agents title threads, which this fork turns off by default, for tests
+/// of how the titles agents report are applied.
+#[cfg(test)]
+fn enable_automatic_thread_titles(cx: &mut App) {
+    <settings::SettingsStore as gpui::UpdateGlobal>::update_global(cx, |store, cx| {
+        store.update_user_settings(cx, |content| {
+            content
+                .agent
+                .get_or_insert_default()
+                .auto_generate_thread_title = Some(true);
+        });
+    });
+}
+
 fn handle_mux_turn_state(notification: MuxTurnState, cx: &mut AsyncApp, context: &ClientContext) {
     if !context.mux_turn_state.get() {
         log::debug!("Ignoring acp-mux turn state from an agent that is not hosted by acp-mux");

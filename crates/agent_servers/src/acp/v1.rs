@@ -3547,6 +3547,7 @@ mod tests {
         use serde_json::json;
 
         let harness = V2SessionHarness::new(cx).await;
+        cx.update(super::super::enable_automatic_thread_titles);
         let updates = harness.session_list_updates().await;
         let session_id = harness
             .thread
