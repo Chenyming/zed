@@ -10767,6 +10767,57 @@ async fn test_archive_thread_active_entry_management(cx: &mut TestAppContext) {
     });
 }
 
+fn ask_for_new_thread_agent(cx: &mut gpui::VisualTestContext) {
+    cx.update(|_, cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.agent.get_or_insert_default().new_thread_agent =
+                    Some(settings::NewThreadAgent::Ask);
+            });
+        });
+    });
+}
+
+#[gpui::test]
+async fn test_new_thread_and_archiving_show_the_agent_picker_when_asking(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let workspace = multi_workspace.read_with(cx, |mw, _cx| mw.workspace().clone());
+    ask_for_new_thread_agent(cx);
+
+    let connection = acp_thread::StubAgentConnection::new();
+    connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+        acp_v1::ContentChunk::new("Done".into()),
+    )]);
+    agent_ui::test_support::open_thread_with_connection(&panel, connection, cx);
+    agent_ui::test_support::send_message(&panel, cx);
+    let session_id = agent_ui::test_support::active_session_id(&panel, cx);
+    cx.run_until_parked();
+
+    // With no other thread to fall back to, archiving leaves the user to
+    // pick an agent rather than starting a draft with the last used one.
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.archive_thread(&session_id, window, cx);
+    });
+    cx.run_until_parked();
+    panel.read_with(cx, |panel, cx| {
+        assert!(panel.is_showing_agent_picker());
+        assert_eq!(panel.active_thread_id(cx), None);
+    });
+
+    let connection = acp_thread::StubAgentConnection::new();
+    agent_ui::test_support::open_thread_with_connection(&panel, connection, cx);
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.create_new_thread(&workspace, window, cx);
+    });
+    cx.run_until_parked();
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.is_showing_agent_picker());
+    });
+}
+
 #[gpui::test]
 async fn test_unarchive_only_shows_restored_thread(cx: &mut TestAppContext) {
     // Full flow: create a thread, archive it (removing the workspace),

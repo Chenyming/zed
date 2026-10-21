@@ -5310,7 +5310,12 @@ impl Sidebar {
                 workspace.update(cx, |workspace, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         panel.update(cx, |panel, cx| {
-                            panel.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
+                            panel.activate_empty_state(
+                                false,
+                                AgentThreadSource::AgentPanel,
+                                window,
+                                cx,
+                            );
                         });
                     }
                 });

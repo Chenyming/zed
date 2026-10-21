@@ -1803,7 +1803,7 @@ impl AgentPanel {
 
     /// Shows what the panel falls back to when it has nothing else to show:
     /// a draft with the selected agent, or the agent picker.
-    fn activate_empty_state(
+    pub fn activate_empty_state(
         &mut self,
         focus: bool,
         source: AgentThreadSource,
@@ -1815,6 +1815,10 @@ impl AgentPanel {
         } else {
             self.activate_draft(focus, source, window, cx);
         }
+    }
+
+    pub fn is_showing_agent_picker(&self) -> bool {
+        matches!(self.base_view, BaseView::AgentPicker { .. })
     }
 
     pub fn show_agent_picker(&mut self, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -3457,7 +3461,7 @@ impl AgentPanel {
             // Activating another view must not retain the thread that was explicitly removed
             self.base_view = BaseView::Uninitialized;
             if activate_draft_after_remove {
-                self.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
+                self.activate_empty_state(false, AgentThreadSource::AgentPanel, window, cx);
             } else {
                 self.refresh_base_view_subscriptions(window, cx);
             }
@@ -13638,6 +13642,29 @@ mod tests {
             panel.clear_base_view(window, cx)
         });
         assert!(agent_picker(&panel, &cx).is_some());
+    }
+
+    #[gpui::test]
+    async fn test_removing_the_active_thread_shows_the_agent_picker(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        ask_for_new_thread_agent(&mut cx);
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        send_message(&panel, &mut cx);
+        let thread_id = panel.read_with(&cx, |panel, cx| panel.active_thread_id(cx).unwrap());
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.remove_thread(thread_id, window, cx)
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            assert!(panel.is_showing_agent_picker());
+            assert_eq!(panel.active_thread_id(cx), None);
+            assert!(
+                panel.draft_thread.is_none(),
+                "removing a thread shouldn't start a new one"
+            );
+        });
     }
 
     #[gpui::test]
