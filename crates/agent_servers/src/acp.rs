@@ -54,6 +54,9 @@ const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 const MUX_META_KEY: &str = "zed.dev/acpMux";
 /// Reports turns that acp-mux saw start on behalf of another Zed connection.
 const MUX_TURN_STATE_METHOD: &str = "_zed.dev/acpMux/turn_state";
+/// Names a session hosted by acp-mux, which shares the name with its other
+/// clients (such as its web client), since ACP has no way to name a session.
+const MUX_SET_TITLE_METHOD: &str = "_zed.dev/acpMux/set_title";
 
 fn mcp_configurations_for_project(
     project: &Entity<Project>,

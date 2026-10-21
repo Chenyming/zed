@@ -1,7 +1,7 @@
 use super::{
     AcpDebugLog, AcpDebugMessage, AcpSession, ClientContext, ConfigOptions, FlattenAcpResult as _,
-    ForegroundWork, MUX_META_KEY, UnsupportedVersion, drain_foreground_queue, enqueue_notification,
-    enqueue_request, first_class_terminal_auth_task, handle_mux_turn_state,
+    ForegroundWork, MUX_META_KEY, MUX_SET_TITLE_METHOD, UnsupportedVersion, drain_foreground_queue,
+    enqueue_notification, enqueue_request, first_class_terminal_auth_task, handle_mux_turn_state,
     handle_v2_complete_elicitation, handle_v2_create_elicitation, map_acp_error,
     mcp_configurations_for_project, mux_turn_state_notification, respond_err, respond_result,
     runtime, session_thread, terminal_auth_task_id, transport, with_v2_client_ingress,
@@ -9,7 +9,7 @@ use super::{
 };
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
-    AgentSessionListResponse, ElicitationStore,
+    AgentSessionListResponse, AgentSessionSetTitle, ElicitationStore,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::{
@@ -83,6 +83,7 @@ pub struct AcpConnection {
     auth_methods: Vec<acp_v2::AuthMethod>,
     agent_server_store: WeakEntity<AgentServerStore>,
     agent_capabilities: acp::AgentCapabilities,
+    hosted_by_mux: bool,
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
     _child: Option<transport::OwnedChild>,
@@ -636,7 +637,8 @@ impl AcpConnection {
         if response.protocol_version < MINIMUM_SUPPORTED_VERSION {
             return Err(UnsupportedVersion.into());
         }
-        mux_turn_state.set(is_hosted_by_mux(&response));
+        let hosted_by_mux = is_hosted_by_mux(&response);
+        mux_turn_state.set(hosted_by_mux);
 
         let wait_task = runtime::watch_process(
             status_fut,
@@ -718,6 +720,7 @@ impl AcpConnection {
             sessions,
             pending_sessions: RefCell::new(HashMap::default()),
             agent_capabilities: response.agent_capabilities,
+            hosted_by_mux,
             request_elicitations,
             defaults,
             session_list,
@@ -763,6 +766,7 @@ impl AcpConnection {
             auth_methods: vec![],
             agent_server_store,
             agent_capabilities,
+            hosted_by_mux: false,
             request_elicitations,
             defaults,
             _child: None,
@@ -1724,8 +1728,44 @@ impl AgentConnection for AcpConnection {
         self.session_list.clone().map(|s| s as _)
     }
 
+    fn set_title(
+        &self,
+        session_id: &acp_v2::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn AgentSessionSetTitle>> {
+        self.hosted_by_mux.then(|| {
+            Rc::new(MuxSessionSetTitle {
+                session_id: session_id.clone(),
+                connection: self.connection.clone(),
+            }) as _
+        })
+    }
+
     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
         self
+    }
+}
+
+struct MuxSessionSetTitle {
+    session_id: acp_v2::SessionId,
+    connection: ConnectionTo<Agent>,
+}
+
+impl AgentSessionSetTitle for MuxSessionSetTitle {
+    fn run(&self, title: SharedString, cx: &mut App) -> Task<Result<()>> {
+        let request = UntypedMessage::new(
+            MUX_SET_TITLE_METHOD,
+            serde_json::json!({"sessionId": self.session_id.0, "title": title}),
+        );
+        let connection = self.connection.clone();
+        cx.foreground_executor().spawn(async move {
+            connection
+                .send_request(request.map_err(map_acp_error)?)
+                .block_task()
+                .await
+                .map_err(map_acp_error)?;
+            Ok(())
+        })
     }
 }
 
@@ -9179,6 +9219,7 @@ exit 7
         agent: ConnectionTo<Client>,
         load_replay: Arc<Mutex<Vec<UntypedMessage>>>,
         cancel_count: Arc<AtomicUsize>,
+        set_title_requests: Arc<Mutex<Vec<serde_json::Value>>>,
         _keep_agent_alive: Task<anyhow::Result<()>>,
     }
 
@@ -9192,6 +9233,7 @@ exit 7
             let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
             let load_replay = Arc::new(Mutex::new(Vec::<UntypedMessage>::new()));
             let cancel_count = Arc::new(AtomicUsize::new(0));
+            let set_title_requests = Arc::new(Mutex::new(Vec::new()));
 
             let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
             let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
@@ -9201,7 +9243,9 @@ exit 7
                 .on_receive_request(
                     async move |request: acp::InitializeRequest, responder, _cx| {
                         let mut response = acp::InitializeResponse::new(request.protocol_version)
-                            .agent_capabilities(acp::AgentCapabilities::default().load_session(true));
+                            .agent_capabilities(
+                                acp::AgentCapabilities::default().load_session(true),
+                            );
                         if hosted_by_mux {
                             response = response.meta(acp::Meta::from_iter([(
                                 MUX_META_KEY.to_string(),
@@ -9224,6 +9268,20 @@ exit 7
                                 cx.send_notification(message)?;
                             }
                             responder.respond(acp::LoadSessionResponse::new())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    {
+                        let set_title_requests = set_title_requests.clone();
+                        async move |request: UntypedMessage, responder, _cx| {
+                            assert_eq!(request.method(), MUX_SET_TITLE_METHOD);
+                            set_title_requests
+                                .lock()
+                                .expect("set title requests lock poisoned")
+                                .push(request.params().clone());
+                            responder.respond(serde_json::json!({}))
                         }
                     },
                     agent_client_protocol::on_receive_request!(),
@@ -9283,7 +9341,8 @@ exit 7
             });
             let agent_server_store =
                 project.read_with(cx, |project, _| project.agent_server_store().downgrade());
-            let connection = cx.update(|cx| {
+            let hosted_by_mux = is_hosted_by_mux(&response);
+            let mut connection = cx.update(|cx| {
                 AcpConnection::new_for_test(
                     client_connection,
                     sessions,
@@ -9296,6 +9355,7 @@ exit 7
                     cx,
                 )
             });
+            connection.hosted_by_mux = hosted_by_mux;
             let agent = agent_receiver.await.expect("fake agent handle");
 
             Self {
@@ -9304,6 +9364,7 @@ exit 7
                 agent,
                 load_replay,
                 cancel_count,
+                set_title_requests,
                 _keep_agent_alive: cx.background_spawn(async move {
                     agent_io_task.await.ok();
                     anyhow::Ok(())
@@ -9401,11 +9462,31 @@ exit 7
     }
 
     #[gpui::test]
+    async fn names_sessions_hosted_by_mux(cx: &mut gpui::TestAppContext) {
+        let agent = FakeMuxAgent::connect(true, cx).await;
+        let thread = agent.load(Vec::new(), cx).await;
+        assert!(thread.update(cx, |thread, cx| thread.can_set_title(cx)));
+        thread
+            .update(cx, |thread, cx| thread.set_title("Login fix".into(), cx))
+            .await
+            .expect("naming the session");
+        assert_eq!(
+            *agent
+                .set_title_requests
+                .lock()
+                .expect("set title requests lock poisoned"),
+            vec![serde_json::json!({"sessionId": MUX_SESSION_ID, "title": "Login fix"})]
+        );
+
+        let agent = FakeMuxAgent::connect(false, cx).await;
+        let thread = agent.load(Vec::new(), cx).await;
+        assert!(!thread.update(cx, |thread, cx| thread.can_set_title(cx)));
+    }
+
+    #[gpui::test]
     async fn cancelling_a_mirrored_turn_waits_for_the_agent(cx: &mut gpui::TestAppContext) {
         let agent = FakeMuxAgent::connect(true, cx).await;
-        let thread = agent
-            .load(vec![mux_turn_state("running", None)], cx)
-            .await;
+        let thread = agent.load(vec![mux_turn_state("running", None)], cx).await;
 
         let mut cancel = thread.update(cx, |thread, cx| thread.cancel(cx));
         cx.run_until_parked();
@@ -9425,9 +9506,7 @@ exit 7
         cx: &mut gpui::TestAppContext,
     ) {
         let agent = FakeMuxAgent::connect(true, cx).await;
-        let thread = agent
-            .load(vec![mux_turn_state("running", None)], cx)
-            .await;
+        let thread = agent.load(vec![mux_turn_state("running", None)], cx).await;
 
         settle_after_disconnect(agent.connection.dispatch_tx.clone())
             .await
@@ -9443,9 +9522,7 @@ exit 7
         cx: &mut gpui::TestAppContext,
     ) {
         let agent = FakeMuxAgent::connect(true, cx).await;
-        let thread = agent
-            .load(vec![mux_turn_state("running", None)], cx)
-            .await;
+        let thread = agent.load(vec![mux_turn_state("running", None)], cx).await;
 
         let _permission = agent.agent.send_request(acp::RequestPermissionRequest::new(
             acp::SessionId::new(MUX_SESSION_ID),
@@ -9473,9 +9550,7 @@ exit 7
     #[gpui::test]
     async fn turn_state_is_ignored_for_agents_not_hosted_by_mux(cx: &mut gpui::TestAppContext) {
         let agent = FakeMuxAgent::connect(false, cx).await;
-        let thread = agent
-            .load(vec![mux_turn_state("running", None)], cx)
-            .await;
+        let thread = agent.load(vec![mux_turn_state("running", None)], cx).await;
         assert_eq!(thread_status(&thread, cx), acp_thread::ThreadStatus::Idle);
     }
 }

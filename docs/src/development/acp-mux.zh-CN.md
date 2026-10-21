@@ -91,18 +91,19 @@ Zed 内置的 agent（Zed Agent）运行在 Mac 上的 Zed 进程里，通过远
 }
 ```
 
-| 字段           | 类型       | 默认值  | 说明                                                                                                                                                                     |
-| -------------- | ---------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `enabled`      | 布尔       | `false` | 是否开启。只有 `true` 才生效                                                                                                                                             |
-| `agents`       | 字符串数组 | 不限制  | 接入的 agent 名称。省略时所有外部 agent 都接入                                                                                                                           |
-| `auto_approve` | 字符串数组 | `[]`    | 自动批准的工具类型，取值为 ACP 的 tool kind：`read`、`edit`、`delete`、`move`、`search`、`execute`、`think`、`fetch`、`switch_mode`、`other`。每次自动批准都会记录到日志 |
-| `gateway`      | 对象       | 不开启  | 网页和手机访问，见[网页和手机访问](#web)                                                                                                                                 |
-| `notify`       | 对象       | 不开启  | 推送通知，见[通知](#notify)                                                                                                                                              |
+| 字段                         | 类型       | 默认值  | 说明                                                                                                                                                                     |
+| ---------------------------- | ---------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `enabled`                    | 布尔       | `false` | 是否开启。只有 `true` 才生效                                                                                                                                             |
+| `agents`                     | 字符串数组 | 不限制  | 接入的 agent 名称。省略时所有外部 agent 都接入                                                                                                                           |
+| `auto_approve`               | 字符串数组 | `[]`    | 自动批准的工具类型，取值为 ACP 的 tool kind：`read`、`edit`、`delete`、`move`、`search`、`execute`、`think`、`fetch`、`switch_mode`、`other`。每次自动批准都会记录到日志 |
+| `gateway`                    | 对象       | 不开启  | 网页和手机访问，见[网页和手机访问](#web)                                                                                                                                 |
+| `notify`                     | 对象       | 不开启  | 推送通知，见[通知](#notify)                                                                                                                                              |
+| `auto_generate_thread_title` | 布尔       | `false` | 是否采用 agent 报的会话标题。关闭时会话只用 Zed 里起的名字，见[会话名字](#titles)                                                                                        |
 
 生效时机：
 
 - `enabled` 和 `agents`：每次建立远程连接时读取。修改后，在 Zed 中断开并重新连接 Linux 才生效。
-- `auto_approve`、`gateway`、`notify`：daemon 启动时读取。修改后执行 `acp-mux restart` 才生效。
+- `auto_approve`、`gateway`、`notify`、`auto_generate_thread_title`：daemon 启动时读取。修改后执行 `acp-mux restart` 才生效。
 
 配置文件格式错误时，远程连接会忽略它并按未开启处理，错误记录在 remote server 的日志里。
 
@@ -240,6 +241,15 @@ token 是网页的唯一门槛，网关又会暴露在 frp 或 VPN 上，短 tok
 - 每次授权回答都会记录到 daemon 日志，包括来源。
 
 注意：在 agent 执行时从网页发送消息，会**中断当前轮次**，网页会先确认。
+
+### 会话名字 {#titles}
+
+会话名字只来自用户：在 Zed 里新建时起的名字和之后的重命名，会通过扩展请求 `_zed.dev/acpMux/set_title` 发给 daemon。
+daemon 保存这个名字并推送给网页等其他客户端，不转发给 agent。`acp-mux list`、网页、通知和会话列表都显示它，没起名的会话显示"未命名会话"。
+
+- 默认（`auto_generate_thread_title` 为 `false`）忽略 agent 报的标题，和 Zed 的同名设置一致。
+- 设为 `true` 时，没起名的会话采用 agent 的标题；用户起名后，agent 的标题不再覆盖它。
+- 名字只保存在 daemon 内存里，daemon 重启后需要在 Zed 里重新命名才会显示。升级前已有的会话也要重命名一次才会同步。
 
 ## 通知 {#notify}
 

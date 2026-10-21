@@ -15,6 +15,9 @@ pub struct MuxSession {
     pub agent_name: String,
     pub cwd: String,
     pub title: Option<String>,
+    /// Whether `title` was given by a user, in which case the agent's titles
+    /// no longer replace it.
+    pub titled_by_user: bool,
     pub updated_at: SystemTime,
     pub snapshot: SessionSnapshot,
     pub turn: TurnState,
@@ -64,6 +67,7 @@ impl MuxSession {
             agent_name,
             cwd,
             title: None,
+            titled_by_user: false,
             updated_at: SystemTime::now(),
             snapshot: SessionSnapshot::default(),
             turn: TurnState::Idle {

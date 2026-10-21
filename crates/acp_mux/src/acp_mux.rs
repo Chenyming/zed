@@ -23,6 +23,9 @@ pub use control::PROTOCOL_VERSION;
 /// Method of the extension notification that tells an attached client whether a
 /// turn it did not start itself is running.
 pub const TURN_STATE_METHOD: &str = "_zed.dev/acpMux/turn_state";
+/// Method of the extension request that names a session. ACP has no way to tell
+/// an agent a session's name, so the daemon keeps it and shares it with clients.
+pub const SET_TITLE_METHOD: &str = "_zed.dev/acpMux/set_title";
 /// Key in the `_meta` of the `initialize` response that marks a muxed agent.
 pub const META_KEY: &str = "zed.dev/acpMux";
 
@@ -91,6 +94,10 @@ pub struct Config {
     pub gateway: Option<GatewayConfig>,
     /// Publishes notifications when present.
     pub notify: Option<NotifyConfig>,
+    /// Whether sessions may be titled by the agent. When disabled, sessions are
+    /// only named by users, through `_zed.dev/acpMux/set_title`, and titles the
+    /// agent reports are dropped.
+    pub auto_generate_thread_title: bool,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]

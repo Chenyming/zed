@@ -4,7 +4,7 @@ use smol::channel::Sender;
 use std::{collections::HashMap, mem, time::SystemTime};
 
 use crate::{
-    Config, META_KEY, PROTOCOL_VERSION, TURN_STATE_METHOD,
+    Config, META_KEY, PROTOCOL_VERSION, SET_TITLE_METHOD, TURN_STATE_METHOD,
     agent::{
         AgentId, AgentKey, AgentLauncher, AgentState, CallKind, InitState, PendingAgentRequest,
         PendingCall, client_initialize_response, daemon_initialize_params,
@@ -148,6 +148,15 @@ fn with_id(mut message: Value, id: Value) -> Value {
         object.insert("id".into(), id);
     }
     message
+}
+
+/// Removes the title from a `session_info_update`, keeping its other fields.
+fn drop_title(update: &mut Value) {
+    if update.get("sessionUpdate").and_then(Value::as_str) == Some("session_info_update")
+        && let Some(update) = update.as_object_mut()
+    {
+        update.remove("title");
+    }
 }
 
 fn session_update_message(session_id: &str, update: &Value) -> Value {
@@ -425,6 +434,7 @@ impl Router {
             "session/load" | "session/resume" => self.handle_load(client, client_agent, id, params),
             "session/close" => self.handle_close(client, id, &params),
             "session/prompt" => self.handle_prompt(client, client_agent, id, params, message),
+            SET_TITLE_METHOD => self.handle_set_title(client, id, &params),
             _ => {
                 let session_id = session_id_of(&params);
                 let key = session_id
@@ -473,6 +483,35 @@ impl Router {
                 self.forward_request(client, target, id, message, kind);
             }
         }
+    }
+
+    /// Names a session for every client. The request is not forwarded, since
+    /// agents can't be told a session's name.
+    fn handle_set_title(&mut self, client: ClientId, id: Value, params: &Value) {
+        let Some(key) =
+            session_id_of(params).and_then(|session_id| self.session_key(client, &session_id))
+        else {
+            Self::send_to_client(
+                &self.clients,
+                client,
+                error_message(id, INVALID_PARAMS, "Unknown session"),
+            );
+            return;
+        };
+        let title = params
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty());
+        if let Some(session) = self.sessions.get_mut(&key) {
+            session.titled_by_user = title.is_some();
+        }
+        self.share_session_change(
+            &key,
+            json!({"sessionUpdate": "session_info_update", "title": title}),
+            client,
+        );
+        Self::send_to_client(&self.clients, client, response_message(id, json!({})));
     }
 
     /// Observers cannot start agents or sessions, only use existing sessions.
@@ -1421,13 +1460,20 @@ impl Router {
             return;
         }
 
+        let auto_generate_title = self.config.auto_generate_thread_title;
         let session = session_id_of(&params)
             .and_then(|session_id| self.sessions.get_mut(&(agent_name, session_id)));
         match session {
             Some(session) => {
+                let mut message = message;
                 if method == "session/update"
-                    && let Some(update) = params.get("update")
+                    && let Some(update) = message
+                        .get_mut("params")
+                        .and_then(|params| params.get_mut("update"))
                 {
+                    if !auto_generate_title || session.titled_by_user {
+                        drop_title(update);
+                    }
                     session.record_update(update);
                 }
                 for observer in &session.observers {
@@ -2054,16 +2100,47 @@ mod tests {
         assert!(session.is_running());
     }
 
+    fn set_title(session_id: &str, title: &str) -> Value {
+        json!({"jsonrpc": "2.0", "id": "title", "method": SET_TITLE_METHOD, "params": {
+            "sessionId": session_id,
+            "title": title,
+        }})
+    }
+
+    fn agent_title(session_id: &str, title: &str) -> Value {
+        notification_message(
+            "session/update",
+            json!({"sessionId": session_id, "update": {
+                "sessionUpdate": "session_info_update",
+                "title": title,
+                "updatedAt": "2026-01-01T00:00:00Z",
+            }}),
+        )
+    }
+
+    fn listed_titles(harness: &mut Harness, client: ClientId) -> Vec<Value> {
+        harness.from_client(
+            client,
+            json!({"jsonrpc": "2.0", "id": "list", "method": "session/list", "params": {}}),
+        );
+        harness.client_messages(client)[0]["result"]["sessions"]
+            .as_array()
+            .map(|sessions| {
+                sessions
+                    .iter()
+                    .map(|session| session["title"].clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
     fn lists_sessions() {
         let mut harness = Harness::new();
         harness.attach(1);
         harness.initialize(1);
         harness.new_session(1, "s1");
-        harness.from_agent(notification_message(
-            "session/update",
-            json!({"sessionId": "s1", "update": {"sessionUpdate": "session_info_update", "title": "Fix it"}}),
-        ));
+        harness.from_client(1, set_title("s1", "Fix it"));
         harness.client_messages(1);
 
         harness.from_client(
@@ -2088,6 +2165,81 @@ mod tests {
             harness.client_messages(1),
             vec![response_message(json!(9), json!({"sessions": []}))]
         );
+    }
+
+    #[test]
+    fn sessions_are_only_titled_by_users_by_default() {
+        let mut harness = Harness::new();
+        harness.attach(1);
+        harness.initialize(1);
+        harness.new_session(1, "s1");
+        harness.observe(2);
+        harness.load(2, "s1");
+        harness.client_messages(2);
+
+        // The agent's title is dropped, but the rest of its update still arrives.
+        harness.from_agent(agent_title("s1", "Agent title"));
+        let forwarded = notification_message(
+            "session/update",
+            json!({"sessionId": "s1", "update": {
+                "sessionUpdate": "session_info_update",
+                "updatedAt": "2026-01-01T00:00:00Z",
+            }}),
+        );
+        assert_eq!(harness.client_messages(1), vec![forwarded.clone()]);
+        assert_eq!(harness.client_messages(2), vec![forwarded]);
+        assert_eq!(listed_titles(&mut harness, 2), vec![Value::Null]);
+
+        // A user's title reaches every other client and replays, but not the agent.
+        harness.from_client(1, set_title("s1", " Login fix "));
+        assert_eq!(
+            harness.client_messages(1),
+            vec![response_message(json!("title"), json!({}))]
+        );
+        assert_eq!(
+            harness.client_messages(2),
+            vec![session_update_message(
+                "s1",
+                &json!({"sessionUpdate": "session_info_update", "title": "Login fix"}),
+            )]
+        );
+        assert_eq!(harness.agent_messages(), Vec::<Value>::new());
+        assert_eq!(listed_titles(&mut harness, 2), vec![json!("Login fix")]);
+        harness.observe(3);
+        harness.load(3, "s1");
+        assert!(
+            harness
+                .client_messages(3)
+                .iter()
+                .any(|message| message["params"]["update"]["title"] == "Login fix")
+        );
+
+        harness.from_client(2, set_title("missing", "Other"));
+        assert_eq!(
+            harness.client_messages(2)[0]["error"]["code"],
+            json!(INVALID_PARAMS)
+        );
+    }
+
+    #[test]
+    fn agent_titles_apply_until_a_user_names_the_session_when_enabled() {
+        let mut harness = Harness::with_config(Config {
+            auto_generate_thread_title: true,
+            ..Config::default()
+        });
+        harness.attach(1);
+        harness.initialize(1);
+        harness.new_session(1, "s1");
+
+        harness.from_agent(agent_title("s1", "Agent title"));
+        harness.client_messages(1);
+        assert_eq!(listed_titles(&mut harness, 1), vec![json!("Agent title")]);
+
+        harness.from_client(1, set_title("s1", "Login fix"));
+        harness.client_messages(1);
+        harness.from_agent(agent_title("s1", "Newer agent title"));
+        harness.client_messages(1);
+        assert_eq!(listed_titles(&mut harness, 1), vec![json!("Login fix")]);
     }
 
     #[test]
