@@ -38,6 +38,7 @@ use zed_actions::{
 use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
+use crate::agent_picker::{AgentPicker, AgentPickerConfirmed, AgentPickerEntry};
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
@@ -83,7 +84,9 @@ use language::LanguageRegistry;
 use language_model::LanguageModelRegistry;
 use notifications::status_toast::StatusToast;
 use project::{Project, ProjectPath, Worktree};
-use settings::{NotifyWhenAgentWaiting, Settings, SettingsStore, update_settings_file};
+use settings::{
+    NewThreadAgent, NotifyWhenAgentWaiting, Settings, SettingsStore, update_settings_file,
+};
 
 use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
 use terminal::Event as TerminalEvent;
@@ -1083,6 +1086,9 @@ enum BaseView {
     Terminal {
         terminal_id: TerminalId,
     },
+    AgentPicker {
+        picker: Entity<AgentPicker>,
+    },
 }
 
 impl From<AgentThread> for BaseView {
@@ -1097,6 +1103,7 @@ enum VisibleSurface<'a> {
     Uninitialized,
     AgentThread(&'a Entity<ConversationView>),
     Terminal(&'a Entity<TerminalView>),
+    AgentPicker(&'a Entity<AgentPicker>),
 }
 
 enum WhichFontSize {
@@ -1108,7 +1115,9 @@ impl BaseView {
     pub fn which_font_size_used(&self) -> WhichFontSize {
         match self {
             BaseView::AgentThread { .. } => WhichFontSize::AgentFont,
-            BaseView::Terminal { .. } | BaseView::Uninitialized => WhichFontSize::None,
+            BaseView::Terminal { .. } | BaseView::AgentPicker { .. } | BaseView::Uninitialized => {
+                WhichFontSize::None
+            }
         }
     }
 }
@@ -1744,7 +1753,7 @@ impl AgentPanel {
     pub fn clear_base_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let old_view = std::mem::replace(&mut self.base_view, BaseView::Uninitialized);
         self.retain_running_thread(old_view, cx);
-        self.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
+        self.activate_empty_state(false, AgentThreadSource::AgentPanel, window, cx);
         self.serialize(cx);
         cx.emit(AgentPanelEvent::ActiveViewChanged);
         cx.notify();
@@ -1764,10 +1773,96 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.should_create_terminal_for_new_entry(cx) {
+        if self.asks_for_new_thread_agent(cx) {
+            self.show_agent_picker(true, window, cx);
+        } else if self.should_create_terminal_for_new_entry(cx) {
             self.new_terminal(workspace, AgentThreadSource::AgentPanel, window, cx);
         } else {
             self.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
+        }
+    }
+
+    /// Starts a new thread with the selected agent, or lets the user choose
+    /// the agent first when `new_thread_agent` is set to ask.
+    pub fn start_new_thread(
+        &mut self,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.asks_for_new_thread_agent(cx) {
+            self.show_agent_picker(true, window, cx);
+        } else {
+            self.activate_new_thread(true, source, window, cx);
+        }
+    }
+
+    fn asks_for_new_thread_agent(&self, cx: &App) -> bool {
+        AgentSettings::get_global(cx).new_thread_agent == NewThreadAgent::Ask
+    }
+
+    /// Shows what the panel falls back to when it has nothing else to show:
+    /// a draft with the selected agent, or the agent picker.
+    fn activate_empty_state(
+        &mut self,
+        focus: bool,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.asks_for_new_thread_agent(cx) {
+            self.show_agent_picker(focus, window, cx);
+        } else {
+            self.activate_draft(focus, source, window, cx);
+        }
+    }
+
+    pub fn show_agent_picker(&mut self, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_open_project(cx) {
+            return;
+        }
+        if let BaseView::AgentPicker { picker } = &self.base_view {
+            if focus {
+                picker.focus_handle(cx).focus(window, cx);
+            }
+            return;
+        }
+        let selected_agent = self.selected_agent(cx);
+        let project = self.project.clone();
+        let picker = cx.new(|cx| AgentPicker::new(project, selected_agent, window, cx));
+        self.set_base_view(BaseView::AgentPicker { picker }, focus, window, cx);
+        cx.notify();
+    }
+
+    fn handle_agent_picker_event(
+        &mut self,
+        _picker: &Entity<AgentPicker>,
+        event: &AgentPickerConfirmed,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match &event.entry {
+            AgentPickerEntry::Agent(agent) => {
+                self.selected_agent = agent.clone();
+                self.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
+                if let Some(title) = event.title.clone()
+                    && let Some(conversation_view) = self.active_conversation_view().cloned()
+                {
+                    conversation_view.update(cx, |conversation_view, cx| {
+                        conversation_view.rename_when_connected(title, window, cx);
+                    });
+                }
+            }
+            AgentPickerEntry::Terminal => {
+                self.new_terminal_with_title(
+                    None,
+                    event.title.clone(),
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                );
+            }
+            AgentPickerEntry::AddMoreAgents => {}
         }
     }
 
@@ -1979,6 +2074,17 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.new_terminal_with_title(workspace, None, source, window, cx);
+    }
+
+    fn new_terminal_with_title(
+        &mut self,
+        workspace: Option<&Workspace>,
+        custom_title: Option<SharedString>,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.supports_terminal(cx) {
             return;
         }
@@ -1987,7 +2093,7 @@ impl AgentPanel {
         self.spawn_terminal(
             TerminalId::new(),
             working_directory,
-            None,
+            custom_title,
             None,
             None,
             true,
@@ -2014,7 +2120,9 @@ impl AgentPanel {
     }
 
     pub fn should_create_terminal_for_new_entry(&self, cx: &App) -> bool {
-        self.last_created_entry_kind == AgentPanelEntryKind::Terminal
+        // When asking, the terminal is one of the choices rather than a default.
+        !self.asks_for_new_thread_agent(cx)
+            && self.last_created_entry_kind == AgentPanelEntryKind::Terminal
             && self.project.read(cx).supports_terminal(cx)
     }
 
@@ -2345,7 +2453,7 @@ impl AgentPanel {
             self.base_view = BaseView::Uninitialized;
             self.refresh_base_view_subscriptions(window, cx);
             if activate_draft_after_close {
-                self.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
+                self.activate_empty_state(false, AgentThreadSource::AgentPanel, window, cx);
             }
         }
 
@@ -4409,6 +4517,11 @@ impl AgentPanel {
                 }
                 None
             }
+            BaseView::AgentPicker { picker } => {
+                self._thread_view_subscription = None;
+                self._active_thread_focus_subscription = None;
+                Some(cx.subscribe_in(picker, window, Self::handle_agent_picker_event))
+            }
             BaseView::Uninitialized => {
                 self._thread_view_subscription = None;
                 self._active_thread_focus_subscription = None;
@@ -4421,6 +4534,7 @@ impl AgentPanel {
     fn visible_surface(&self) -> VisibleSurface<'_> {
         match &self.base_view {
             BaseView::Uninitialized => VisibleSurface::Uninitialized,
+            BaseView::AgentPicker { picker } => VisibleSurface::AgentPicker(picker),
             BaseView::AgentThread { conversation_view } => {
                 VisibleSurface::AgentThread(conversation_view)
             }
@@ -5028,14 +5142,14 @@ fn agent_panel_dock_position(cx: &App) -> DockPosition {
     AgentSettings::get_global(cx).dock.into()
 }
 
-struct ExternalAgentEntry {
-    id: AgentId,
-    display_name: SharedString,
-    icon_path: Option<SharedString>,
+pub(crate) struct ExternalAgentEntry {
+    pub(crate) id: AgentId,
+    pub(crate) display_name: SharedString,
+    pub(crate) icon_path: Option<SharedString>,
 }
 
 /// The external agents a new thread can be started with, sorted by name.
-fn external_agent_entries(
+pub(crate) fn external_agent_entries(
     agent_server_store: &project::AgentServerStore,
     cx: &App,
 ) -> Vec<ExternalAgentEntry> {
@@ -5091,6 +5205,7 @@ impl Panel for AgentPanel {
                 conversation_view.read(cx).activation_focus_handle(cx)
             }
             VisibleSurface::Terminal(terminal_view) => terminal_view.focus_handle(cx),
+            VisibleSurface::AgentPicker(picker) => picker.focus_handle(cx),
         }
     }
 
@@ -5224,7 +5339,7 @@ impl AgentPanel {
                     }
                 });
             } else {
-                self.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
+                self.activate_empty_state(false, AgentThreadSource::AgentPanel, window, cx);
             }
         }
     }
@@ -5306,7 +5421,7 @@ impl AgentPanel {
         }
 
         match &self.base_view {
-            BaseView::Uninitialized => false,
+            BaseView::Uninitialized | BaseView::AgentPicker { .. } => false,
             BaseView::Terminal { .. } => true,
             BaseView::AgentThread { conversation_view } => {
                 let has_entries = conversation_view
@@ -5597,6 +5712,10 @@ impl AgentPanel {
             }
 
             VisibleSurface::Uninitialized => Label::new("Agent").truncate().into_any_element(),
+            VisibleSurface::AgentPicker(_) => Label::new("New Thread")
+                .color(Color::Muted)
+                .truncate()
+                .into_any_element(),
         };
 
         let toolbar_bg = cx.theme().colors().tab_bar_background;
@@ -6193,7 +6312,10 @@ impl AgentPanel {
             .is_some_and(|conversation_view| {
                 conversation_view.read(cx).root_thread_view().is_some()
             });
-        let empty_thread_title = (matches!(mode, ToolbarMode::EmptyThread) && !has_title_editor)
+        let showing_agent_picker = matches!(self.base_view, BaseView::AgentPicker { .. });
+        let empty_thread_title = (matches!(mode, ToolbarMode::EmptyThread)
+            && !has_title_editor
+            && !showing_agent_picker)
             .then(|| {
                 Label::new(untitled_thread_placeholder(&selected_agent_label))
                     .color(Color::Muted)
@@ -6284,7 +6406,7 @@ impl AgentPanel {
                     return false;
                 }
             }
-            BaseView::Terminal { .. } | BaseView::Uninitialized => {
+            BaseView::Terminal { .. } | BaseView::AgentPicker { .. } | BaseView::Uninitialized => {
                 return false;
             }
         }
@@ -6336,7 +6458,9 @@ impl AgentPanel {
             });
 
         match &self.base_view {
-            BaseView::Uninitialized | BaseView::Terminal { .. } => false,
+            BaseView::Uninitialized | BaseView::Terminal { .. } | BaseView::AgentPicker { .. } => {
+                false
+            }
             BaseView::AgentThread { conversation_view } => {
                 if conversation_view.read(cx).as_native_thread(cx).is_some() {
                     let history_is_empty = ThreadStore::global(cx).read(cx).is_empty();
@@ -6604,7 +6728,7 @@ impl AgentPanel {
                     });
                 }
             }
-            BaseView::Uninitialized => {}
+            BaseView::Uninitialized | BaseView::AgentPicker { .. } => {}
         }
     }
 
@@ -6678,6 +6802,7 @@ impl Render for AgentPanel {
                     parent.child(self.render_no_project_state(cx))
                 }
                 VisibleSurface::Uninitialized => parent,
+                VisibleSurface::AgentPicker(picker) => parent.child(picker.clone()),
                 VisibleSurface::AgentThread(conversation_view) => parent
                     .child(conversation_view.clone())
                     .child(self.render_drag_target(cx)),
@@ -13458,6 +13583,177 @@ mod tests {
             assert!(panel.retained_threads.contains_key(&draft_thread_id));
         });
         assert_eq!(title_override(&cx).as_deref(), Some("Login fix"));
+    }
+
+    fn ask_for_new_thread_agent(cx: &mut VisualTestContext) {
+        cx.update(|_, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    new_thread_agent: NewThreadAgent::Ask,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+    }
+
+    fn agent_picker(
+        panel: &Entity<AgentPanel>,
+        cx: &VisualTestContext,
+    ) -> Option<Entity<AgentPicker>> {
+        panel.read_with(cx, |panel, _cx| match &panel.base_view {
+            BaseView::AgentPicker { picker } => Some(picker.clone()),
+            _ => None,
+        })
+    }
+
+    #[gpui::test]
+    async fn test_agent_picker_is_shown_instead_of_a_draft_when_asking(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        ask_for_new_thread_agent(&mut cx);
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.set_active(true, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(agent_picker(&panel, &cx).is_some());
+        panel.read_with(&cx, |panel, cx| {
+            assert!(
+                panel.draft_thread.is_none(),
+                "no agent should be started before one is picked"
+            );
+            assert_eq!(panel.active_thread_id(cx), None);
+        });
+
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        send_message(&panel, &mut cx);
+        assert!(agent_picker(&panel, &cx).is_none());
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.new_thread(&NewThread, window, cx)
+        });
+        assert!(agent_picker(&panel, &cx).is_some());
+
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.clear_base_view(window, cx)
+        });
+        assert!(agent_picker(&panel, &cx).is_some());
+    }
+
+    #[gpui::test]
+    async fn test_agent_picker_keyboard_navigation(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        ask_for_new_thread_agent(&mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.show_agent_picker(true, window, cx)
+        });
+        let picker = agent_picker(&panel, &cx).expect("picker should be shown");
+
+        let entries = picker.read_with(&cx, |picker, cx| picker.entries(cx));
+        assert_eq!(
+            entries.first(),
+            Some(&AgentPickerEntry::Agent(Agent::NativeAgent))
+        );
+        assert!(entries.contains(&AgentPickerEntry::Terminal));
+        assert_eq!(entries.last(), Some(&AgentPickerEntry::AddMoreAgents));
+        let selected_entry =
+            |cx: &VisualTestContext| picker.read_with(cx, |picker, cx| picker.selected_entry(cx));
+        assert_eq!(
+            selected_entry(&cx),
+            Some(AgentPickerEntry::Agent(Agent::NativeAgent)),
+            "the last used agent should be preselected"
+        );
+
+        let title_editor = picker.read_with(&cx, |picker, _cx| picker.title_editor().clone());
+        cx.update(|window, cx| {
+            assert!(title_editor.focus_handle(cx).is_focused(window));
+        });
+        cx.dispatch_action(menu::SelectNext);
+        assert_eq!(selected_entry(&cx), entries.get(1).cloned());
+        cx.dispatch_action(menu::SelectPrevious);
+        cx.dispatch_action(menu::SelectPrevious);
+        assert_eq!(selected_entry(&cx), entries.last().cloned());
+    }
+
+    #[gpui::test]
+    async fn test_agent_picker_names_the_new_thread_once_connected(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        ask_for_new_thread_agent(&mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.show_agent_picker(true, window, cx)
+        });
+        let picker = agent_picker(&panel, &cx).expect("picker should be shown");
+        picker.update(&mut cx, |_picker, cx| {
+            cx.emit(AgentPickerConfirmed {
+                entry: AgentPickerEntry::Agent(Agent::Stub),
+                title: Some("Login fix".into()),
+            });
+        });
+        let conversation_view = panel.read_with(&cx, |panel, _cx| {
+            panel
+                .active_conversation_view()
+                .cloned()
+                .expect("picking an agent should start a thread")
+        });
+        assert!(
+            conversation_view.read_with(&cx, |view, _cx| view.root_thread_view().is_none()),
+            "the agent shouldn't have connected yet, so the name has to wait"
+        );
+        cx.run_until_parked();
+
+        let thread_id = conversation_view.read_with(&cx, |view, _cx| view.thread_id);
+        let (agent, title_editor_text, thread_title) =
+            conversation_view.read_with(&cx, |view, cx| {
+                let thread_view = view.root_thread_view().expect("agent should be connected");
+                let thread_view = thread_view.read(cx);
+                (
+                    view.agent_key().clone(),
+                    thread_view.title_editor.read(cx).text(cx),
+                    thread_view.thread.read(cx).title(),
+                )
+            });
+        assert_eq!(agent, Agent::Stub);
+        assert_eq!(title_editor_text, "Login fix");
+        assert_eq!(thread_title.as_deref(), Some("Login fix"));
+        cx.read(|cx| {
+            let metadata = ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(thread_id)
+                .cloned()
+                .expect("thread metadata");
+            assert_eq!(metadata.title_override.as_deref(), Some("Login fix"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_picker_names_a_new_terminal(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        ask_for_new_thread_agent(&mut cx);
+        let (terminal_landed, spawn_gate) = futures::channel::oneshot::channel::<()>();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.test_terminal_spawn_gate = Some(spawn_gate);
+            panel.show_agent_picker(true, window, cx)
+        });
+        let picker = agent_picker(&panel, &cx).expect("picker should be shown");
+
+        picker.update(&mut cx, |_picker, cx| {
+            cx.emit(AgentPickerConfirmed {
+                entry: AgentPickerEntry::Terminal,
+                title: Some("Dev server".into()),
+            });
+        });
+        terminal_landed
+            .send(())
+            .expect("the panel should be waiting on the terminal spawn");
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            let terminal_id = panel
+                .active_terminal_id()
+                .expect("terminal should be shown");
+            let terminal = panel.terminals.get(&terminal_id).expect("terminal");
+            assert_eq!(terminal.view.read(cx).custom_title(), Some("Dev server"));
+        });
     }
 
     #[gpui::test]

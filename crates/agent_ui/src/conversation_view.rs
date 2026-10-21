@@ -795,6 +795,7 @@ pub struct ConversationView {
     pub(crate) root_session_id: Option<acp_v2::SessionId>,
     server_state: ServerState,
     pending_selections: Vec<AgentContextSelection>,
+    pending_title: Option<SharedString>,
     focus_handle: FocusHandle,
     notifications: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
@@ -1120,6 +1121,7 @@ impl ConversationView {
                 cx,
             ),
             pending_selections: Vec::new(),
+            pending_title: None,
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
             auth_task: None,
@@ -1462,6 +1464,13 @@ impl ConversationView {
                             }),
                             cx,
                         );
+                        if let Some(title) = this.pending_title.take() {
+                            // The thread's metadata is saved in response to the
+                            // state change above; the name can be stored once it is.
+                            cx.defer_in(window, move |this, window, cx| {
+                                this.rename_when_connected(title, window, cx);
+                            });
+                        }
                     }
                     Err(err) => {
                         this.handle_load_error(
@@ -1785,6 +1794,22 @@ impl ConversationView {
     /// User renames are stored in ThreadMetadataStore.
     /// Some agents can't set titles directly, so this should be checked
     /// when rendering the thread's title.
+    /// Names the thread, waiting for the agent to connect if it hasn't yet,
+    /// since there's no thread to name until then.
+    pub(crate) fn rename_when_connected(
+        &mut self,
+        title: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.root_thread_view() {
+            Some(thread_view) => thread_view.update(cx, |thread_view, cx| {
+                thread_view.rename(title, window, cx);
+            }),
+            None => self.pending_title = Some(title),
+        }
+    }
+
     pub(crate) fn title_override(&self, cx: &App) -> Option<SharedString> {
         ThreadMetadataStore::try_global(cx).and_then(|store| {
             store
@@ -9494,7 +9519,8 @@ pub(crate) mod tests {
             editor::init(cx);
             agent_panel::init(cx);
             release_channel::init(semver::Version::new(0, 0, 0), cx);
-            prompt_store::init(cx)
+            prompt_store::init(cx);
+            crate::test_support::start_new_threads_with_last_used_agent(cx);
         });
     }
 

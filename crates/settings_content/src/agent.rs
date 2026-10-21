@@ -396,6 +396,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: false
     pub auto_generate_thread_title: Option<bool>,
+    /// Which agent a new thread starts with when the panel has nothing to
+    /// show: the last used one, or one chosen from a list each time.
+    ///
+    /// Default: ask
+    pub new_thread_agent: Option<NewThreadAgent>,
     /// Whether to show the merge conflict indicator in the status bar
     /// that offers to resolve conflicts using the agent.
     ///
@@ -650,6 +655,28 @@ fn agent_profile_tools_schema(_: &mut schemars::SchemaGenerator) -> schemars::Sc
         "properties": properties,
         "additionalProperties": false
     })
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Default,
+    Debug,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum NewThreadAgent {
+    /// Start a new thread with the last used agent right away.
+    LastUsed,
+    /// Show a list of agents and start the thread once one is chosen.
+    #[default]
+    Ask,
 }
 
 #[derive(

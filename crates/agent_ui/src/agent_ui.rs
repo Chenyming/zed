@@ -3,6 +3,7 @@ pub mod agent_connection_store;
 mod agent_diff;
 mod agent_model_selector;
 mod agent_panel;
+mod agent_picker;
 mod agent_registry_ui;
 mod buffer_codegen;
 mod completion_provider;
@@ -1053,7 +1054,8 @@ mod tests {
     use gpui::{BorrowAppContext, TestAppContext, px};
     use project::DisableAiSettings;
     use settings::{
-        DockPosition, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, Settings, SettingsStore,
+        DockPosition, NewThreadAgent, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, Settings,
+        SettingsStore,
     };
 
     #[gpui::test]
@@ -1109,6 +1111,7 @@ mod tests {
             sandbox_permissions: Default::default(),
             show_turn_stats: false,
             auto_generate_thread_title: false,
+            new_thread_agent: NewThreadAgent::default(),
             show_merge_conflict_indicator: true,
             max_idle_retained_threads: 5,
             threads_sidebar: agent_settings::ThreadsSidebarSettings {

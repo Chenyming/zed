@@ -7170,7 +7170,7 @@ impl Sidebar {
         let draft_id = workspace.update(cx, |workspace, cx| {
             let panel = workspace.panel::<AgentPanel>(cx)?;
             let draft_id = panel.update(cx, |panel, cx| {
-                panel.activate_new_thread(true, AgentThreadSource::Sidebar, window, cx);
+                panel.start_new_thread(AgentThreadSource::Sidebar, window, cx);
                 panel.active_thread_id(cx)
             });
             workspace.focus_panel::<AgentPanel>(window, cx);

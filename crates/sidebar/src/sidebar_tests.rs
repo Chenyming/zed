@@ -67,6 +67,7 @@ fn init_test(cx: &mut TestAppContext) {
         language_model::LanguageModelRegistry::test(cx);
         prompt_store::init(cx);
         enable_automatic_thread_titles(cx);
+        agent_ui::test_support::start_new_threads_with_last_used_agent(cx);
     });
 }
 

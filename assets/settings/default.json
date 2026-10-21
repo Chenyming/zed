@@ -1415,6 +1415,13 @@
     //
     // Default: false
     "auto_generate_thread_title": false,
+    // Which agent a new thread starts with when the panel has nothing to show.
+    //
+    // - "last_used": Start a new thread with the last used agent right away.
+    // - "ask": Show a list of agents and start the thread once one is chosen.
+    //
+    // Default: "ask"
+    "new_thread_agent": "ask",
     // Whether to show the merge conflict indicator in the status bar
     // that offers to resolve conflicts using the agent.
     //

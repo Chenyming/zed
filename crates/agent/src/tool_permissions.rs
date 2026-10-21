@@ -563,7 +563,7 @@ mod tests {
     use crate::{AgentTool, EditFileTool};
     use agent_settings::{AgentProfileId, CompiledRegex, InvalidRegexPattern, ToolRules};
     use gpui::px;
-    use settings::{DockPosition, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone};
+    use settings::{DockPosition, NewThreadAgent, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone};
     use std::sync::Arc;
 
     fn test_agent_settings(tool_permissions: ToolPermissions) -> AgentSettings {
@@ -608,6 +608,7 @@ mod tests {
             sandbox_permissions: Default::default(),
             show_turn_stats: false,
             auto_generate_thread_title: false,
+            new_thread_agent: NewThreadAgent::default(),
             show_merge_conflict_indicator: true,
             max_idle_retained_threads: 5,
             threads_sidebar: agent_settings::ThreadsSidebarSettings {

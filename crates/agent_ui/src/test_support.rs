@@ -128,6 +128,18 @@ pub fn init_test(cx: &mut TestAppContext) {
                     .auto_generate_thread_title = Some(true);
             });
         });
+        start_new_threads_with_last_used_agent(cx);
+    });
+}
+
+/// Restores upstream behavior, where the panel starts a draft with the last
+/// used agent instead of asking which agent to use.
+pub fn start_new_threads_with_last_used_agent(cx: &mut App) {
+    <SettingsStore as gpui::UpdateGlobal>::update_global(cx, |store, cx| {
+        store.update_user_settings(cx, |content| {
+            content.agent.get_or_insert_default().new_thread_agent =
+                Some(settings::NewThreadAgent::LastUsed);
+        });
     });
 }
 
