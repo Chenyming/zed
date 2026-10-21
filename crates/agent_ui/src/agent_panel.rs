@@ -5028,6 +5028,42 @@ fn agent_panel_dock_position(cx: &App) -> DockPosition {
     AgentSettings::get_global(cx).dock.into()
 }
 
+struct ExternalAgentEntry {
+    id: AgentId,
+    display_name: SharedString,
+    icon_path: Option<SharedString>,
+}
+
+/// The external agents a new thread can be started with, sorted by name.
+fn external_agent_entries(
+    agent_server_store: &project::AgentServerStore,
+    cx: &App,
+) -> Vec<ExternalAgentEntry> {
+    let registry_store = project::AgentRegistryStore::try_global(cx);
+    let registry_store = registry_store.as_ref().map(|store| store.read(cx));
+    agent_server_store
+        .external_agents()
+        .map(|agent_id| {
+            let registry_agent = registry_store
+                .as_ref()
+                .and_then(|store| store.agent(agent_id));
+            let display_name = agent_server_store
+                .agent_display_name(agent_id)
+                .or_else(|| registry_agent.map(|agent| agent.name().clone()))
+                .unwrap_or_else(|| agent_id.0.clone());
+            let icon_path = agent_server_store
+                .agent_icon(agent_id)
+                .or_else(|| registry_agent.and_then(|agent| agent.icon_path().cloned()));
+            ExternalAgentEntry {
+                id: agent_id.clone(),
+                display_name,
+                icon_path,
+            }
+        })
+        .sorted_unstable_by_key(|entry| entry.display_name.to_lowercase())
+        .collect()
+}
+
 pub enum AgentPanelEvent {
     ActiveViewChanged,
     ActiveViewFocused,
@@ -5990,50 +6026,16 @@ impl AgentPanel {
                             )
                         })
                         .map(|mut menu| {
-                            let agent_server_store = agent_server_store.read(cx);
-                            let registry_store = project::AgentRegistryStore::try_global(cx);
-                            let registry_store_ref = registry_store.as_ref().map(|s| s.read(cx));
-
-                            struct AgentMenuItem {
-                                id: AgentId,
-                                display_name: SharedString,
-                            }
-
-                            let agent_items = agent_server_store
-                                .external_agents()
-                                .map(|agent_id| {
-                                    let display_name = agent_server_store
-                                        .agent_display_name(agent_id)
-                                        .or_else(|| {
-                                            registry_store_ref
-                                                .as_ref()
-                                                .and_then(|store| store.agent(agent_id))
-                                                .map(|a| a.name().clone())
-                                        })
-                                        .unwrap_or_else(|| agent_id.0.clone());
-                                    AgentMenuItem {
-                                        id: agent_id.clone(),
-                                        display_name,
-                                    }
-                                })
-                                .sorted_unstable_by_key(|e| e.display_name.to_lowercase())
-                                .collect::<Vec<_>>();
+                            let agent_items =
+                                external_agent_entries(agent_server_store.read(cx), cx);
 
                             if !agent_items.is_empty() {
                                 menu = menu.separator().header("External Agents");
                             }
-                            for item in &agent_items {
+                            for item in agent_items {
                                 let mut entry = ContextMenuEntry::new(item.display_name.clone());
 
-                                let icon_path =
-                                    agent_server_store.agent_icon(&item.id).or_else(|| {
-                                        registry_store_ref
-                                            .as_ref()
-                                            .and_then(|store| store.agent(&item.id))
-                                            .and_then(|a| a.icon_path().cloned())
-                                    });
-
-                                if let Some(icon_path) = icon_path {
+                                if let Some(icon_path) = item.icon_path.clone() {
                                     entry = entry.custom_icon_svg(icon_path);
                                 } else {
                                     entry = entry.icon(IconName::Sparkle);
