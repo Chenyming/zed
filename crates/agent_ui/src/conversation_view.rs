@@ -1785,7 +1785,7 @@ impl ConversationView {
     /// User renames are stored in ThreadMetadataStore.
     /// Some agents can't set titles directly, so this should be checked
     /// when rendering the thread's title.
-    fn title_override(&self, cx: &App) -> Option<SharedString> {
+    pub(crate) fn title_override(&self, cx: &App) -> Option<SharedString> {
         ThreadMetadataStore::try_global(cx).and_then(|store| {
             store
                 .read(cx)
@@ -2153,7 +2153,7 @@ impl ConversationView {
                 let title = self
                     .title_override(cx)
                     .or_else(|| thread.read(cx).title())
-                    .unwrap_or_else(|| DEFAULT_THREAD_TITLE.into());
+                    .unwrap_or_default();
                 if let Some(active_thread) = self.thread_view(&session_id) {
                     active_thread.update(cx, |active_thread, cx| {
                         active_thread.sync_title_editor(title, window, cx);
@@ -6654,7 +6654,7 @@ pub(crate) mod tests {
                 assert_eq!(view.thread.read(cx).title().as_deref(), title);
                 assert_eq!(
                     view.title_editor.read(cx).text(cx),
-                    title_override.or(title).unwrap_or(DEFAULT_THREAD_TITLE)
+                    title_override.or(title).unwrap_or_default()
                 );
             });
             cx.read(|cx| {
@@ -15648,7 +15648,7 @@ pub(crate) mod tests {
                 assert_eq!(thread.title().as_deref(), title);
             });
             title_editor.read_with(cx, |editor, cx| {
-                assert_eq!(editor.text(cx), title.unwrap_or(DEFAULT_THREAD_TITLE));
+                assert_eq!(editor.text(cx), title.unwrap_or_default());
             });
         };
 
@@ -15696,7 +15696,10 @@ pub(crate) mod tests {
             |title: Option<&str>, title_override: Option<&str>, cx: &VisualTestContext| {
                 let display_title = title_override.or(title).unwrap_or(DEFAULT_THREAD_TITLE);
                 title_editor.read_with(cx, |editor, cx| {
-                    assert_eq!(editor.text(cx), display_title);
+                    assert_eq!(
+                        editor.text(cx),
+                        title_override.or(title).unwrap_or_default()
+                    );
                 });
                 thread.read_with(cx, |thread, _cx| {
                     assert_eq!(thread.title().as_deref(), title);

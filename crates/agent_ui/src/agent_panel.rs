@@ -46,7 +46,7 @@ use crate::terminal_thread_metadata_store::{
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
-    NewNativeAgentThreadFromSummary,
+    NewNativeAgentThreadFromSummary, untitled_thread_placeholder,
 };
 use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
@@ -1826,7 +1826,8 @@ impl AgentPanel {
 
     fn draft_has_content(&self, draft: &Entity<ConversationView>, cx: &App) -> bool {
         let cv = draft.read(cx);
-        if cv.has_pending_selections() {
+        // A draft the user has named is kept like one with a typed message.
+        if cv.has_pending_selections() || cv.title_override(cx).is_some() {
             return true;
         }
         if let Some(thread_view) = cv.active_thread() {
@@ -3035,6 +3036,7 @@ impl AgentPanel {
             if agent_matches
                 || has_editor_content
                 || draft.read(cx).has_pending_selections()
+                || draft.read(cx).title_override(cx).is_some()
                 || !draft_is_active
             {
                 return draft.clone();
@@ -3187,6 +3189,7 @@ impl AgentPanel {
                     .text(cx)
                     .trim()
                     .is_empty()
+                    && conversation.title_override(cx).is_none()
             } else {
                 !self.draft_has_content(&conversation_view, cx)
             };
@@ -6181,12 +6184,20 @@ impl AgentPanel {
             .flex_none()
             .justify_between();
 
-        let empty_thread_title = matches!(mode, ToolbarMode::EmptyThread).then(|| {
-            Label::new(format!("New {} Thread", selected_agent_label))
-                .color(Color::Muted)
-                .truncate()
-                .into_any_element()
-        });
+        // The title editor lets an empty thread be named before its first
+        // message; it only exists once the agent has connected.
+        let has_title_editor = self
+            .visible_conversation_view()
+            .is_some_and(|conversation_view| {
+                conversation_view.read(cx).root_thread_view().is_some()
+            });
+        let empty_thread_title = (matches!(mode, ToolbarMode::EmptyThread) && !has_title_editor)
+            .then(|| {
+                Label::new(untitled_thread_placeholder(&selected_agent_label))
+                    .color(Color::Muted)
+                    .truncate()
+                    .into_any_element()
+            });
 
         let toolbar_content = {
             let new_thread_menu = PopoverMenu::new("new_thread_menu")
@@ -13393,6 +13404,58 @@ mod tests {
             active_text, None,
             "new draft on the new agent should start empty, not carry the parked draft's prompt"
         );
+    }
+
+    #[gpui::test]
+    async fn test_draft_named_before_its_first_message_is_kept(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.open_draft_with_server(
+                Rc::new(StubAgentServer::new(StubAgentConnection::new())),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let draft_thread_id = panel.read_with(&cx, |panel, cx| panel.active_thread_id(cx).unwrap());
+        let thread_view = panel.read_with(&cx, |panel, cx| panel.active_thread_view(cx).unwrap());
+        let (title_editor, agent_display_name) = thread_view.read_with(&cx, |view, _cx| {
+            (view.title_editor.clone(), view.agent_display_name.clone())
+        });
+        title_editor.update(&mut cx, |editor, cx| {
+            assert_eq!(editor.text(cx), "");
+            assert_eq!(
+                editor.placeholder_text(cx),
+                Some(untitled_thread_placeholder(&agent_display_name))
+            );
+        });
+
+        cx.focus(&title_editor);
+        cx.simulate_input("Login fix");
+        cx.run_until_parked();
+        let title_override = |cx: &VisualTestContext| {
+            cx.read(|cx| {
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(draft_thread_id)
+                    .and_then(|metadata| metadata.title_override.clone())
+            })
+        };
+        assert_eq!(title_override(&cx).as_deref(), Some("Login fix"));
+
+        // Without a typed message the draft would be discarded here; its name
+        // must keep it around instead.
+        cx.dispatch_action(NewExternalAgentThread {
+            agent: Agent::Stub.id(),
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            assert_ne!(panel.active_thread_id(cx), Some(draft_thread_id));
+            assert!(panel.retained_threads.contains_key(&draft_thread_id));
+        });
+        assert_eq!(title_override(&cx).as_deref(), Some("Login fix"));
     }
 
     #[gpui::test]

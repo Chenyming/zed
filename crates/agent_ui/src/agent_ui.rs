@@ -264,6 +264,10 @@ pub(crate) fn open_abs_path_at_point(
 }
 
 pub const DEFAULT_THREAD_TITLE: &str = "New Agent Thread";
+
+pub(crate) fn untitled_thread_placeholder(agent_display_name: &str) -> String {
+    format!("New {agent_display_name} Thread")
+}
 const PARALLEL_AGENT_LAYOUT_BACKFILL_KEY: &str = "parallel_agent_layout_backfilled";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

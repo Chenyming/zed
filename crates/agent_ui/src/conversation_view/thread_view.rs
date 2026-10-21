@@ -4,6 +4,7 @@ use crate::{
     entry_view_state::TERMINAL_CONTENT_TOP_PADDING,
     open_abs_path_at_point, project_path_for_file_link,
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
+    untitled_thread_placeholder,
 };
 use agent_client_protocol::schema::v2 as acp_v2;
 use std::{cell::RefCell, path::Path};
@@ -903,9 +904,16 @@ impl ThreadView {
                 None
             }
             .or_else(|| thread.read(cx).title())
-            .unwrap_or_else(|| DEFAULT_THREAD_TITLE.into());
+            .unwrap_or_default();
             let editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
+                // An untitled thread keeps the editor empty, so naming it
+                // doesn't require clearing a default title first.
+                editor.set_placeholder_text(
+                    &untitled_thread_placeholder(&agent_display_name),
+                    window,
+                    cx,
+                );
                 editor.set_text(initial_title, window, cx);
                 editor
             });
@@ -2932,7 +2940,8 @@ impl ThreadView {
             }
             EditorEvent::Blurred => {
                 if title_editor.read(cx).text(cx).is_empty() {
-                    self.sync_title_editor(DEFAULT_THREAD_TITLE.into(), window, cx);
+                    let title = self.current_title(cx).unwrap_or_default();
+                    self.sync_title_editor(title, window, cx);
                 }
             }
             _ => {}
@@ -2946,6 +2955,17 @@ impl ThreadView {
     pub fn rename(&mut self, title: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_title_editor(title.clone(), window, cx);
         self.apply_renamed_title(title, cx);
+    }
+
+    fn current_title(&self, cx: &App) -> Option<SharedString> {
+        let title_override = if self.is_subagent() {
+            None
+        } else {
+            ThreadMetadataStore::try_global(cx)
+                .and_then(|store| store.read(cx).entry(self.root_thread_id))
+                .and_then(|metadata| metadata.title_override.clone())
+        };
+        title_override.or_else(|| self.thread.read(cx).title())
     }
 
     fn apply_renamed_title(&mut self, title: SharedString, cx: &mut Context<Self>) {
