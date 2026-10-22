@@ -93,6 +93,57 @@ impl SessionSnapshot {
             .iter()
             .chain(self.latest.iter().map(|(_, update)| update))
     }
+
+    /// Number of conversation entries. Entries are only appended (later chunks
+    /// and tool call updates are merged in place), so an entry's index stays
+    /// valid for the life of the session and can be used to page through it.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The latest value of each piece of session-wide state, such as the plan.
+    pub fn latest_updates(&self) -> impl Iterator<Item = &Value> {
+        self.latest.iter().map(|(_, update)| update)
+    }
+
+    /// Up to `limit` entries ending right before index `before`, stopping early
+    /// once they would exceed `max_bytes` of JSON, but always including at least
+    /// one entry when there is one. Returns the index of the first entry.
+    pub fn entries_before(
+        &self,
+        before: usize,
+        limit: usize,
+        max_bytes: usize,
+    ) -> (usize, &[Value]) {
+        let end = before.min(self.entries.len());
+        let mut start = end;
+        let mut bytes = 0;
+        while start > 0 && end - start < limit {
+            let size = json_size(&self.entries[start - 1]);
+            if start < end && bytes + size > max_bytes {
+                break;
+            }
+            bytes += size;
+            start -= 1;
+        }
+        (start, &self.entries[start..end])
+    }
+}
+
+fn json_size(value: &Value) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value).ok();
+    counter.0
 }
 
 fn update_kind(update: &Value) -> Option<&str> {
@@ -348,5 +399,71 @@ mod tests {
         snapshot.apply(unknown.clone());
 
         assert_eq!(replay(&snapshot), vec![unknown.clone(), untagged, unknown]);
+    }
+
+    fn message(id: usize, text: &str) -> Value {
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": id.to_string(),
+            "content": {"type": "text", "text": text},
+        })
+    }
+
+    #[test]
+    fn pages_through_entries_with_stable_indices() {
+        let mut snapshot = SessionSnapshot::default();
+        for id in 0..5 {
+            snapshot.apply(message(id, "x"));
+        }
+        snapshot.apply(json!({"sessionUpdate": "plan", "entries": []}));
+        assert_eq!(snapshot.entry_count(), 5);
+        assert_eq!(
+            snapshot.latest_updates().cloned().collect::<Vec<_>>(),
+            vec![json!({"sessionUpdate": "plan", "entries": []})]
+        );
+
+        let (start, page) = snapshot.entries_before(5, 2, usize::MAX);
+        assert_eq!(
+            (start, page.to_vec()),
+            (3, vec![message(3, "x"), message(4, "x")])
+        );
+        let (start, page) = snapshot.entries_before(start, 2, usize::MAX);
+        assert_eq!(
+            (start, page.to_vec()),
+            (1, vec![message(1, "x"), message(2, "x")])
+        );
+        let (start, page) = snapshot.entries_before(start, 2, usize::MAX);
+        assert_eq!((start, page.to_vec()), (0, vec![message(0, "x")]));
+        let (start, page) = snapshot.entries_before(start, 2, usize::MAX);
+        assert_eq!((start, page.len()), (0, 0));
+
+        // A tail larger than the conversation returns all of it, and an index
+        // past the end is treated as the end.
+        let (start, page) = snapshot.entries_before(100, 100, usize::MAX);
+        assert_eq!((start, page.len()), (0, 5));
+
+        // Merging into the last entry and overlaying tool calls keep indices.
+        snapshot.apply(message(4, "y"));
+        assert_eq!(snapshot.entry_count(), 5);
+        assert_eq!(
+            snapshot.entries_before(5, 1, usize::MAX).1,
+            [message(4, "xy")]
+        );
+    }
+
+    #[test]
+    fn limits_pages_by_size_but_returns_at_least_one_entry() {
+        let mut snapshot = SessionSnapshot::default();
+        snapshot.apply(message(0, &"a".repeat(100)));
+        snapshot.apply(message(1, &"b".repeat(100)));
+        snapshot.apply(message(2, &"c".repeat(1000)));
+        let small = json_size(&message(0, &"a".repeat(100)));
+
+        let (start, page) = snapshot.entries_before(3, 10, 10);
+        assert_eq!((start, page.len()), (2, 1));
+        let (start, page) = snapshot.entries_before(2, 10, small * 2);
+        assert_eq!((start, page.len()), (0, 2));
+        let (start, page) = snapshot.entries_before(2, 10, small * 2 - 1);
+        assert_eq!((start, page.len()), (1, 1));
     }
 }

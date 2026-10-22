@@ -26,6 +26,10 @@ pub const TURN_STATE_METHOD: &str = "_zed.dev/acpMux/turn_state";
 /// Method of the extension request that names a session. ACP has no way to tell
 /// an agent a session's name, so the daemon keeps it and shares it with clients.
 pub const SET_TITLE_METHOD: &str = "_zed.dev/acpMux/set_title";
+/// Method of the extension request that returns earlier entries of a session a
+/// client observes, for clients that loaded only its latest entries by passing
+/// `_meta["zed.dev/acpMux"].history.tail` to `session/load`.
+pub const HISTORY_METHOD: &str = "_zed.dev/acpMux/history";
 /// Key in the `_meta` of the `initialize` response that marks a muxed agent.
 pub const META_KEY: &str = "zed.dev/acpMux";
 

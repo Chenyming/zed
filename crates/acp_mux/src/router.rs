@@ -4,7 +4,7 @@ use smol::channel::Sender;
 use std::{collections::HashMap, mem, time::SystemTime};
 
 use crate::{
-    Config, META_KEY, PROTOCOL_VERSION, SET_TITLE_METHOD, TURN_STATE_METHOD,
+    Config, HISTORY_METHOD, META_KEY, PROTOCOL_VERSION, SET_TITLE_METHOD, TURN_STATE_METHOD,
     agent::{
         AgentId, AgentKey, AgentLauncher, AgentState, CallKind, InitState, PendingAgentRequest,
         PendingCall, client_initialize_response, daemon_initialize_params,
@@ -24,6 +24,14 @@ const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 const REQUEST_CANCELLED: i64 = -32800;
 const RESOURCE_NOT_FOUND: i64 = -32002;
+
+/// Entries in a page of history when the client doesn't say.
+const DEFAULT_HISTORY_PAGE: usize = 100;
+/// Most entries in a page of history, whatever the client asks for.
+const MAX_HISTORY_PAGE: usize = 1000;
+/// Pages of history stop before exceeding this much JSON, so that a few large
+/// tool calls don't make a page slow over a mobile connection.
+const MAX_HISTORY_PAGE_BYTES: usize = 1024 * 1024;
 
 pub enum Event {
     Attach {
@@ -129,6 +137,18 @@ fn session_id_of(params: &Value) -> Option<String> {
         .get("sessionId")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// The number of latest entries a client asked `session/load` to replay, when
+/// it pages through earlier ones with [`HISTORY_METHOD`].
+fn history_tail(params: &Value) -> Option<usize> {
+    let tail = params
+        .get("_meta")?
+        .get(META_KEY)?
+        .get("history")?
+        .get("tail")?
+        .as_u64()?;
+    Some((tail as usize).clamp(1, MAX_HISTORY_PAGE))
 }
 
 fn response_message(id: Value, result: Value) -> Value {
@@ -435,6 +455,7 @@ impl Router {
             "session/close" => self.handle_close(client, id, &params),
             "session/prompt" => self.handle_prompt(client, client_agent, id, params, message),
             SET_TITLE_METHOD => self.handle_set_title(client, id, &params),
+            HISTORY_METHOD => self.handle_history(client, id, &params),
             _ => {
                 let session_id = session_id_of(&params);
                 let key = session_id
@@ -512,6 +533,51 @@ impl Router {
             client,
         );
         Self::send_to_client(&self.clients, client, response_message(id, json!({})));
+    }
+
+    /// Answers [`HISTORY_METHOD`] with the entries of a session the client
+    /// observes that come before `before`, most recent last.
+    fn handle_history(&mut self, client: ClientId, id: Value, params: &Value) {
+        let session = session_id_of(params)
+            .and_then(|session_id| self.session_key(client, &session_id))
+            .and_then(|key| self.sessions.get(&key))
+            .filter(|session| session.observers.contains(&client));
+        let Some(session) = session else {
+            Self::send_to_client(
+                &self.clients,
+                client,
+                error_message(
+                    id,
+                    INVALID_PARAMS,
+                    "Unknown session, or not loaded by this client",
+                ),
+            );
+            return;
+        };
+        let Some(before) = params.get("before").and_then(Value::as_u64) else {
+            Self::send_to_client(
+                &self.clients,
+                client,
+                error_message(id, INVALID_PARAMS, "Missing before"),
+            );
+            return;
+        };
+        let limit = params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map_or(DEFAULT_HISTORY_PAGE, |limit| {
+                (limit as usize).clamp(1, MAX_HISTORY_PAGE)
+            });
+        let (start, entries) = session.snapshot.entries_before(
+            usize::try_from(before).unwrap_or(usize::MAX),
+            limit,
+            MAX_HISTORY_PAGE_BYTES,
+        );
+        Self::send_to_client(
+            &self.clients,
+            client,
+            response_message(id, json!({"updates": entries, "start": start})),
+        );
     }
 
     /// Observers cannot start agents or sessions, only use existing sessions.
@@ -648,7 +714,7 @@ impl Router {
             return;
         };
         if let Some(key) = self.session_key(client, &session_id) {
-            self.attach_session(client, id, &key);
+            self.attach_session(client, id, &key, history_tail(&params));
             return;
         }
 
@@ -693,19 +759,49 @@ impl Router {
     /// answer. The running-turn notification must come before the requests,
     /// because Zed cancels outstanding permission requests when it starts
     /// mirroring a turn.
-    fn attach_session(&mut self, client: ClientId, id: Value, key: &SessionKey) {
+    ///
+    /// With `tail`, only the last entries of the conversation are replayed (and
+    /// all of the session-wide state); the response's `_meta` says where they
+    /// start, so the client can ask for earlier ones with [`HISTORY_METHOD`].
+    fn attach_session(
+        &mut self,
+        client: ClientId,
+        id: Value,
+        key: &SessionKey,
+        tail: Option<usize>,
+    ) {
         let Some(session) = self.sessions.get_mut(key) else {
             return;
         };
         session.add_observer(client);
         let agent = session.agent;
         let session_id = session.session_id.clone();
-        for update in session.snapshot.updates() {
-            Self::send_to_client(
-                &self.clients,
-                client,
-                session_update_message(&session_id, update),
-            );
+        let mut history = None;
+        match tail {
+            Some(tail) => {
+                let total = session.snapshot.entry_count();
+                let (start, entries) =
+                    session
+                        .snapshot
+                        .entries_before(total, tail, MAX_HISTORY_PAGE_BYTES);
+                for update in entries.iter().chain(session.snapshot.latest_updates()) {
+                    Self::send_to_client(
+                        &self.clients,
+                        client,
+                        session_update_message(&session_id, update),
+                    );
+                }
+                history = Some(json!({"start": start, "total": total}));
+            }
+            None => {
+                for update in session.snapshot.updates() {
+                    Self::send_to_client(
+                        &self.clients,
+                        client,
+                        session_update_message(&session_id, update),
+                    );
+                }
+            }
         }
         if let TurnState::Running(turn) = &mut session.turn
             && turn.originator != client
@@ -715,7 +811,10 @@ impl Router {
                 turn.notified.push(client);
             }
         }
-        let load_response = session.load_response();
+        let mut load_response = session.load_response();
+        if let (Some(history), Some(response)) = (history, load_response.as_object_mut()) {
+            response.insert("_meta".into(), json!({META_KEY: {"history": history}}));
+        }
         Self::send_to_client(&self.clients, client, response_message(id, load_response));
         log::info!(
             "{} is observing session {session_id}",
@@ -2757,5 +2856,202 @@ mod tests {
         let session = &harness.router.sessions[&("claude".to_string(), "s1".to_string())];
         assert!(session.dead);
         assert!(!session.is_running());
+    }
+
+    fn message_update(session_id: &str, message_id: usize) -> Value {
+        notification_message(
+            "session/update",
+            json!({"sessionId": session_id, "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": message_id.to_string(),
+                "content": {"type": "text", "text": format!("message {message_id}")},
+            }}),
+        )
+    }
+
+    fn load_tail(harness: &mut Harness, client: ClientId, session_id: &str, tail: u64) {
+        harness.from_client(
+            client,
+            json!({"jsonrpc": "2.0", "id": "load", "method": "session/load", "params": {
+                "sessionId": session_id, "cwd": "/project", "mcpServers": [],
+                "_meta": {META_KEY: {"history": {"tail": tail}}},
+            }}),
+        );
+    }
+
+    fn history(harness: &mut Harness, client: ClientId, params: Value) -> Value {
+        harness.from_client(
+            client,
+            json!({"jsonrpc": "2.0", "id": "history", "method": HISTORY_METHOD, "params": params}),
+        );
+        harness.client_messages(client).remove(0)
+    }
+
+    /// An attached client with session `s1`, whose conversation is a user
+    /// message followed by agent messages 1 to `messages`, and a plan.
+    fn session_with_messages(messages: usize) -> Harness {
+        let mut harness = Harness::new();
+        harness.attach(1);
+        harness.initialize(1);
+        harness.new_session(1, "s1");
+        harness.prompt(1, "s1", "go");
+        for message_id in 1..=messages {
+            harness.from_agent(message_update("s1", message_id));
+        }
+        harness.from_agent(notification_message(
+            "session/update",
+            json!({"sessionId": "s1", "update": {"sessionUpdate": "plan", "entries": []}}),
+        ));
+        harness.client_messages(1);
+        harness
+    }
+
+    #[test]
+    fn loads_only_the_latest_entries_when_asked() {
+        let mut harness = session_with_messages(4);
+        harness.observe(2);
+        load_tail(&mut harness, 2, "s1", 2);
+        assert_eq!(
+            harness.client_messages(2),
+            vec![
+                message_update("s1", 3),
+                message_update("s1", 4),
+                session_update_message("s1", &json!({"sessionUpdate": "plan", "entries": []})),
+                turn_state_running("s1"),
+                response_message(
+                    json!("load"),
+                    json!({
+                        "modes": {"currentModeId": "ask", "availableModes": []},
+                        "_meta": {META_KEY: {"history": {"start": 3, "total": 5}}},
+                    })
+                ),
+            ]
+        );
+
+        // Without a tail, loading replays everything and has no history `_meta`.
+        harness.observe(3);
+        harness.load(3, "s1");
+        let messages = harness.client_messages(3);
+        assert_eq!(messages.len(), 8);
+        assert_eq!(
+            messages.last(),
+            Some(&response_message(
+                json!("load"),
+                json!({"modes": {"currentModeId": "ask", "availableModes": []}})
+            ))
+        );
+    }
+
+    #[test]
+    fn pages_through_earlier_entries() {
+        let mut harness = session_with_messages(4);
+        harness.observe(2);
+        load_tail(&mut harness, 2, "s1", 2);
+        harness.client_messages(2);
+
+        let user_message = json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": {"type": "text", "text": "go"},
+        });
+        let entry =
+            |message_id: usize| message_update("s1", message_id)["params"]["update"].clone();
+        assert_eq!(
+            history(
+                &mut harness,
+                2,
+                json!({"sessionId": "s1", "before": 3, "limit": 2})
+            ),
+            response_message(
+                json!("history"),
+                json!({"updates": [entry(1), entry(2)], "start": 1})
+            )
+        );
+        assert_eq!(
+            history(
+                &mut harness,
+                2,
+                json!({"sessionId": "s1", "before": 1, "limit": 2})
+            ),
+            response_message(
+                json!("history"),
+                json!({"updates": [user_message], "start": 0})
+            )
+        );
+        assert_eq!(
+            history(&mut harness, 2, json!({"sessionId": "s1", "before": 0})),
+            response_message(json!("history"), json!({"updates": [], "start": 0}))
+        );
+    }
+
+    #[test]
+    fn history_pages_show_tool_calls_as_they_are_now() {
+        let mut harness = session_with_messages(0);
+        let tool_call = |status: &str| {
+            notification_message(
+                "session/update",
+                json!({"sessionId": "s1", "update": {
+                    "sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": status,
+                }}),
+            )
+        };
+        harness.from_agent(tool_call("in_progress"));
+        harness.from_agent(message_update("s1", 1));
+        harness.client_messages(1);
+        harness.observe(2);
+        load_tail(&mut harness, 2, "s1", 1);
+        harness.client_messages(2);
+
+        // The update reaches the observer live even though it hasn't loaded the
+        // tool call, and the page it loads later already includes it.
+        harness.from_agent(tool_call("completed"));
+        assert_eq!(harness.client_messages(2), vec![tool_call("completed")]);
+        let page = history(
+            &mut harness,
+            2,
+            json!({"sessionId": "s1", "before": 2, "limit": 1}),
+        );
+        assert_eq!(
+            page["result"],
+            json!({"updates": [{
+                "sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed",
+            }], "start": 1})
+        );
+    }
+
+    #[test]
+    fn only_clients_observing_a_session_get_its_history() {
+        let mut harness = session_with_messages(2);
+        harness.observe(2);
+        let error = |message: &str| error_message(json!("history"), INVALID_PARAMS, message);
+        let not_loaded = "Unknown session, or not loaded by this client";
+        assert_eq!(
+            history(&mut harness, 2, json!({"sessionId": "s1", "before": 3})),
+            error(not_loaded)
+        );
+
+        load_tail(&mut harness, 2, "s1", 1);
+        harness.client_messages(2);
+        assert_eq!(
+            history(&mut harness, 2, json!({"sessionId": "s1"})),
+            error("Missing before")
+        );
+        assert_eq!(
+            history(
+                &mut harness,
+                2,
+                json!({"sessionId": "missing", "before": 3})
+            ),
+            error(not_loaded)
+        );
+
+        harness.from_client(
+            2,
+            json!({"jsonrpc": "2.0", "id": "close", "method": "session/close", "params": {"sessionId": "s1"}}),
+        );
+        harness.client_messages(2);
+        assert_eq!(
+            history(&mut harness, 2, json!({"sessionId": "s1", "before": 3})),
+            error(not_loaded)
+        );
     }
 }
