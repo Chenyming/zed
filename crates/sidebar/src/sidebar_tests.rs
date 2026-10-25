@@ -3470,11 +3470,22 @@ async fn test_subagent_permission_request_marks_parent_sidebar_thread_waiting(
     save_test_thread_metadata(&parent_session_id, &project, cx).await;
 
     let subagent_session_id = acp::SessionId::new("subagent-session");
-    cx.update(|_, cx| {
-        let parent_thread = panel.read(cx).active_agent_thread(cx).unwrap();
-        parent_thread.update(cx, |thread: &mut AcpThread, cx| {
-            thread.subagent_spawned(subagent_session_id.clone(), cx);
-        });
+    let parent_thread = cx.update(|_, cx| panel.read(cx).active_agent_thread(cx).unwrap());
+    let subagent = cx
+        .update(|_, cx| {
+            let parent = parent_thread.read(cx);
+            parent.connection().clone().load_session(
+                subagent_session_id.clone(),
+                parent.project().clone(),
+                PathList::default(),
+                None,
+                cx,
+            )
+        })
+        .await
+        .expect("subagent session");
+    parent_thread.update(cx, |thread: &mut AcpThread, cx| {
+        thread.register_subagent(subagent, cx);
     });
     cx.run_until_parked();
 
@@ -8842,7 +8853,46 @@ async fn test_delete_thread_removes_metadata_and_sidebar_entry(cx: &mut TestAppC
         "expected thread to be visible before deletion, got: {entries:?}"
     );
 
+    for status in [
+        AgentThreadStatus::Running,
+        AgentThreadStatus::WaitingForConfirmation,
+        AgentThreadStatus::Unconfirmed,
+    ] {
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            let index = sidebar
+                .contents
+                .entries
+                .iter()
+                .position(|entry| {
+                    matches!(entry, ListEntry::Thread(thread) if thread.metadata.session_id.as_ref()
+                        .is_some_and(|session_id| session_id.0.as_ref() == "thread-to-delete"))
+                })
+                .expect("thread entry");
+            sidebar.selection = Some(index);
+            let Some(ListEntry::Thread(thread)) = sidebar.contents.entries.get_mut(index) else {
+                panic!("expected thread entry");
+            };
+            Arc::make_mut(thread).status = status;
+            sidebar.remove_selected_thread(&RemoveSelectedThread, window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry_by_session(&acp::SessionId::new("thread-to-delete"))
+                    .is_some(),
+                "active or unconfirmed threads must not be removed"
+            );
+        });
+    }
+
     sidebar.update_in(cx, |sidebar, window, cx| {
+        if let Some(index) = sidebar.selection
+            && let Some(ListEntry::Thread(thread)) = sidebar.contents.entries.get_mut(index)
+        {
+            Arc::make_mut(thread).status = AgentThreadStatus::Completed;
+        }
         sidebar.delete_thread(
             &acp::SessionId::new(Arc::from("thread-to-delete")),
             window,

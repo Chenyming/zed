@@ -1931,8 +1931,7 @@ impl AgentPanel {
 
     fn draft_has_content(&self, draft: &Entity<ConversationView>, cx: &App) -> bool {
         let cv = draft.read(cx);
-        // A draft the user has named is kept like one with a typed message.
-        if cv.has_pending_selections() || cv.title_override(cx).is_some() {
+        if cv.has_pending_selections() || cv.title_override(cx).is_some() || cv.has_saved_input() {
             return true;
         }
         if let Some(thread_view) = cv.active_thread() {
@@ -4426,7 +4425,7 @@ impl AgentPanel {
             .iter()
             .filter(|(_id, view)| {
                 let view = view.read(cx);
-                if view.has_pending_selections() {
+                if view.has_pending_selections() || view.has_saved_input() {
                     return false;
                 }
                 let Some(thread_view) = view.root_thread_view() else {
@@ -6744,8 +6743,8 @@ impl AgentPanel {
         }
     }
 
-    fn key_context(&self) -> KeyContext {
-        let mut key_context = KeyContext::new_with_defaults();
+    fn key_context(&self, cx: &App) -> KeyContext {
+        let mut key_context = KeyContext::new_with_defaults(cx.platform_info().os);
         key_context.add("AgentPanel");
         key_context
     }
@@ -6763,7 +6762,7 @@ impl Render for AgentPanel {
         // - Scrolling in all views works as expected
         // - Files can be dropped into the panel
         let content = v_flex()
-            .key_context(self.key_context())
+            .key_context(self.key_context(cx))
             .relative()
             .size_full()
             .justify_between()
@@ -12058,6 +12057,46 @@ mod tests {
             assert!(
                 panel.retained_threads.is_empty(),
                 "changing the retained thread limit should unload idle threads immediately"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_disconnected_saved_input_is_not_evicted_as_idle(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new()
+            .with_receipt_submissions(true)
+            .with_supports_load_session(true);
+        open_thread_with_custom_connection(&panel, connection.clone(), &mut cx);
+        let saved = panel.read_with(&cx, |panel, _| {
+            panel
+                .active_conversation_view()
+                .expect("conversation")
+                .clone()
+        });
+        let _response = connection.defer_next_receipt_response();
+        send_message(&panel, &mut cx);
+        let thread = saved.read_with(&cx, |view, cx| view.root_thread(cx).expect("thread"));
+        thread.update(&mut cx, |thread, cx| thread.handle_connection_lost(cx));
+        cx.run_until_parked();
+        assert!(saved.read_with(&cx, |view, _| view.has_saved_input()));
+
+        cx.update(|_, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    max_idle_retained_threads: 0,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        open_thread_with_custom_connection(&panel, connection, &mut cx);
+        panel.update(&mut cx, |panel, cx| {
+            panel.cleanup_retained_threads(cx);
+            assert!(
+                panel
+                    .retained_threads
+                    .contains_key(&saved.read(cx).thread_id)
             );
         });
     }

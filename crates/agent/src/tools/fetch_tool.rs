@@ -181,6 +181,11 @@ fn verify_host_not_forbidden(url: &str) -> Result<()> {
     let host = parsed
         .host_str()
         .with_context(|| format!("URL {url:?} has no host to reach"))?;
+    // URL brackets are syntax, not part of an IPv6 address passed to the resolver.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
     // Default to the scheme's port when the URL omits one; resolution needs a
     // port but the value doesn't affect which IPs a host resolves to.
     let port = parsed

@@ -128,9 +128,9 @@ export ZED_REMOTE_SERVER_VERSION
 export TERM=xterm-256color
 export CARGO_TERM_COLOR=never
 
-# 把临时文件放进仓库内的 tmp,避免 /tmp 所在卷被链接阶段的大文件挤爆。
-mkdir -p tmp
-export TMPDIR="$PWD/tmp"
+# 把临时文件放进仓库内的 docs/tmp,避免 /tmp 所在卷被链接阶段的大文件挤爆。
+mkdir -p tmp docs/tmp
+export TMPDIR="$PWD/docs/tmp"
 export TEMP="$TMPDIR"
 export TMP="$TMPDIR"
 

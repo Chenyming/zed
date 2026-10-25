@@ -431,10 +431,28 @@ impl Router {
     ) {
         let client_agent = self.client_agent(client);
         match method {
-            "initialize" => match client_agent {
-                Some((agent, _)) => self.handle_initialize(client, agent, id, &params),
-                None => self.initialize_observer(client, id, &params),
-            },
+            "initialize" => {
+                // Prompt responses still end turns in the mux. Let v2 clients retry
+                // with v1 instead of negotiating a lifecycle we cannot yet route.
+                if let Some(version) = params.get("protocolVersion").and_then(Value::as_u64)
+                    && version > 1
+                {
+                    Self::send_to_client(
+                        &self.clients,
+                        client,
+                        json!({"jsonrpc": "2.0", "id": id, "error": {
+                            "code": -32022,
+                            "message": "Unsupported protocol version",
+                            "data": {"requested": version, "supported": [1]},
+                        }}),
+                    );
+                    return;
+                }
+                match client_agent {
+                    Some((agent, _)) => self.handle_initialize(client, agent, id, &params),
+                    None => self.initialize_observer(client, id, &params),
+                }
+            }
             "session/new" => {
                 let Some((agent, _)) = client_agent else {
                     self.reject_observer(client, id);
@@ -2055,6 +2073,56 @@ mod tests {
                 {"optionId": "no", "name": "Reject", "kind": "reject_once"},
             ],
         }})
+    }
+
+    #[test]
+    fn v2_negotiation_preserves_v1_sessions_and_allows_fallback() {
+        let mut harness = Harness::new();
+        harness.attach(1);
+        harness.from_client(
+            1,
+            json!({"jsonrpc": "2.0", "id": "v2", "method": "initialize", "params": {
+                "protocolVersion": 2, "info": {"name": "zed", "version": "1"}, "capabilities": {},
+            }}),
+        );
+        assert!(harness.agent_messages().is_empty());
+        let expected = json!({"jsonrpc": "2.0", "id": "v2", "error": {
+            "code": -32022,
+            "message": "Unsupported protocol version",
+            "data": {"requested": 2, "supported": [1]},
+        }});
+        assert_eq!(harness.client_messages(1), vec![expected.clone()]);
+        harness.disconnect(1);
+        harness.attach(2);
+        harness.initialize(2);
+        harness.new_session(2, "s1");
+        let prompt_id = harness.prompt(2, "s1", "keep working");
+        harness.attach(3);
+        harness.observe(4);
+        for client in [3, 4] {
+            harness.from_client(
+                client,
+                json!({"jsonrpc": "2.0", "id": "v2", "method": "initialize", "params": {"protocolVersion": 2}}),
+            );
+            assert_eq!(harness.client_messages(client), vec![expected.clone()]);
+        }
+        assert!(harness.agent_messages().is_empty());
+        harness.initialize(3);
+        harness.load(3, "s1");
+        assert!(
+            harness
+                .client_messages(3)
+                .contains(&turn_state_running("s1"))
+        );
+        harness.from_agent(response_message(
+            prompt_id,
+            json!({"stopReason": "end_turn"}),
+        ));
+        assert!(
+            harness
+                .client_messages(3)
+                .contains(&turn_state_idle("s1", "end_turn"))
+        );
     }
 
     #[test]
