@@ -7,7 +7,9 @@ OUTPUT_FILE="${1:-$(pwd)/assets/licenses.md}"
 TEMPLATE_FILE="script/licenses/template.md.hbs"
 
 fail_on_stderr() {
-    local tmpfile=$(mktemp)
+    local temporary_directory="${TMPDIR:-$(pwd)/tmp}"
+    mkdir -p "$temporary_directory"
+    local tmpfile=$(mktemp "${temporary_directory}/zed-licenses.XXXXXX")
     "$@" 2> >(tee "$tmpfile" >&2)
     local rc=$?
     [ -s "$tmpfile" ] && rc=1

@@ -3,6 +3,10 @@
 set -euo pipefail
 source script/lib/blob-store.sh
 
+# macOS mktemp ignores TMPDIR unless an explicit template is supplied.
+temporary_directory="${TMPDIR:-${PWD}/tmp}"
+mkdir -p "$temporary_directory"
+
 build_flag="--release"
 zed_features=""
 remote_server_features=""
@@ -174,7 +178,7 @@ function download_and_unpack() {
     local path_to_unpack=$2
     local target_path=$3
 
-    temp_dir=$(mktemp -d)
+    temp_dir=$(mktemp -d "${temporary_directory}/zed-download.XXXXXX")
 
     if ! command -v curl &> /dev/null; then
         echo "curl is not installed. Please install curl to continue."
@@ -192,7 +196,7 @@ function download_git() {
     local architecture=$1
     local target_binary=$2
 
-    tmp_dir=$(mktemp -d)
+    tmp_dir=$(mktemp -d "${temporary_directory}/zed-git.XXXXXX")
     pushd "$tmp_dir"
 
     case "$architecture" in
@@ -277,7 +281,6 @@ function sign_app_binaries() {
         rm -rf ${dmg_source_directory}
         mkdir -p ${dmg_source_directory}
         mv "${app_path}" "${dmg_source_directory}"
-        notarization_key_file=$(mktemp)
 
         echo "Adding symlink to /Applications to ${dmg_source_directory}"
         ln -s /Applications ${dmg_source_directory}
@@ -297,6 +300,7 @@ function sign_app_binaries() {
         if [[ $can_code_sign = true ]]; then
             echo "Notarizing DMG with Apple"
             /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "$(pwd)/${dmg_file_path}" -v
+            notarization_key_file=$(mktemp "${temporary_directory}/zed-notarization.XXXXXX")
             echo "$APPLE_NOTARIZATION_KEY" > "$notarization_key_file"
             "${xcode_bin_dir_path}/notarytool" submit --wait --key "$notarization_key_file" --key-id "$APPLE_NOTARIZATION_KEY_ID" --issuer "$APPLE_NOTARIZATION_ISSUER_ID" "${dmg_file_path}"
             rm "$notarization_key_file"
