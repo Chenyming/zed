@@ -2977,11 +2977,26 @@ impl ThreadView {
                 store.set_title_override(thread_id, title.clone(), cx);
             });
         }
-        self.thread.update(cx, |thread, cx| {
-            if thread.can_set_title(cx) {
-                thread.set_title(title, cx).detach_and_log_err(cx);
-            }
+        let sync_title = self.thread.update(cx, |thread, cx| {
+            thread
+                .can_set_title(cx)
+                .then(|| thread.set_title(title, cx))
         });
+        if let Some(sync_title) = sync_title {
+            let workspace = self.workspace.clone();
+            cx.spawn(async move |_, cx| {
+                if let Err(error) = sync_title.await {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.show_error(
+                            format!("Failed to synchronize the thread title. Rename it again or reconnect to retry. {error:#}"),
+                            cx,
+                        );
+                    })?;
+                }
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+        }
     }
 
     pub fn cancel_editing(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {

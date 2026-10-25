@@ -33,13 +33,13 @@ For quick switching without opening the sidebar, use the thread switcher: press 
 
 ### Thread History {#threads-history}
 
-To remove a thread from the sidebar, you can archive it by hovering over it and clicking the archive icon that appears. You can also select a thread and press {#kb agent::ArchiveSelectedThread}. Running threads cannot be moved to history until they finish.
+To delete a thread, hover over it and click the trash icon, or select it and press {#kb agent::RemoveSelectedThread}. Stop a running thread before deleting it.
 
-The Thread History view holds all your threads, including ones that you have archived. Toggle it with {#kb agents_sidebar::ToggleThreadHistory} or by clicking the clock icon in the sidebar bottom bar, next to the sidebar toggle.
+The Thread History view holds all your remaining threads, including threads saved by earlier versions of Zed. Toggle it with {#kb agents_sidebar::ToggleThreadHistory} or by clicking the clock icon in the sidebar bottom bar, next to the sidebar toggle.
 
-To restore a thread, open Thread History and click the thread you want to bring back. Zed moves it back to the thread list and opens it in the Agent Panel. If the thread was running in a Git worktree that was removed, Zed restores the worktree automatically.
+To open a thread, click it in Thread History. Zed opens it in the Agent Panel. Worktrees archived by earlier versions of Zed can still be restored when you open their threads.
 
-To permanently delete a thread, open Thread History, hover over the thread, and click the trash icon. This removes the thread's conversation history and cleans up any associated worktree data. Deleted threads cannot be recovered.
+You can also delete threads from Thread History using the trash icon. Deletion removes the conversation records and its sandbox temporary files, while preserving your project files, worktrees, and Git branches. For external agents, Zed requests deletion from the agent on the machine that owns the session. If the agent does not support deletion, Zed removes its own record and tells you that the agent's history remains. If the request fails, you can retry, delete only Zed's record, or cancel. Locally deleted sessions are excluded from future history imports, including after restarting Zed. Deleted threads cannot be recovered from Thread History.
 
 You can search your threads in history; search will fuzzy match on thread titles.
 

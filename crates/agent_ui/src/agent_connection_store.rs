@@ -72,7 +72,59 @@ pub struct AgentConnectionStore {
     _subscriptions: Vec<Subscription>,
 }
 
+pub enum SessionDeletionOutcome {
+    Deleted,
+    Unsupported,
+}
+
 impl AgentConnectionStore {
+    pub fn delete_session(
+        &mut self,
+        metadata: &crate::thread_metadata_store::ThreadMetadata,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<SessionDeletionOutcome>> {
+        if !metadata
+            .matches_remote_connection(self.project.read(cx).remote_connection_options(cx).as_ref())
+        {
+            return Task::ready(Err(anyhow::anyhow!(
+                "The agent connection belongs to a different machine"
+            )));
+        }
+        let Some(session_id) = metadata.session_id.clone() else {
+            return Task::ready(Ok(SessionDeletionOutcome::Deleted));
+        };
+        let agent = Agent::from(metadata.agent_id.clone());
+        let server = agent.server(<dyn fs::Fs>::global(cx), agent::ThreadStore::global(cx));
+        let entry = if self
+            .entries
+            .get(&agent)
+            .is_some_and(|entry| matches!(entry.read(cx), AgentConnectionEntry::Error { .. }))
+        {
+            self.restart_connection(agent, server, cx)
+        } else {
+            self.request_connection(agent, server, cx)
+        };
+        let connection = entry.read(cx).wait_for_connection();
+        cx.spawn(async move |_this, cx| {
+            let state = connection.await?;
+            let task = cx.update(|cx| {
+                let Some(list) = state
+                    .connection
+                    .session_list(cx)
+                    .filter(|list| list.supports_delete())
+                else {
+                    return None;
+                };
+                Some(list.delete_session(&session_id, cx))
+            });
+            let Some(task) = task else {
+                return Ok(SessionDeletionOutcome::Unsupported);
+            };
+            task.await?;
+            Ok(SessionDeletionOutcome::Deleted)
+        })
+    }
+
     pub fn new(project: Entity<Project>, cx: &mut Context<Self>) -> Self {
         let agent_server_store = project.read(cx).agent_server_store().clone();
         let subscription = cx.subscribe(&agent_server_store, Self::handle_agent_servers_updated);

@@ -1171,10 +1171,11 @@ impl AgentConnection for AcpV2Connection {
     }
 
     fn session_list(&self, _cx: &mut App) -> Option<Rc<dyn AgentSessionList>> {
-        self.initialize_response.capabilities.session.as_ref()?;
+        let capabilities = self.initialize_response.capabilities.session.as_ref()?;
         Some(Rc::new(V2SessionList {
             connection: self.connection.clone(),
             dispatch_tx: self.dispatch_tx.clone(),
+            supports_delete: capabilities.delete.is_some(),
         }))
     }
 
@@ -1186,9 +1187,29 @@ impl AgentConnection for AcpV2Connection {
 struct V2SessionList {
     connection: V2ConnectionTo<Agent>,
     dispatch_tx: mpsc::UnboundedSender<ForegroundWork>,
+    supports_delete: bool,
 }
 
 impl AgentSessionList for V2SessionList {
+    fn supports_delete(&self) -> bool {
+        self.supports_delete
+    }
+
+    fn delete_session(&self, session_id: &acp::SessionId, cx: &mut App) -> Task<Result<()>> {
+        if !self.supports_delete {
+            return Task::ready(Err(anyhow!("delete_session not supported")));
+        }
+        let response = AcpV2Connection::scoped_request(
+            &self.connection,
+            &self.dispatch_tx,
+            acp::DeleteSessionRequest::new(session_id.clone()),
+        );
+        cx.foreground_executor().spawn(async move {
+            response.await?;
+            Ok(())
+        })
+    }
+
     fn list_sessions(
         &self,
         request: AgentSessionListRequest,
@@ -1475,6 +1496,10 @@ mod tests {
             Responder<acp::ListSessionsResponse>,
         )>,
         closes: async_channel::Receiver<acp::SessionId>,
+        deletions: async_channel::Receiver<(
+            acp::DeleteSessionRequest,
+            Responder<acp::DeleteSessionResponse>,
+        )>,
         resume_requests: async_channel::Receiver<(
             acp::ResumeSessionRequest,
             Responder<acp::ResumeSessionResponse>,
@@ -1510,6 +1535,7 @@ mod tests {
                 Result<acp::SetSessionConfigOptionResponse, agent_client_protocol::Error>,
             >();
             let (close_sender, closes) = async_channel::unbounded();
+            let (delete_sender, deletions) = async_channel::unbounded();
             let (resume_sender, resume_requests) = async_channel::unbounded();
             let (prompt_sender, prompts) = async_channel::unbounded();
             let (cancel_sender, cancellations) = async_channel::unbounded();
@@ -1603,6 +1629,15 @@ mod tests {
                         agent_client_protocol::on_receive_request!(),
                     )
                     .on_receive_request(
+                        async move |request: acp::DeleteSessionRequest, responder, _| {
+                            delete_sender
+                                .try_send((request, responder))
+                                .expect("delete receiver");
+                            Ok(())
+                        },
+                        agent_client_protocol::on_receive_request!(),
+                    )
+                    .on_receive_request(
                         async move |request: acp::ResumeSessionRequest, responder, _| {
                             resume_sender
                                 .try_send((request, responder))
@@ -1659,6 +1694,7 @@ mod tests {
                 config_responses,
                 list_requests,
                 closes,
+                deletions,
                 resume_requests,
                 agent: received.await.expect("agent"),
                 _agent_task: agent_task,
@@ -2172,6 +2208,57 @@ done
             );
             assert!(validate_prompt_content(&capabilities, &[block]).is_ok());
         }
+    }
+
+    #[gpui::test]
+    async fn v2_session_delete_respects_capabilities_and_propagates_server_errors(
+        cx: &mut TestAppContext,
+    ) {
+        let harness = SessionHarness::new(
+            acp::AgentCapabilities::new().session(
+                acp::SessionCapabilities::new().delete(acp::SessionDeleteCapabilities::new()),
+            ),
+            Vec::new(),
+            Vec::new(),
+            cx,
+        )
+        .await;
+        let list = cx
+            .update(|cx| harness.client.session_list(cx))
+            .expect("session list");
+        assert!(list.supports_delete());
+        let session_id = acp::SessionId::new("remote/会話:007");
+        let deletion = cx.update(|cx| list.delete_session(&session_id, cx));
+        let (request, responder) = bounded(harness.deletions.recv(), cx)
+            .await
+            .expect("delete request");
+        assert_eq!(request.session_id, session_id);
+        responder
+            .respond_with_error(agent_client_protocol::Error::internal_error())
+            .expect("reject deletion");
+        assert!(bounded(deletion, cx).await.is_err());
+
+        let deletion = cx.update(|cx| list.delete_session(&session_id, cx));
+        let (_, responder) = bounded(harness.deletions.recv(), cx)
+            .await
+            .expect("retry request");
+        responder
+            .respond(acp::DeleteSessionResponse::new())
+            .expect("delete response");
+        bounded(deletion, cx).await.expect("delete session");
+
+        let unsupported =
+            SessionHarness::new(session_capabilities(), Vec::new(), Vec::new(), cx).await;
+        let list = cx
+            .update(|cx| unsupported.client.session_list(cx))
+            .expect("session list");
+        assert!(!list.supports_delete());
+        assert!(
+            cx.update(|cx| list.delete_session(&session_id, cx))
+                .await
+                .is_err()
+        );
+        assert!(unsupported.deletions.is_empty());
     }
 
     #[gpui::test]

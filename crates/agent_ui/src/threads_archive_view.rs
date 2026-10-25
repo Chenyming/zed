@@ -2,15 +2,11 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::agent_connection_store::AgentConnectionStore;
-
 use crate::thread_metadata_store::{
     ThreadId, ThreadMetadata, ThreadMetadataStore, worktree_info_from_thread_paths,
 };
-use crate::{Agent, ArchiveSelectedThread, DEFAULT_THREAD_TITLE, RemoveSelectedThread};
+use crate::{DEFAULT_THREAD_TITLE, RemoveSelectedThread};
 
-use agent::ThreadStore;
-use agent_client_protocol::schema::v2 as acp;
 use agent_settings::AgentSettings;
 use chrono::{DateTime, Datelike as _, Local, NaiveDate, TimeDelta, Utc};
 use collections::HashMap;
@@ -19,8 +15,8 @@ use fs::Fs;
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
     AnyElement, App, Context, Decorations, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, ListState, Render, SharedString, Subscription, Task, TaskExt, WeakEntity, Window,
-    list, prelude::*, px,
+    Focusable, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
+    prelude::*, px,
 };
 use itertools::Itertools as _;
 use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
@@ -29,7 +25,7 @@ use picker::{
     highlighted_match_with_paths::{HighlightedMatch, HighlightedMatchWithPaths},
 };
 use platform_title_bar::apply_title_bar_insets;
-use project::{AgentId, AgentServerStore};
+use project::AgentServerStore;
 use settings::Settings as _;
 use theme::ActiveTheme;
 use ui::{
@@ -46,13 +42,6 @@ use workspace::{
 
 use zed_actions::agents_sidebar::FocusSidebarFilter;
 use zed_actions::editor::{MoveDown, MoveUp};
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ThreadFilter {
-    #[default]
-    All,
-    ArchivedOnly,
-}
 
 #[derive(Clone)]
 enum ArchiveListItem {
@@ -132,6 +121,7 @@ pub enum ThreadsArchiveViewEvent {
     Close,
     Activate { thread: ThreadMetadata },
     CancelRestore { thread_id: ThreadId },
+    Delete { thread_id: ThreadId },
     Import,
     NewThread,
 }
@@ -150,19 +140,16 @@ pub struct ThreadsArchiveView {
     _subscriptions: Vec<gpui::Subscription>,
     _refresh_history_task: Task<()>,
     workspace: WeakEntity<Workspace>,
-    agent_connection_store: WeakEntity<AgentConnectionStore>,
     agent_server_store: WeakEntity<AgentServerStore>,
     restoring: HashSet<ThreadId>,
     archived_thread_ids: HashSet<ThreadId>,
     archived_branch_names: HashMap<ThreadId, HashMap<PathBuf, String>>,
     _load_branch_names_task: Task<()>,
-    thread_filter: ThreadFilter,
 }
 
 impl ThreadsArchiveView {
     pub fn new(
         workspace: WeakEntity<Workspace>,
-        agent_connection_store: WeakEntity<AgentConnectionStore>,
         agent_server_store: WeakEntity<AgentServerStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -224,13 +211,11 @@ impl ThreadsArchiveView {
             ],
             _refresh_history_task: Task::ready(()),
             workspace,
-            agent_connection_store,
             agent_server_store,
             restoring: HashSet::default(),
             archived_thread_ids: HashSet::default(),
             archived_branch_names: HashMap::default(),
             _load_branch_names_task: Task::ready(()),
-            thread_filter: ThreadFilter::All,
         };
 
         this.update_items(cx);
@@ -271,22 +256,8 @@ impl ThreadsArchiveView {
     fn update_items(&mut self, cx: &mut Context<Self>) {
         let store = ThreadMetadataStore::global(cx).read(cx);
 
-        // If we're filtering to archived threads but none remain (e.g. the
-        // user just deleted the last one), fall back to showing all threads
-        // so they aren't stranded with an empty list and a disabled toggle.
-        if self.thread_filter == ThreadFilter::ArchivedOnly
-            && store.archived_entries().next().is_none()
-        {
-            self.thread_filter = ThreadFilter::All;
-        }
-
-        let thread_filter = self.thread_filter;
         let sessions = store
             .entries()
-            .filter(|t| match thread_filter {
-                ThreadFilter::All => true,
-                ThreadFilter::ArchivedOnly => t.archived,
-            })
             .sorted_by_cached_key(|t| t.created_at.unwrap_or(t.updated_at))
             .rev()
             .cloned()
@@ -416,29 +387,6 @@ impl ThreadsArchiveView {
         self.filter_editor.update(cx, |editor, cx| {
             editor.set_text("", window, cx);
         });
-    }
-
-    fn archive_thread(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
-        self.preserve_selection_on_next_update = true;
-        ThreadMetadataStore::global(cx).update(cx, |store, cx| store.archive(thread_id, None, cx));
-    }
-
-    fn archive_selected_thread(
-        &mut self,
-        _: &ArchiveSelectedThread,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(ix) = self.selection else { return };
-        let Some(ArchiveListItem::Entry { thread, .. }) = self.items.get(ix) else {
-            return;
-        };
-
-        if thread.archived {
-            return;
-        }
-
-        self.archive_thread(thread.thread_id, cx);
     }
 
     fn unarchive_thread(
@@ -643,8 +591,6 @@ impl ThreadsArchiveView {
 
                 let is_restoring = self.restoring.contains(&thread.thread_id);
 
-                let is_archived = thread.archived;
-
                 let branch_names_for_thread: HashMap<PathBuf, SharedString> = self
                     .archived_branch_names
                     .get(&thread.thread_id)
@@ -660,16 +606,9 @@ impl ThreadsArchiveView {
                     &branch_names_for_thread,
                 );
 
-                let archived_color = Color::Custom(cx.theme().colors().icon_muted.opacity(0.6));
-
                 let base = ThreadItem::new(id, thread.display_title())
                     .base_bg(cx.theme().colors().panel_background)
                     .icon(icon)
-                    .when(is_archived, |this| {
-                        this.archived(true)
-                            .icon_color(archived_color)
-                            .title_label_color(Color::Muted)
-                    })
                     .when_some(icon_from_external_svg, |this, svg| {
                         this.custom_icon_from_external_svg(svg)
                     })
@@ -711,7 +650,7 @@ impl ThreadsArchiveView {
                                 }),
                         )
                         .into_any_element()
-                } else if is_archived {
+                } else {
                     base.action_slot(
                         IconButton::new("delete-thread", IconName::Trash)
                             .hover_background(button_hover_bg)
@@ -728,17 +667,10 @@ impl ThreadsArchiveView {
                                 }
                             })
                             .on_click({
-                                let agent = thread.agent_id.clone();
                                 let thread_id = thread.thread_id;
-                                let session_id = thread.session_id.clone();
                                 cx.listener(move |this, _, _, cx| {
                                     this.preserve_selection_on_next_update = true;
-                                    this.delete_thread(
-                                        thread_id,
-                                        session_id.clone(),
-                                        agent.clone(),
-                                        cx,
-                                    );
+                                    cx.emit(ThreadsArchiveViewEvent::Delete { thread_id });
                                     cx.stop_propagation();
                                 })
                             }),
@@ -746,42 +678,6 @@ impl ThreadsArchiveView {
                     .on_click({
                         let thread = thread.clone();
                         cx.listener(move |this, _, window, cx| {
-                            this.unarchive_thread(thread.clone(), window, cx);
-                        })
-                    })
-                    .into_any_element()
-                } else {
-                    base.action_slot(
-                        IconButton::new("archive-thread", IconName::Archive)
-                            .hover_background(button_hover_bg)
-                            .icon_size(IconSize::Small)
-                            .icon_color(Color::Muted)
-                            .tooltip({
-                                move |_window, cx| {
-                                    Tooltip::for_action_in(
-                                        "Archive Thread",
-                                        &ArchiveSelectedThread,
-                                        &focus_handle,
-                                        cx,
-                                    )
-                                }
-                            })
-                            .on_click({
-                                let thread_id = thread.thread_id;
-                                cx.listener(move |this, _, _, cx| {
-                                    this.archive_thread(thread_id, cx);
-                                    cx.stop_propagation();
-                                })
-                            }),
-                    )
-                    .on_click({
-                        let thread = thread.clone();
-                        cx.listener(move |this, _, window, cx| {
-                            telemetry::event!(
-                                "Archived Thread Opened",
-                                agent = thread.agent_id.as_ref(),
-                                side = crate::agent_sidebar_side(cx)
-                            );
                             this.unarchive_thread(thread.clone(), window, cx);
                         })
                     })
@@ -803,58 +699,9 @@ impl ThreadsArchiveView {
         };
 
         self.preserve_selection_on_next_update = true;
-        self.delete_thread(
-            thread.thread_id,
-            thread.session_id.clone(),
-            thread.agent_id.clone(),
-            cx,
-        );
-    }
-
-    fn delete_thread(
-        &mut self,
-        thread_id: ThreadId,
-        session_id: Option<acp::SessionId>,
-        agent: AgentId,
-        cx: &mut Context<Self>,
-    ) {
-        ThreadMetadataStore::global(cx).update(cx, |store, cx| store.delete(thread_id, cx));
-
-        let agent = Agent::from(agent);
-
-        let Some(agent_connection_store) = self.agent_connection_store.upgrade() else {
-            return;
-        };
-        let fs = <dyn Fs>::global(cx);
-
-        let task = agent_connection_store.update(cx, |store, cx| {
-            store
-                .request_connection(agent.clone(), agent.server(fs, ThreadStore::global(cx)), cx)
-                .read(cx)
-                .wait_for_connection()
+        cx.emit(ThreadsArchiveViewEvent::Delete {
+            thread_id: thread.thread_id,
         });
-        cx.spawn(async move |_this, cx| {
-            crate::thread_worktree_archive::cleanup_thread_archived_worktrees(thread_id, cx).await;
-
-            let state = task.await?;
-            let task = cx.update(|cx| {
-                if let Some(session_id) = &session_id {
-                    if let Some(list) = state
-                        .connection
-                        .session_list(cx)
-                        .filter(|list| list.supports_delete())
-                    {
-                        list.delete_session(session_id, cx)
-                    } else {
-                        Task::ready(Ok(()))
-                    }
-                } else {
-                    Task::ready(Ok(()))
-                }
-            });
-            task.await
-        })
-        .detach_and_log_err(cx);
     }
 
     fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -959,11 +806,6 @@ impl ThreadsArchiveView {
             .filter(|item| matches!(item, ArchiveListItem::Entry { .. }))
             .count();
 
-        let has_archived_threads = {
-            let store = ThreadMetadataStore::global(cx).read(cx);
-            store.archived_entries().next().is_some()
-        };
-
         let count_label = if entry_count == 1 {
             "1 thread".to_string()
         } else {
@@ -1000,28 +842,6 @@ impl ThreadsArchiveView {
                             .tooltip(Tooltip::text("Import Threads"))
                             .on_click(cx.listener(|_this, _, _, cx| {
                                 cx.emit(ThreadsArchiveViewEvent::Import);
-                            })),
-                    )
-                    .child(
-                        IconButton::new("filter-archived-only", IconName::Archive)
-                            .icon_size(IconSize::Small)
-                            .disabled(!has_archived_threads)
-                            .toggle_state(self.thread_filter == ThreadFilter::ArchivedOnly)
-                            .tooltip(Tooltip::text(
-                                if self.thread_filter == ThreadFilter::ArchivedOnly {
-                                    "Show All Threads"
-                                } else {
-                                    "Show Only Archived Threads"
-                                },
-                            ))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.thread_filter =
-                                    if this.thread_filter == ThreadFilter::ArchivedOnly {
-                                        ThreadFilter::All
-                                    } else {
-                                        ThreadFilter::ArchivedOnly
-                                    };
-                                this.update_items(cx);
                             })),
                     ),
             )
@@ -1110,7 +930,6 @@ impl Render for ThreadsArchiveView {
             .on_action(cx.listener(Self::select_last))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::remove_selected_thread))
-            .on_action(cx.listener(Self::archive_selected_thread))
             .size_full()
             .child(self.render_header(window, cx))
             .when(!has_query, |this| this.child(self.render_toolbar(cx)))

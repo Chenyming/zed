@@ -938,6 +938,9 @@ mod test_support {
         receipt_prompt: Arc<Mutex<Option<Vec<acp_v2::ContentBlock>>>>,
         next_truncate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
         close_session_calls: Arc<Mutex<Vec<acp_v2::SessionId>>>,
+        delete_session_calls: Arc<Mutex<Vec<acp_v2::SessionId>>>,
+        next_delete_error: Arc<Mutex<Option<anyhow::Error>>>,
+        supports_delete: bool,
         next_close_responses: Arc<Mutex<VecDeque<oneshot::Receiver<Result<()>>>>>,
         set_title_calls: Arc<Mutex<Vec<(acp_v2::SessionId, SharedString)>>>,
         cancel_calls: Arc<Mutex<Vec<acp_v2::SessionId>>>,
@@ -981,6 +984,9 @@ mod test_support {
                 receipt_prompt: Default::default(),
                 next_truncate: Default::default(),
                 close_session_calls: Default::default(),
+                delete_session_calls: Default::default(),
+                next_delete_error: Default::default(),
+                supports_delete: false,
                 next_close_responses: Default::default(),
                 set_title_calls: Default::default(),
                 cancel_calls: Default::default(),
@@ -1206,7 +1212,58 @@ mod test_support {
         }
     }
 
+    impl StubAgentConnection {
+        pub fn with_session_deletion(mut self) -> Self {
+            self.supports_delete = true;
+            self
+        }
+
+        pub fn deleted_sessions(&self) -> Vec<acp_v2::SessionId> {
+            self.delete_session_calls.lock().clone()
+        }
+
+        pub fn set_next_delete_error(&self, error: anyhow::Error) {
+            *self.next_delete_error.lock() = Some(error);
+        }
+    }
+
+    impl AgentSessionList for StubAgentConnection {
+        fn list_sessions(
+            &self,
+            _request: AgentSessionListRequest,
+            _cx: &mut App,
+        ) -> Task<Result<AgentSessionListResponse>> {
+            Task::ready(Ok(AgentSessionListResponse::new(Vec::new())))
+        }
+
+        fn supports_delete(&self) -> bool {
+            self.supports_delete
+        }
+
+        fn delete_session(
+            &self,
+            session_id: &acp_v2::SessionId,
+            _cx: &mut App,
+        ) -> Task<Result<()>> {
+            if let Some(error) = self.next_delete_error.lock().take() {
+                return Task::ready(Err(error));
+            }
+            self.delete_session_calls.lock().push(session_id.clone());
+            self.sessions.lock().remove(session_id);
+            Task::ready(Ok(()))
+        }
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
     impl AgentConnection for StubAgentConnection {
+        fn session_list(&self, _cx: &mut App) -> Option<Rc<dyn AgentSessionList>> {
+            self.supports_delete
+                .then(|| Rc::new(self.clone()) as Rc<dyn AgentSessionList>)
+        }
+
         fn agent_id(&self) -> AgentId {
             self.agent_id.clone()
         }

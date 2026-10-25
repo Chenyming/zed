@@ -1468,7 +1468,7 @@ impl AgentPanel {
         })
     }
 
-    pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fs = workspace.app_state().fs.clone();
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
@@ -1525,12 +1525,18 @@ impl AgentPanel {
                 _ => {}
             });
 
-        let _thread_metadata_store_subscription = cx.subscribe(
+        let _thread_metadata_store_subscription = cx.subscribe_in(
             &ThreadMetadataStore::global(cx),
-            |this, _store, event, cx| {
-                let ThreadMetadataStoreEvent::ThreadArchived(thread_id) = event;
-                if this.remove_retained_thread(thread_id).is_some() {
-                    cx.notify();
+            window,
+            |this, _store, event, window, cx| match event {
+                ThreadMetadataStoreEvent::ThreadArchived(thread_id) => {
+                    if this.remove_retained_thread(thread_id).is_some() {
+                        cx.notify();
+                    }
+                }
+                ThreadMetadataStoreEvent::ThreadDeleted(thread_id) => {
+                    this.cancel_thread(thread_id, cx);
+                    this.remove_thread_without_activating_draft(*thread_id, window, cx);
                 }
             },
         );
@@ -3445,7 +3451,9 @@ impl AgentPanel {
     ) {
         self.remove_retained_thread(&id);
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-            store.delete(id, cx);
+            if store.entry(id).is_some() {
+                store.delete(id, cx);
+            }
         });
 
         if self

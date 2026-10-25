@@ -66,7 +66,7 @@ The same `agent.notify_when_agent_waiting` and `agent.play_sound_when_agent_done
 
 ## Closing Terminal Threads {#closing-terminal-threads}
 
-Unlike agent threads, Terminal Threads are closed rather than archived. They do not go to Thread History. To close one, hover over it in the Threads Sidebar and click the **×** button, or select it and press {#kb agent::ArchiveSelectedThread}.
+Terminal Threads do not go to Thread History. To close one, hover over it in the Threads Sidebar and click the **×** button, or select it and press {#kb agent::RemoveSelectedThread}. Closing a terminal preserves its project files and Git worktree.
 
 ## CLI/TUI Setup Notes {#cli-setup}
 

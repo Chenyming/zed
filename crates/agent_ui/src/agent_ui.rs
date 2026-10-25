@@ -310,9 +310,7 @@ actions!(
         CycleFavoriteModels,
         /// Expands the message editor to full size.
         ExpandMessageEditor,
-        /// Archives the currently selected thread.
-        ArchiveSelectedThread,
-        /// Removes the currently selected thread.
+        /// Deletes the currently selected thread and its sandbox temporary files.
         RemoveSelectedThread,
         /// Renames the currently selected thread.
         RenameSelectedThread,

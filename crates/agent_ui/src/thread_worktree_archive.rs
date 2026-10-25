@@ -850,67 +850,6 @@ pub async fn cleanup_archived_worktree_record(
         .log_err();
 }
 
-/// Cleans up all archived worktree data associated with a thread being deleted.
-///
-/// This unlinks the thread from all its archived worktrees and, for any
-/// archived worktree that is no longer referenced by any other thread,
-/// deletes the git ref and DB records.
-pub async fn cleanup_thread_archived_worktrees(thread_id: ThreadId, cx: &mut AsyncApp) {
-    let store = cx.update(|cx| ThreadMetadataStore::global(cx));
-    let remote_connection = store.read_with(cx, |store, _cx| {
-        store
-            .entry(thread_id)
-            .and_then(|t| t.remote_connection.clone())
-    });
-
-    let archived_worktrees = store
-        .read_with(cx, |store, cx| {
-            store.get_archived_worktrees_for_thread(thread_id, cx)
-        })
-        .await;
-    let archived_worktrees = match archived_worktrees {
-        Ok(rows) => rows,
-        Err(error) => {
-            log::error!("Failed to fetch archived worktrees for thread {thread_id:?}: {error:#}");
-            return;
-        }
-    };
-
-    if archived_worktrees.is_empty() {
-        return;
-    }
-
-    if let Err(error) = store
-        .read_with(cx, |store, cx| {
-            store.unlink_thread_from_all_archived_worktrees(thread_id, cx)
-        })
-        .await
-    {
-        log::error!("Failed to unlink thread {thread_id:?} from archived worktrees: {error:#}");
-        return;
-    }
-
-    for row in &archived_worktrees {
-        let still_referenced = store
-            .read_with(cx, |store, cx| {
-                store.is_archived_worktree_referenced(row.id, cx)
-            })
-            .await;
-        match still_referenced {
-            Ok(true) => {}
-            Ok(false) => {
-                cleanup_archived_worktree_record(row, remote_connection.as_ref(), cx).await;
-            }
-            Err(error) => {
-                log::error!(
-                    "Failed to check if archived worktree {} is still referenced: {error:#}",
-                    row.id
-                );
-            }
-        }
-    }
-}
-
 /// Collects every `Workspace` entity across all open `MultiWorkspace` windows.
 pub fn all_open_workspaces(cx: &App) -> Vec<Entity<Workspace>> {
     cx.windows()
@@ -925,10 +864,11 @@ pub fn all_open_workspaces(cx: &App) -> Vec<Entity<Workspace>> {
         .collect()
 }
 
-pub fn workspaces_for_archive(
+pub fn all_workspaces_including(
     multi_workspace: Option<&Entity<MultiWorkspace>>,
     cx: &App,
 ) -> Vec<Entity<Workspace>> {
+    // A window being updated cannot be read through its window handle.
     let mut workspaces = multi_workspace
         .map(|multi_workspace| {
             multi_workspace

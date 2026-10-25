@@ -1464,13 +1464,18 @@ impl ConversationView {
                             }),
                             cx,
                         );
-                        if let Some(title) = this.pending_title.take() {
-                            // The thread's metadata is saved in response to the
-                            // state change above; the name can be stored once it is.
-                            cx.defer_in(window, move |this, window, cx| {
+                        // Metadata is saved in response to the state change above.
+                        // A sidebar rename made while disconnected only lives there;
+                        // sync it after restoring, including when a draft gets a new ID.
+                        cx.defer_in(window, move |this, window, cx| {
+                            if let Some(title) = this
+                                .pending_title
+                                .take()
+                                .or_else(|| this.title_override(cx))
+                            {
                                 this.rename_when_connected(title, window, cx);
-                            });
-                        }
+                            }
+                        });
                     }
                     Err(err) => {
                         this.handle_load_error(
@@ -6636,7 +6641,7 @@ pub(crate) mod tests {
                         Rc::new(StubAgentServer::new(connection)),
                         connection_store,
                         Agent::Custom { id: "Test".into() },
-                        Some(session_id),
+                        Some(session_id.clone()),
                         Some(thread_id),
                         None,
                         Some("Old cached title".into()),
@@ -6687,7 +6692,109 @@ pub(crate) mod tests {
                 let metadata = store.read(cx).entry(thread_id).expect("live metadata");
                 assert_eq!(metadata.title.as_deref(), title);
                 assert_eq!(metadata.title_override.as_deref(), title_override);
+                assert_eq!(
+                    metadata.session_id.as_ref(),
+                    Some(&session_id),
+                    "an empty replay must not turn a restored session into a new draft"
+                );
             });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_restoring_a_user_title_syncs_to_the_connected_session(cx: &mut TestAppContext) {
+        use crate::thread_metadata_store::ThreadMetadata;
+        use chrono::Utc;
+        use project::WorktreePaths;
+
+        init_test(cx);
+        for (restore_session, supports_set_title, rename_during_load) in [
+            (false, true, false),
+            (true, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let fs = FakeFs::new(cx.executor());
+            let project = Project::test(fs, [], cx).await;
+            let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+                MultiWorkspace::test_new(project.clone(), window, cx)
+            });
+            let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+            let thread_id = ThreadId::new();
+            let session_id = restore_session.then(|| acp_v2::SessionId::new("restored-session"));
+            cx.update(|_, cx| {
+                ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                    store.save(
+                        ThreadMetadata {
+                            thread_id,
+                            session_id: session_id.clone(),
+                            agent_id: AgentId::new("stub"),
+                            title: Some("User title".into()),
+                            title_override: Some("User title".into()),
+                            updated_at: Utc::now(),
+                            created_at: Some(Utc::now()),
+                            interacted_at: None,
+                            worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
+                            remote_connection: None,
+                            archived: false,
+                        },
+                        cx,
+                    );
+                });
+            });
+            let connection = StubAgentConnection::new()
+                .with_supports_load_session(true)
+                .with_supports_set_title(supports_set_title);
+            let connection_store =
+                cx.update(|_, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
+            let view = cx.update(|window, cx| {
+                cx.new(|cx| {
+                    ConversationView::new(
+                        Rc::new(StubAgentServer::new(connection.clone())),
+                        connection_store,
+                        Agent::Stub,
+                        session_id.clone(),
+                        Some(thread_id),
+                        None,
+                        Some("User title".into()),
+                        None,
+                        workspace.downgrade(),
+                        project,
+                        None,
+                        AgentThreadSource::Sidebar,
+                        window,
+                        cx,
+                    )
+                })
+            });
+            add_to_workspace(view.clone(), cx);
+            let expected_title = if rename_during_load {
+                view.update_in(cx, |view, window, cx| {
+                    assert!(view.root_thread_view().is_none());
+                    view.rename_when_connected("Newest title".into(), window, cx);
+                });
+                "Newest title"
+            } else {
+                "User title"
+            };
+            cx.run_until_parked();
+            let active = active_thread(&view, cx);
+            let connected_id = active.read_with(cx, |view, cx| {
+                assert_eq!(view.title_editor.read(cx).text(cx), expected_title);
+                view.thread.read(cx).session_id().clone()
+            });
+            if let Some(session_id) = &session_id {
+                assert_eq!(&connected_id, session_id);
+            }
+            assert_eq!(
+                connection.take_set_title_calls(),
+                if supports_set_title {
+                    vec![(connected_id, expected_title.into())]
+                } else {
+                    Vec::new()
+                },
+                "a persisted user title must be sent even when the cached title is identical"
+            );
         }
     }
 
@@ -15801,7 +15908,11 @@ pub(crate) mod tests {
         cx.dispatch_action(Paste);
         cx.run_until_parked();
         assert_title(Some("Agent title to keep"), Some("Agent title to keep"), cx);
-        assert!(connection.take_set_title_calls().is_empty());
+        assert_eq!(
+            connection.take_set_title_calls(),
+            vec![(session_id.clone(), "Agent title to keep".into())],
+            "explicitly choosing the displayed title must still reach the server"
+        );
         for title in [Some("Agent replacement after explicit choice"), None] {
             thread.update(cx, |thread, cx| {
                 let title = title

@@ -508,7 +508,25 @@ pub struct ThreadMetadataStore {
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
+    deleted_threads: HashSet<ThreadId>,
+    deleted_sessions: Vec<DeletedAgentSession>,
     _db_operations_task: Task<()>,
+}
+
+// Keep only identity, not conversation content, when an agent cannot delete its history.
+#[derive(Clone)]
+struct DeletedAgentSession {
+    agent_id: AgentId,
+    session_id: acp::SessionId,
+    remote_connection: Option<RemoteConnectionOptions>,
+}
+
+impl DeletedAgentSession {
+    fn matches(&self, metadata: &ThreadMetadata) -> bool {
+        metadata.agent_id == self.agent_id
+            && metadata.session_id.as_ref() == Some(&self.session_id)
+            && metadata.matches_remote_connection(self.remote_connection.as_ref())
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -659,16 +677,17 @@ impl ThreadMetadataStore {
         let db = self.db.clone();
         self.reload_task.take();
 
-        let list_task = cx
-            .background_spawn(async move { db.list().context("Failed to fetch sidebar metadata") });
+        let list_task =
+            cx.background_spawn(async move { anyhow::Ok((db.list()?, db.deleted_sessions()?)) });
 
         let reload_task = cx
             .spawn(async move |this, cx| {
-                let Some(rows) = list_task.await.log_err() else {
+                let Some((rows, deleted_sessions)) = list_task.await.log_err() else {
                     return;
                 };
 
                 this.update(cx, |this, cx| {
+                    this.deleted_sessions.extend(deleted_sessions);
                     this.threads.clear();
                     this.threads_by_paths.clear();
                     this.threads_by_main_paths.clear();
@@ -740,6 +759,14 @@ impl ThreadMetadataStore {
     }
 
     fn save_internal(&mut self, metadata: ThreadMetadata) {
+        if self.deleted_threads.contains(&metadata.thread_id)
+            || self
+                .deleted_sessions
+                .iter()
+                .any(|session| session.matches(&metadata))
+        {
+            return;
+        }
         if let Some(thread) = self.threads.get(&metadata.thread_id) {
             if thread.folder_paths() != metadata.folder_paths() {
                 if let Some(thread_ids) = self.threads_by_paths.get_mut(thread.folder_paths()) {
@@ -765,6 +792,14 @@ impl ThreadMetadataStore {
     }
 
     fn cache_thread_metadata(&mut self, metadata: ThreadMetadata) {
+        if self.deleted_threads.contains(&metadata.thread_id)
+            || self
+                .deleted_sessions
+                .iter()
+                .any(|session| session.matches(&metadata))
+        {
+            return;
+        }
         // Drafts may not have a session_id yet; only index by session
         // when one is present.
         if let Some(session_id) = metadata.session_id.as_ref() {
@@ -1138,7 +1173,39 @@ impl ThreadMetadataStore {
         }
     }
 
+    pub fn exclude_session_from_history(
+        &mut self,
+        metadata: &ThreadMetadata,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let Some(session_id) = metadata.session_id.clone() else {
+            return Task::ready(Ok(()));
+        };
+        let session = DeletedAgentSession {
+            agent_id: metadata.agent_id.clone(),
+            session_id,
+            remote_connection: metadata.remote_connection.clone(),
+        };
+        let db = self.db.clone();
+        cx.spawn(async move |this, cx| {
+            db.exclude_session(&session).await?;
+            this.update(cx, |this, cx| {
+                let duplicates: Vec<_> = this
+                    .entries()
+                    .filter(|entry| session.matches(entry))
+                    .map(|entry| entry.thread_id)
+                    .collect();
+                this.deleted_sessions.push(session);
+                for thread_id in duplicates {
+                    this.delete(thread_id, cx);
+                }
+            })?;
+            Ok(())
+        })
+    }
+
     pub fn delete(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        self.deleted_threads.insert(thread_id);
         if let Some(thread) = self.threads.get(&thread_id) {
             if let Some(sid) = &thread.session_id {
                 self.threads_by_session.remove(sid);
@@ -1160,6 +1227,7 @@ impl ThreadMetadataStore {
             .try_send(DbOperation::Delete(thread_id))
             .log_err();
         crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
+        cx.emit(ThreadMetadataStoreEvent::ThreadDeleted(thread_id));
         cx.notify();
     }
 
@@ -1246,6 +1314,8 @@ impl ThreadMetadataStore {
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
+            deleted_threads: HashSet::default(),
+            deleted_sessions: Vec::new(),
             _db_operations_task,
         };
         let _ = this.reload(cx);
@@ -1280,8 +1350,11 @@ impl ThreadMetadataStore {
         if thread_ref.project().read(cx).is_via_collab() {
             return;
         }
-        let is_draft = thread_ref.is_draft_thread();
         let existing_thread = self.entry(thread_id);
+        // Resuming without replay (or replay arriving later) can leave an
+        // established session empty. Never erase its ID and reopen it as new.
+        let is_draft =
+            thread_ref.is_draft_thread() && existing_thread.is_none_or(ThreadMetadata::is_draft);
 
         // Draft session IDs may change on reload, so let's not save them until they're valid
         let session_id = if is_draft {
@@ -1362,6 +1435,7 @@ impl Global for ThreadMetadataStore {}
 #[derive(Clone, Debug)]
 pub enum ThreadMetadataStoreEvent {
     ThreadArchived(ThreadId),
+    ThreadDeleted(ThreadId),
 }
 
 impl gpui::EventEmitter<ThreadMetadataStoreEvent> for ThreadMetadataStore {}
@@ -1463,6 +1537,14 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
+        sql!(
+            CREATE TABLE deleted_agent_sessions (
+                agent_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                remote_connection TEXT NOT NULL,
+                PRIMARY KEY (agent_id, session_id, remote_connection)
+            );
+        ),
     ];
 }
 
@@ -1487,7 +1569,47 @@ impl ThreadMetadataDb {
     ///
     /// Only returns threads that have a `session_id`.
     pub fn list(&self) -> anyhow::Result<Vec<ThreadMetadata>> {
-        self.select::<ThreadMetadata>(Self::LIST_QUERY)?()
+        let deleted_sessions = self.deleted_sessions()?;
+        let mut rows = self.select::<ThreadMetadata>(Self::LIST_QUERY)?()?;
+        rows.retain(|row| !deleted_sessions.iter().any(|session| session.matches(row)));
+        Ok(rows)
+    }
+
+    fn deleted_sessions(&self) -> anyhow::Result<Vec<DeletedAgentSession>> {
+        self.select::<(String, String, String)>(
+            "SELECT agent_id, session_id, remote_connection FROM deleted_agent_sessions",
+        )?()?
+        .into_iter()
+        .map(|(agent_id, session_id, remote_connection)| {
+            Ok(DeletedAgentSession {
+                agent_id: AgentId::new(agent_id),
+                session_id: acp::SessionId::new(session_id),
+                remote_connection: serde_json::from_str(&remote_connection)?,
+            })
+        })
+        .collect()
+    }
+
+    async fn exclude_session(&self, session: &DeletedAgentSession) -> anyhow::Result<()> {
+        let session = session.clone();
+        let values = (
+            session.agent_id.to_string(),
+            session.session_id.0.to_string(),
+            serde_json::to_string(&session.remote_connection)?,
+        );
+        self.write(move |connection| {
+            connection.with_savepoint("exclude_agent_session", || {
+                connection.exec_bound::<(String, String, String)>(
+                    "INSERT OR IGNORE INTO deleted_agent_sessions (agent_id, session_id, remote_connection) VALUES (?, ?, ?)",
+                )?(values)?;
+                for metadata in connection.select::<ThreadMetadata>(Self::LIST_QUERY)?()? {
+                    if session.matches(&metadata) {
+                        Self::delete_on_connection(connection, metadata.thread_id)?;
+                    }
+                }
+                Ok(())
+            })
+        }).await
     }
 
     /// Upsert metadata for a thread.
@@ -1534,6 +1656,17 @@ impl ThreadMetadataDb {
         let archived = row.archived;
 
         self.write(move |conn| {
+            if let Some(session_id) = row.session_id.as_ref() {
+                let connections = conn.select_bound::<(String, String), String>(
+                    "SELECT remote_connection FROM deleted_agent_sessions WHERE agent_id = ? AND session_id = ?",
+                )?((row.agent_id.to_string(), session_id.0.to_string()))?;
+                for connection in connections {
+                    let connection: Option<RemoteConnectionOptions> = serde_json::from_str(&connection)?;
+                    if row.matches_remote_connection(connection.as_ref()) {
+                        return Ok(());
+                    }
+                }
+            }
             let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override) \
                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
                        ON CONFLICT(thread_id) DO UPDATE SET \
@@ -1573,12 +1706,30 @@ impl ThreadMetadataDb {
     /// Delete metadata for a single thread.
     pub async fn delete(&self, thread_id: ThreadId) -> anyhow::Result<()> {
         self.write(move |conn| {
-            let mut stmt =
-                Statement::prepare(conn, "DELETE FROM sidebar_threads WHERE thread_id = ?")?;
-            stmt.bind(&thread_id, 1)?;
-            stmt.exec()
+            conn.with_savepoint("delete_thread_metadata", || {
+                Self::delete_on_connection(conn, thread_id)
+            })
         })
         .await
+    }
+
+    fn delete_on_connection(
+        conn: &db::sqlez::connection::Connection,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<()> {
+        let worktree_ids = conn.select_bound::<ThreadId, i64>(
+            "SELECT archived_worktree_id FROM thread_archived_worktrees WHERE thread_id = ?",
+        )?(thread_id)?;
+        conn.exec_bound::<ThreadId>("DELETE FROM thread_archived_worktrees WHERE thread_id = ?")?(
+            thread_id,
+        )?;
+        for id in worktree_ids {
+            conn.exec_bound::<i64>(
+                "DELETE FROM archived_git_worktrees WHERE id = ?1 AND NOT EXISTS \
+                         (SELECT 1 FROM thread_archived_worktrees WHERE archived_worktree_id = ?1)",
+            )?(id)?;
+        }
+        conn.exec_bound::<ThreadId>("DELETE FROM sidebar_threads WHERE thread_id = ?")?(thread_id)
     }
 
     pub async fn create_archived_worktree(
@@ -3503,6 +3654,175 @@ mod tests {
             .await
             .unwrap();
         assert!(worktrees.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_local_deletion_preserves_metadata_when_exclusion_cannot_be_saved(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+        let metadata = make_metadata(
+            "failed-exclusion",
+            "Keep this thread",
+            Utc::now(),
+            PathList::default(),
+        );
+        let thread_id = metadata.thread_id;
+        store.update(cx, |store, cx| store.save(metadata.clone(), cx));
+        cx.run_until_parked();
+        let db = store.read_with(cx, |store, _| store.db.clone());
+        db.write(|connection| connection.exec(
+            "CREATE TRIGGER reject_exclusion BEFORE INSERT ON deleted_agent_sessions BEGIN SELECT RAISE(ABORT, 'exclusion failed'); END",
+        )?()).await.expect("install failure trigger");
+        assert!(
+            store
+                .update(cx, |store, cx| store
+                    .exclude_session_from_history(&metadata, cx))
+                .await
+                .is_err()
+        );
+        assert!(store.read_with(cx, |store, _| store.entry(thread_id).is_some()));
+        assert_eq!(db.list_ids().expect("retained record"), vec![thread_id]);
+        assert!(db.deleted_sessions().expect("no exclusion").is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_local_deletion_excludes_reimport_after_reload_without_affecting_other_agents_or_hosts(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+        let mut metadata = make_metadata(
+            "shared-session-id",
+            "Deleted",
+            Utc::now(),
+            PathList::default(),
+        );
+        metadata.agent_id = AgentId::new("external-agent");
+        metadata.remote_connection = Some(RemoteConnectionOptions::Mock(
+            remote::MockConnectionOptions { id: 1 },
+        ));
+        let thread_id = metadata.thread_id;
+        store.update(cx, |store, cx| store.save(metadata.clone(), cx));
+        cx.run_until_parked();
+        store
+            .update(cx, |store, cx| {
+                store.exclude_session_from_history(&metadata, cx)
+            })
+            .await
+            .expect("persist exclusion and delete metadata");
+        cx.run_until_parked();
+        let db = store.read_with(cx, |store, _| store.db.clone());
+        assert!(db.list_ids().expect("database IDs").is_empty());
+        assert!(store.read_with(cx, |store, _| store.entry(thread_id).is_none()));
+
+        let restored = cx.new(|cx| ThreadMetadataStore::new(db.clone(), cx));
+        restored.read_with(cx, |store, _| store.reload_task()).await;
+        let reimported = ThreadMetadata {
+            thread_id: ThreadId::new(),
+            ..metadata.clone()
+        };
+        restored.update(cx, |store, cx| store.save(reimported.clone(), cx));
+        db.save(reimported.clone())
+            .await
+            .expect("late database save");
+        cx.run_until_parked();
+        assert!(restored.read_with(cx, |store, _| store.entry(reimported.thread_id).is_none()));
+        assert!(db.list_ids().expect("database IDs").is_empty());
+
+        for (agent_id, remote_connection) in [
+            (
+                AgentId::new("another-agent"),
+                metadata.remote_connection.clone(),
+            ),
+            (metadata.agent_id.clone(), None),
+            (
+                metadata.agent_id.clone(),
+                Some(RemoteConnectionOptions::Mock(
+                    remote::MockConnectionOptions { id: 2 },
+                )),
+            ),
+        ] {
+            let other = ThreadMetadata {
+                thread_id: ThreadId::new(),
+                agent_id,
+                remote_connection,
+                ..metadata.clone()
+            };
+            let other_id = other.thread_id;
+            restored.update(cx, |store, cx| store.save(other, cx));
+            assert!(restored.read_with(cx, |store, _| store.entry(other_id).is_some()));
+        }
+        cx.run_until_parked();
+        assert_eq!(db.list_ids().expect("unrelated sessions").len(), 3);
+    }
+
+    #[gpui::test]
+    async fn test_delete_thread_cleans_shared_archive_records_and_rejects_late_updates(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+        let first = make_metadata("first", "First", Utc::now(), PathList::default());
+        let second = make_metadata("second", "Second", Utc::now(), PathList::default());
+        let first_id = first.thread_id;
+        let second_id = second.thread_id;
+        store.update(cx, |store, cx| {
+            store.save(first.clone(), cx);
+            store.save(second, cx);
+        });
+        cx.run_until_parked();
+        let archive_id = store
+            .read_with(cx, |store, cx| {
+                store.create_archived_worktree(
+                    "/user/worktree".into(),
+                    "/user/repo".into(),
+                    Some("feature".into()),
+                    "staged".into(),
+                    "unstaged".into(),
+                    "head".into(),
+                    cx,
+                )
+            })
+            .await
+            .expect("archive record");
+        for id in [first_id, second_id] {
+            store
+                .read_with(cx, |store, cx| {
+                    store.link_thread_to_archived_worktree(id, archive_id, cx)
+                })
+                .await
+                .expect("link thread");
+        }
+        store.update(cx, |store, cx| {
+            store.delete(first_id, cx);
+            store.save(first.clone(), cx);
+            store.cache_thread_metadata(first);
+        });
+        cx.run_until_parked();
+        assert!(store.read_with(cx, |store, _| store.entry(first_id).is_none()));
+        let remaining = store
+            .read_with(cx, |store, cx| {
+                store.get_archived_worktrees_for_thread(second_id, cx)
+            })
+            .await
+            .expect("shared record");
+        assert_eq!(remaining.len(), 1);
+        store.update(cx, |store, cx| store.delete(second_id, cx));
+        cx.run_until_parked();
+        let records = store
+            .read_with(cx, |store, _| {
+                store
+                    .db
+                    .select::<i64>("SELECT id FROM archived_git_worktrees")?()
+            })
+            .expect("archive records");
+        assert!(records.is_empty());
+        let entries = store
+            .read_with(cx, |store, _| store.db.list())
+            .expect("persisted metadata");
+        assert!(entries.is_empty());
     }
 
     #[gpui::test]

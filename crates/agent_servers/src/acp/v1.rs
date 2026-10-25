@@ -9484,6 +9484,36 @@ exit 7
     }
 
     #[gpui::test]
+    async fn names_a_restored_mux_session_even_when_the_cached_title_matches(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let agent = FakeMuxAgent::connect(true, cx).await;
+        let thread = cx
+            .update(|cx| {
+                agent.connection.clone().load_session(
+                    acp_v2::SessionId::new(MUX_SESSION_ID),
+                    agent.project.clone(),
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    Some("User title".into()),
+                    cx,
+                )
+            })
+            .await
+            .expect("load with a locally cached title");
+        thread
+            .update(cx, |thread, cx| thread.set_title("User title".into(), cx))
+            .await
+            .expect("sync the user title to mux");
+        assert_eq!(
+            *agent
+                .set_title_requests
+                .lock()
+                .expect("set title requests lock poisoned"),
+            vec![serde_json::json!({"sessionId": MUX_SESSION_ID, "title": "User title"})]
+        );
+    }
+
+    #[gpui::test]
     async fn cancelling_a_mirrored_turn_waits_for_the_agent(cx: &mut gpui::TestAppContext) {
         let agent = FakeMuxAgent::connect(true, cx).await;
         let thread = agent.load(vec![mux_turn_state("running", None)], cx).await;

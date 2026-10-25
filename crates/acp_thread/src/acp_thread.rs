@@ -5337,11 +5337,13 @@ impl AcpThread {
         if self.session_info.title.as_ref() != Some(&title) {
             self.session_info.title = Some(title.clone());
             cx.emit(AcpThreadEvent::TitleUpdated);
-            if let Some(set_title) = self.connection.set_title(self.session_id(), cx) {
-                return set_title.run(title, cx);
-            }
         } else if had_provisional {
             cx.emit(AcpThreadEvent::TitleUpdated);
+        }
+        // A cached or optimistically updated title does not mean the server
+        // accepted it. Explicit renames must also work when retrying that title.
+        if let Some(set_title) = self.connection.set_title(self.session_id(), cx) {
+            return set_title.run(title, cx);
         }
         Task::ready(Ok(()))
     }
@@ -19725,6 +19727,7 @@ mod tests {
         supports_truncate: bool,
         sessions: Arc<parking_lot::Mutex<HashMap<acp_v2::SessionId, WeakEntity<AcpThread>>>>,
         set_title_calls: Rc<RefCell<Vec<SharedString>>>,
+        next_set_title_error: Rc<RefCell<Option<anyhow::Error>>>,
         on_user_message: Option<
             Rc<
                 dyn Fn(
@@ -19746,6 +19749,7 @@ mod tests {
                 on_user_message: None,
                 sessions: Arc::default(),
                 set_title_calls: Default::default(),
+                next_set_title_error: Default::default(),
             }
         }
 
@@ -19889,6 +19893,7 @@ mod tests {
         ) -> Option<Rc<dyn AgentSessionSetTitle>> {
             Some(Rc::new(FakeAgentSessionSetTitle {
                 calls: self.set_title_calls.clone(),
+                next_error: self.next_set_title_error.clone(),
             }))
         }
 
@@ -19899,12 +19904,13 @@ mod tests {
 
     struct FakeAgentSessionSetTitle {
         calls: Rc<RefCell<Vec<SharedString>>>,
+        next_error: Rc<RefCell<Option<anyhow::Error>>>,
     }
 
     impl AgentSessionSetTitle for FakeAgentSessionSetTitle {
         fn run(&self, title: SharedString, _cx: &mut App) -> Task<Result<()>> {
             self.calls.borrow_mut().push(title);
-            Task::ready(Ok(()))
+            Task::ready(self.next_error.borrow_mut().take().map_or(Ok(()), Err))
         }
     }
 
@@ -20819,6 +20825,42 @@ mod tests {
                 tool_entry.status()
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_set_title_retries_an_identical_title_after_failure(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project, PathList::default(), cx)
+            })
+            .await
+            .expect("new session");
+        *connection.next_set_title_error.borrow_mut() = Some(anyhow!("connection lost"));
+
+        assert!(
+            thread
+                .update(cx, |thread, cx| thread.set_title("User title".into(), cx))
+                .await
+                .is_err()
+        );
+        thread
+            .update(cx, |thread, cx| thread.set_title("User title".into(), cx))
+            .await
+            .expect("retry the same title");
+        assert_eq!(
+            connection.set_title_calls.borrow().as_slice(),
+            &[
+                SharedString::from("User title"),
+                SharedString::from("User title")
+            ],
+            "the optimistic local title is not proof the server accepted it"
+        );
     }
 
     #[gpui::test]

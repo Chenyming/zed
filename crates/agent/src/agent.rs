@@ -6744,7 +6744,7 @@ mod internal_tests {
     }
 
     #[gpui::test]
-    async fn test_threads_flushed_to_database_on_app_quit(cx: &mut TestAppContext) {
+    async fn test_deleted_threads_are_not_recreated_on_app_quit(cx: &mut TestAppContext) {
         init_test(cx);
 
         let (connection, agent, project, acp_thread) = setup_native_agent_session(cx).await;
@@ -6788,9 +6788,7 @@ mod internal_tests {
         });
         cx.run_until_parked();
 
-        // Reproduce the orphaned state from the bug: the sidebar metadata and
-        // serialized panel still reference the session, but the per-session
-        // async content save never landed, so the content row is absent.
+        // Keep the live session around to exercise saves that race with deletion.
         let database = cx.update(|cx| ThreadsDatabase::connect(cx)).await.unwrap();
         database.delete_thread(session_id.clone()).await.unwrap();
         assert!(
@@ -6806,21 +6804,7 @@ mod internal_tests {
         // registration is exercised, not just the flush itself.
         cx.update(|cx| cx.shutdown());
 
-        let restored = database
-            .load_thread(session_id.clone())
-            .await
-            .unwrap()
-            .expect("thread content should be persisted to the database on quit");
-        assert_eq!(
-            restored.messages.len(),
-            1,
-            "the user message should survive the quit flush"
-        );
-        assert_eq!(
-            restored.draft_prompt,
-            Some(vec![acp_v2::ContentBlock::from("draft in progress")]),
-            "the current draft prompt should be captured by the quit flush"
-        );
+        assert!(database.load_thread(session_id).await.unwrap().is_none());
         assert!(
             database
                 .load_thread(empty_session_id)

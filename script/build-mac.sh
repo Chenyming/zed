@@ -13,6 +13,7 @@
 # 渠道可选 dev / nightly / preview / stable,默认沿用 crates/zed/RELEASE_CHANNEL 当前的值。
 #
 # 环境变量:
+
 #   MIN_FREE_GB   构建前要求的最小可用空间,默认 60
 #   TARGET_TRIPLE 目标三元组,默认取 rustc 的 host
 #   MACOS_SIGNING_KEY 默认使用固定本地证书 73C71571A1E993B2B628A5F4998CC201DB8336FA;设为 - 使用 ad-hoc 签名
@@ -69,6 +70,7 @@ case "$channel" in
     dev|nightly|preview|stable) ;;
     *) echo "未知渠道: $channel(可选 dev / nightly / preview / stable)" >&2; exit 2 ;;
 esac
+
 
 export MACOS_SIGNING_KEY="${MACOS_SIGNING_KEY:-73C71571A1E993B2B628A5F4998CC201DB8336FA}"
 

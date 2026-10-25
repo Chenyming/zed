@@ -402,7 +402,7 @@
     "context": "ThreadsArchiveView",
     "use_key_equivalents": true,
     "bindings": {
-      "shift-backspace": "agent::ArchiveSelectedThread",
+      "shift-backspace": "agent::RemoveSelectedThread",
     },
   },
   {
@@ -761,7 +761,7 @@
       "enter": "menu::Confirm",
       "ctrl-f": "agents_sidebar::FocusSidebarFilter",
       "ctrl-g": "agents_sidebar::ToggleThreadHistory",
-      "shift-backspace": "agent::ArchiveSelectedThread",
+      "shift-backspace": "agent::RemoveSelectedThread",
       "ctrl-backspace": "agent::RemoveSelectedThread",
       "ctrl-tab": "agents_sidebar::ToggleThreadSwitcher",
       "ctrl-shift-tab": ["agents_sidebar::ToggleThreadSwitcher", { "select_last": true }],

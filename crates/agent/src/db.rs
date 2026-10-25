@@ -460,6 +460,10 @@ impl ThreadsDatabase {
         "})?()
         .map_err(|e| e.context("Failed to create threads table"))?;
 
+        // Save workers and shutdown observers can finish after a thread is deleted.
+        // Keep tombstones for this connection's lifetime so those writes cannot recreate it.
+        connection.exec("CREATE TEMP TABLE deleted_threads (id TEXT PRIMARY KEY)")?()?;
+
         if let Ok(mut s) = connection.exec(indoc! {"
             ALTER TABLE threads ADD COLUMN parent_id TEXT
         "})
@@ -529,12 +533,29 @@ impl ThreadsDatabase {
                     Some(serialized_folder_paths.order),
                 )
             };
+        let sandboxed_terminal_temp_dir = thread.sandboxed_terminal_temp_dir.clone();
         let json_data = serde_json::to_string(&SerializedThread {
             thread,
             version: DbThread::VERSION,
         })?;
 
         let connection = connection.lock();
+
+        if connection.select_row_bound::<(Arc<str>, Option<Arc<str>>), i64>(
+            "SELECT 1 FROM deleted_threads WHERE id = ?1 OR id = ?2 LIMIT 1",
+        )?((id.0.clone(), parent_id.clone()))?
+        .is_some()
+        {
+            connection
+                .exec_bound::<Arc<str>>("INSERT OR IGNORE INTO deleted_threads (id) VALUES (?)")?(
+                id.0,
+            )?;
+            drop(connection);
+            if let Some(temp_dir) = sandboxed_terminal_temp_dir {
+                Self::remove_sandboxed_terminal_temp_dir(temp_dir)?;
+            }
+            return Ok(());
+        }
 
         let compressed = zstd::encode_all(json_data.as_bytes(), COMPRESSION_LEVEL)?;
         let data_type = DataType::Zstd;
@@ -677,114 +698,107 @@ impl ThreadsDatabase {
         DbThread::from_json(json_data.as_bytes())
     }
 
-    fn sandboxed_terminal_temp_dir(data_type: DataType, data: Vec<u8>) -> Option<PathBuf> {
-        match Self::deserialize_thread(data_type, data) {
-            Ok(thread) => thread.sandboxed_terminal_temp_dir,
-            Err(error) => {
-                log::warn!("failed to deserialize thread before deleting it: {error:#}");
-                None
-            }
-        }
+    fn sandboxed_terminal_temp_dir(data_type: DataType, data: Vec<u8>) -> Result<Option<PathBuf>> {
+        Ok(Self::deserialize_thread(data_type, data)?.sandboxed_terminal_temp_dir)
     }
 
-    fn remove_sandboxed_terminal_temp_dir(temp_dir: PathBuf) {
+    fn remove_sandboxed_terminal_temp_dir(temp_dir: PathBuf) -> Result<()> {
         match std::fs::remove_dir_all(&temp_dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => {
-                log::warn!(
-                    "failed to remove sandboxed terminal temp directory {}: {error}",
-                    temp_dir.display()
-                );
-            }
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(anyhow::anyhow!(
+                "failed to remove sandboxed terminal temp directory {}: {error}",
+                temp_dir.display(),
+            )),
         }
     }
 
     pub fn delete_thread(&self, id: acp_v2::SessionId) -> Task<Result<()>> {
         let connection = self.connection.clone();
-
         self.executor.spawn(async move {
-            let sandboxed_terminal_temp_dirs = {
+            let (ids_to_delete, sandboxed_terminal_temp_dirs) = {
                 let connection = connection.lock();
-
-                let mut select_children =
-                    connection.select_bound::<Arc<str>, Arc<str>>(indoc! {"
-                    SELECT id FROM threads WHERE parent_id = ?
-                "})?;
-
-                // Collect target thread together with all of its transitive
-                // subagent threads
-                let mut ids_to_delete = vec![id.0.clone()];
-                let mut frontier = vec![id.0.clone()];
+                let mut select_children = connection.select_bound::<Arc<str>, Arc<str>>(
+                    "SELECT id FROM threads WHERE parent_id = ?",
+                )?;
+                let mut ids_to_delete = collections::HashSet::default();
+                let mut frontier = vec![id.0];
                 while let Some(parent) = frontier.pop() {
-                    for child in select_children(parent)? {
-                        ids_to_delete.push(child.clone());
-                        frontier.push(child);
+                    if ids_to_delete.insert(parent.clone()) {
+                        frontier.extend(select_children(parent)?);
                     }
                 }
-
-                let mut select =
-                    connection.select_bound::<Arc<str>, (DataType, Vec<u8>)>(indoc! {"
-                    SELECT data_type, data FROM threads WHERE id = ? LIMIT 1
-                "})?;
-
-                let mut delete = connection.exec_bound::<Arc<str>>(indoc! {"
-                    DELETE FROM threads WHERE id = ?
-                "})?;
-
+                let mut select = connection.select_bound::<Arc<str>, (DataType, Vec<u8>)>(
+                    "SELECT data_type, data FROM threads WHERE id = ? LIMIT 1",
+                )?;
                 let mut sandboxed_terminal_temp_dirs = Vec::new();
-                for thread_id in ids_to_delete {
-                    if let Some(temp_dir) = select(thread_id.clone())?.into_iter().next().and_then(
-                        |(data_type, data)| Self::sandboxed_terminal_temp_dir(data_type, data),
-                    ) {
-                        sandboxed_terminal_temp_dirs.push(temp_dir);
+                for thread_id in &ids_to_delete {
+                    if let Some((data_type, data)) = select(thread_id.clone())?.into_iter().next() {
+                        if let Some(temp_dir) = Self::sandboxed_terminal_temp_dir(data_type, data)?
+                        {
+                            sandboxed_terminal_temp_dirs.push(temp_dir);
+                        }
                     }
-                    delete(thread_id)?;
                 }
-
-                sandboxed_terminal_temp_dirs
+                for thread_id in &ids_to_delete {
+                    connection.exec_bound::<Arc<str>>(
+                        "INSERT OR IGNORE INTO deleted_threads (id) VALUES (?)",
+                    )?(thread_id.clone())?;
+                }
+                (ids_to_delete, sandboxed_terminal_temp_dirs)
             };
 
+            // Keep the rows until cleanup succeeds so a failed deletion can be retried.
             for temp_dir in sandboxed_terminal_temp_dirs {
-                Self::remove_sandboxed_terminal_temp_dir(temp_dir);
+                Self::remove_sandboxed_terminal_temp_dir(temp_dir)?;
             }
-
-            Ok(())
+            let connection = connection.lock();
+            connection.with_savepoint("delete_thread", || {
+                let mut delete =
+                    connection.exec_bound::<Arc<str>>("DELETE FROM threads WHERE id = ?")?;
+                for thread_id in ids_to_delete {
+                    delete(thread_id)?;
+                }
+                Ok(())
+            })
         })
     }
 
     pub fn delete_threads(&self) -> Task<Result<()>> {
         let connection = self.connection.clone();
-
         self.executor.spawn(async move {
-            let sandboxed_terminal_temp_dirs = {
+            let (ids_to_delete, sandboxed_terminal_temp_dirs) = {
                 let connection = connection.lock();
-
-                let mut select = connection.select_bound::<(), (DataType, Vec<u8>)>(indoc! {"
-                    SELECT data_type, data FROM threads
-                "})?;
-
-                let sandboxed_terminal_temp_dirs = select(())?
-                    .into_iter()
-                    .filter_map(|(data_type, data)| {
-                        Self::sandboxed_terminal_temp_dir(data_type, data)
-                    })
-                    .collect::<Vec<_>>();
-
-                let mut delete = connection.exec_bound::<()>(indoc! {"
-                    DELETE FROM threads
-                "})?;
-
-                delete(())?;
-
-                sandboxed_terminal_temp_dirs
+                let rows = connection.select::<(Arc<str>, DataType, Vec<u8>)>(
+                    "SELECT id, data_type, data FROM threads",
+                )?()?;
+                let mut ids_to_delete = Vec::new();
+                let mut sandboxed_terminal_temp_dirs = Vec::new();
+                for (id, data_type, data) in rows {
+                    ids_to_delete.push(id);
+                    if let Some(temp_dir) = Self::sandboxed_terminal_temp_dir(data_type, data)? {
+                        sandboxed_terminal_temp_dirs.push(temp_dir);
+                    }
+                }
+                for id in &ids_to_delete {
+                    connection.exec_bound::<Arc<str>>(
+                        "INSERT OR IGNORE INTO deleted_threads (id) VALUES (?)",
+                    )?(id.clone())?;
+                }
+                (ids_to_delete, sandboxed_terminal_temp_dirs)
             };
-
             for temp_dir in sandboxed_terminal_temp_dirs {
-                Self::remove_sandboxed_terminal_temp_dir(temp_dir);
+                Self::remove_sandboxed_terminal_temp_dir(temp_dir)?;
             }
-
-            Ok(())
+            let connection = connection.lock();
+            connection.with_savepoint("delete_threads", || {
+                let mut delete =
+                    connection.exec_bound::<Arc<str>>("DELETE FROM threads WHERE id = ?")?;
+                for id in ids_to_delete {
+                    delete(id)?;
+                }
+                Ok(())
+            })
         })
     }
 }
@@ -1202,9 +1216,56 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_delete_thread_prevents_pending_save_from_recreating_it(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).expect("database");
+        let id = session_id("deleted-with-pending-save");
+        let thread = make_thread("Pending save", Utc::now());
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        database.set_write_gate(receiver);
+        let save = database.save_thread(id.clone(), thread, PathList::default());
+        database
+            .delete_thread(id.clone())
+            .await
+            .expect("delete thread");
+        sender.send(()).expect("release save");
+        save.await.expect("finish pending save");
+        assert!(
+            database
+                .load_thread(id.clone())
+                .await
+                .expect("load deleted thread")
+                .is_none()
+        );
+
+        let child_id = session_id("late-child");
+        let mut child = make_thread("Late subagent", Utc::now());
+        child.subagent_context = Some(crate::SubagentContext {
+            parent_thread_id: id,
+            depth: 1,
+        });
+        database
+            .save_thread(child_id.clone(), child, PathList::default())
+            .await
+            .expect("late child save");
+        assert!(
+            database
+                .load_thread(child_id)
+                .await
+                .expect("load deleted child")
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
     async fn test_delete_thread_removes_sandboxed_terminal_temp_dir(cx: &mut TestAppContext) {
         let database = ThreadsDatabase::new(cx.executor()).unwrap();
         let thread_id = session_id("sandbox-temp-dir-delete-thread");
+        let worktree = tempfile::tempdir().expect("user worktree");
+        std::fs::write(
+            worktree.path().join("user.txt"),
+            b"uncommitted user content",
+        )
+        .expect("user file");
         let temp_dir = tempfile::Builder::new()
             .prefix("zed-agent-terminal-test-")
             .tempdir()
@@ -1218,12 +1279,51 @@ mod tests {
         thread.sandboxed_terminal_temp_dir = Some(temp_dir.clone());
 
         database
-            .save_thread(thread_id.clone(), thread, PathList::default())
+            .save_thread(thread_id.clone(), thread, PathList::new(&[worktree.path()]))
             .await
             .unwrap();
         database.delete_thread(thread_id).await.unwrap();
 
         assert!(!temp_dir.exists());
+        assert_eq!(
+            std::fs::read(worktree.path().join("user.txt")).expect("retained user file"),
+            b"uncommitted user content"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_delete_thread_preserves_records_when_sandbox_cleanup_fails(
+        cx: &mut TestAppContext,
+    ) {
+        let database = ThreadsDatabase::new(cx.executor()).expect("database");
+        let id = session_id("sandbox-cleanup-failure");
+        let sandbox = tempfile::NamedTempFile::new().expect("invalid sandbox directory");
+        let mut thread = make_thread("Cleanup failure", Utc::now());
+        thread.sandboxed_terminal_temp_dir = Some(sandbox.path().to_path_buf());
+        database
+            .save_thread(id.clone(), thread, PathList::default())
+            .await
+            .expect("save thread");
+        assert!(database.delete_thread(id.clone()).await.is_err());
+        assert!(
+            database
+                .load_thread(id.clone())
+                .await
+                .expect("retained thread")
+                .is_some()
+        );
+        sandbox.close().expect("remove invalid sandbox file");
+        database
+            .delete_thread(id.clone())
+            .await
+            .expect("retry deletion");
+        assert!(
+            database
+                .load_thread(id)
+                .await
+                .expect("deleted thread")
+                .is_none()
+        );
     }
 
     #[gpui::test]
