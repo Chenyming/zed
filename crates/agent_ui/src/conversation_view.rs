@@ -1945,6 +1945,34 @@ impl ConversationView {
         matches!(self.server_state, ServerState::Loading { .. })
     }
 
+    pub fn session_id_for_deletion(
+        conversation_view: Entity<Self>,
+        cx: &mut App,
+    ) -> Task<Result<Option<acp_v2::SessionId>>> {
+        let (mut sender, mut receiver) = watch::channel(());
+        let observation = cx.observe(&conversation_view, move |_, _| {
+            sender.send(()).log_err();
+        });
+        // Keep session/new alive until its result is known. Dropping the view
+        // only closes/detaches the session; it does not delete it from the agent.
+        cx.spawn(async move |cx| {
+            let _observation = observation;
+            loop {
+                let result = conversation_view.read_with(cx, |view, _| match &view.server_state {
+                    ServerState::Loading { .. } => None,
+                    ServerState::LoadError { error } if view.root_session_id.is_none() => {
+                        Some(Err(anyhow!(error.clone())))
+                    }
+                    _ => Some(Ok(view.root_session_id.clone())),
+                });
+                if let Some(result) = result {
+                    return result;
+                }
+                receiver.changed().await?;
+            }
+        })
+    }
+
     fn send_queued_after_confirmed_idle(
         &mut self,
         window: &mut Window,
@@ -2367,7 +2395,9 @@ impl ConversationView {
                 }
             }
             AcpThreadEvent::PromptUpdated => {
-                if !is_subagent && thread.read(cx).is_draft_thread() {
+                if !is_subagent
+                    && (!self.connection_key.is_native() || thread.read(cx).is_draft_thread())
+                {
                     self.schedule_draft_prompt_persist(cx);
                 }
                 cx.notify();
@@ -2385,7 +2415,7 @@ impl ConversationView {
             let persist = this.update(cx, |this, cx| {
                 let thread = this.root_thread(cx)?;
                 let thread = thread.read(cx);
-                if !thread.is_draft_thread() {
+                if this.connection_key.is_native() && !thread.is_draft_thread() {
                     return None;
                 }
                 let snapshot: Vec<acp_v2::ContentBlock> = thread

@@ -1765,23 +1765,6 @@ impl Sidebar {
                 }
                 threads.retain(|thread| thread.draft.is_none() || thread.metadata.title.is_some());
 
-                // Keep empty drafts only while their thread is active; preserve
-                // drafts with content because they hold user-typed state.
-                let pending_activation = self.pending_thread_activation;
-                let active_panel_thread_id = active_workspace
-                    .as_ref()
-                    .and_then(|ws| ws.read(cx).panel::<AgentPanel>(cx))
-                    .and_then(|panel| panel.read(cx).active_thread_id(cx));
-                threads.retain(|thread| {
-                    if thread.draft != Some(DraftKind::Empty) {
-                        return true;
-                    }
-                    if pending_activation.is_some() {
-                        return false;
-                    }
-                    Some(thread.metadata.thread_id) == active_panel_thread_id
-                });
-
                 // Build a lookup from live_infos and compute running/waiting
                 // counts in a single pass.
                 let mut live_info_by_session: HashMap<acp::SessionId, ActiveThreadInfo> =
@@ -4994,12 +4977,51 @@ impl Sidebar {
 
     fn delete_thread_in_workspace(
         &mut self,
-        metadata: ThreadMetadata,
+        mut metadata: ThreadMetadata,
         workspace: Option<Entity<Workspace>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let thread_id = metadata.thread_id;
+        if !Agent::from(metadata.agent_id.clone()).is_native()
+            && let Some(conversation_view) = workspace
+                .as_ref()
+                .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
+                .and_then(|panel| {
+                    panel
+                        .read(cx)
+                        .conversation_view_for_id(&thread_id, cx)
+                        .cloned()
+                })
+        {
+            if conversation_view.read(cx).is_loading() {
+                let session =
+                    agent_ui::ConversationView::session_id_for_deletion(conversation_view, cx);
+                self.deleting_threads.insert(thread_id);
+                cx.spawn_in(window, async move |this, cx| {
+                    let result = session.await;
+                    this.update_in(cx, |this, window, cx| {
+                        this.deleting_threads.remove(&thread_id);
+                        match result {
+                            Ok(session_id) => {
+                                metadata.session_id = session_id.or(metadata.session_id);
+                                this.delete_thread_in_workspace(metadata, workspace, window, cx);
+                            }
+                            Err(error) => {
+                                this.handle_thread_deletion_failure(metadata, error, window, cx)
+                            }
+                        }
+                    })
+                    .log_err();
+                })
+                .detach();
+                return;
+            }
+            if let Some(thread_view) = conversation_view.read(cx).root_thread_view() {
+                metadata.session_id =
+                    Some(thread_view.read(cx).thread.read(cx).session_id().clone());
+            }
+        }
         let mut deletion_connection_store = None;
         let task = if let Some(session_id) = metadata.session_id.clone() {
             if Agent::from(metadata.agent_id.clone()).is_native() {
@@ -5819,7 +5841,25 @@ impl Sidebar {
                     )
                 } else {
                     match thread.draft {
-                        Some(DraftKind::Empty) => None,
+                        Some(DraftKind::Empty) => Some(
+                            IconButton::new("delete-empty-draft", IconName::Trash)
+                                .hover_background(button_hover_bg)
+                                .active_background(button_active_bg)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Delete Draft"))
+                                .on_click({
+                                    let thread_workspace = thread_workspace.clone();
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.remove_draft(
+                                            thread_id_for_actions,
+                                            &thread_workspace,
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                })
+                                .into_any_element(),
+                        ),
                         Some(DraftKind::WithContent) => Some(
                             IconButton::new("discard_thread", IconName::Close)
                                 .hover_background(button_hover_bg)
@@ -6264,6 +6304,14 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(draft_id)
+            .is_some_and(|metadata| !Agent::from(metadata.agent_id.clone()).is_native())
+        {
+            self.delete_thread_by_id(draft_id, window, cx);
+            return;
+        }
         let was_active = self
             .active_entry
             .as_ref()

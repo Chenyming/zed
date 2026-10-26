@@ -38,7 +38,9 @@ pub fn set_stub_agent_connection(connection: StubAgentConnection) -> StubAgentCo
 pub fn stub_agent_connection() -> StubAgentConnection {
     STUB_AGENT_CONNECTION.with(|cell| {
         let mut borrow = cell.borrow_mut();
-        borrow.get_or_insert_with(StubAgentConnection::new).clone()
+        borrow
+            .get_or_insert_with(|| StubAgentServer::default_response().connection)
+            .clone()
     })
 }
 
@@ -104,6 +106,7 @@ where
 }
 
 pub fn init_test(cx: &mut TestAppContext) {
+    STUB_AGENT_CONNECTION.with(|cell| *cell.borrow_mut() = None);
     cx.update(|cx| {
         let settings_store = SettingsStore::test(cx);
         cx.set_global(settings_store);
@@ -262,15 +265,22 @@ pub fn open_thread_with_connection(
     cx.run_until_parked();
 }
 
-/// Opens a draft thread against a stub server so the panel's `draft_thread`
-/// pointer is populated for tests that care about draft UX.
+/// Exercises native draft UX without starting a language model. External
+/// sessions are persistent from creation and do not use the local draft slot.
 pub fn open_draft_with_connection(
     panel: &Entity<AgentPanel>,
     connection: StubAgentConnection,
     cx: &mut VisualTestContext,
 ) {
     panel.update_in(cx, |panel, window, cx| {
-        panel.open_draft_with_server(Rc::new(StubAgentServer::new(connection)), window, cx);
+        panel.open_draft_with_server(
+            Rc::new(
+                StubAgentServer::new(connection.with_agent_id(agent::ZED_AGENT_ID.clone()))
+                    .with_connection_agent_id(),
+            ),
+            window,
+            cx,
+        );
     });
     cx.run_until_parked();
 }

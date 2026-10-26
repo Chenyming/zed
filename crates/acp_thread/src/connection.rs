@@ -980,6 +980,7 @@ mod test_support {
         auth_methods: Vec<acp_v2::AuthMethod>,
         next_authenticate_response: Arc<Mutex<Option<oneshot::Receiver<Result<()>>>>>,
         next_load_error: Arc<Mutex<Option<anyhow::Error>>>,
+        next_new_session_response: Arc<Mutex<Option<oneshot::Receiver<Result<()>>>>>,
         next_receipt_response:
             Arc<Mutex<Option<oneshot::Receiver<Result<acp_v2::PromptResponse>>>>>,
         receipt_prompt: Arc<Mutex<Option<Vec<acp_v2::ContentBlock>>>>,
@@ -1032,6 +1033,7 @@ mod test_support {
                 auth_methods: Vec::new(),
                 next_authenticate_response: Default::default(),
                 next_load_error: Default::default(),
+                next_new_session_response: Default::default(),
                 next_receipt_response: Default::default(),
                 receipt_prompt: Default::default(),
                 next_truncate: Default::default(),
@@ -1067,6 +1069,17 @@ mod test_support {
 
         pub fn set_next_load_error(&self, error: anyhow::Error) {
             *self.next_load_error.lock() = Some(error);
+        }
+
+        pub fn defer_next_new_session_response(&self) -> oneshot::Sender<Result<()>> {
+            let (sender, receiver) = oneshot::channel();
+            assert!(
+                self.next_new_session_response
+                    .lock()
+                    .replace(receiver)
+                    .is_none()
+            );
+            sender
         }
 
         pub fn shutdown_calls(&self) -> usize {
@@ -1388,8 +1401,15 @@ mod test_support {
             cx: &mut gpui::App,
         ) -> Task<gpui::Result<Entity<AcpThread>>> {
             let session_id = acp_v2::SessionId::new(StubSessionCounter::next(cx).to_string());
+            let response = self.next_new_session_response.lock().take();
             let thread = self.create_session(session_id, project, work_dirs, None, cx);
-            Task::ready(Ok(thread))
+            match response {
+                Some(response) => cx.spawn(async move |_| {
+                    response.await??;
+                    Ok(thread)
+                }),
+                None => Task::ready(Ok(thread)),
+            }
         }
 
         fn supports_load_session(&self) -> bool {

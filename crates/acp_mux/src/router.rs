@@ -375,7 +375,7 @@ impl Router {
         let existing = self
             .agents
             .iter()
-            .find(|(_, agent)| agent.key == key)
+            .find(|(_, agent)| agent.key == key && !agent.stopping)
             .map(|(id, _)| *id);
         let agent = match existing {
             Some(agent) => agent,
@@ -1166,7 +1166,8 @@ impl Router {
                 });
                 match call {
                     Some((agent_request_id, call)) => {
-                        self.handle_agent_response(agent, agent_request_id, call, message)
+                        self.handle_agent_response(agent, agent_request_id, call, message);
+                        self.stop_unused_agents();
                     }
                     None => log::warn!("agent {agent} answered unknown request {id}"),
                 }
@@ -1644,6 +1645,35 @@ impl Router {
                 still_answerable
             });
         }
+        self.stop_unused_agents();
+    }
+
+    fn stop_unused_agents(&mut self) {
+        let clients = &self.clients;
+        let sessions = &self.sessions;
+        for (agent_id, agent_state) in &mut self.agents {
+            let has_client = clients
+                .values()
+                .any(|client| client.agent == Some(*agent_id));
+            let has_session = sessions.values().any(|session| session.agent == *agent_id);
+            let is_creating_session = agent_state.calls.values().any(|call| {
+                matches!(
+                    call,
+                    PendingCall::Forwarded {
+                        kind: CallKind::NewSession { .. },
+                        ..
+                    }
+                )
+            });
+            if !agent_state.stopping && !has_client && !has_session && !is_creating_session {
+                agent_state.stopping = true;
+                log::info!(
+                    "stopping unused agent {} ({agent_id})",
+                    agent_state.key.name
+                );
+                (agent_state.handle.kill)();
+            }
+        }
     }
 
     fn handle_agent_exit(&mut self, agent: AgentId, status: &str) {
@@ -1878,6 +1908,7 @@ impl Router {
                 );
             }
         }
+        self.stop_unused_agents();
         keys.len()
     }
 }
@@ -1896,11 +1927,16 @@ mod tests {
     use anyhow::Result;
     use pretty_assertions::assert_eq;
     use smol::channel::Receiver;
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        sync::{Arc, Mutex},
+    };
 
     #[derive(Default, Clone)]
     struct FakeLauncher {
         launched: Rc<RefCell<Vec<(AgentId, Receiver<Value>)>>>,
+        killed: Arc<Mutex<Vec<AgentId>>>,
     }
 
     impl AgentLauncher for FakeLauncher {
@@ -1912,10 +1948,16 @@ mod tests {
         ) -> Result<AgentHandle> {
             let (outgoing, incoming) = smol::channel::unbounded();
             self.launched.borrow_mut().push((agent, incoming));
+            let killed = self.killed.clone();
             Ok(AgentHandle {
                 outgoing,
                 pid: None,
-                kill: Box::new(|| {}),
+                kill: Box::new(move || {
+                    killed
+                        .lock()
+                        .expect("killed agents lock poisoned")
+                        .push(agent);
+                }),
             })
         }
     }
@@ -1964,6 +2006,14 @@ mod tests {
             std::iter::from_fn(|| self.notices.try_recv().ok()).collect()
         }
 
+        fn killed_agents(&self) -> Vec<AgentId> {
+            self.launcher
+                .killed
+                .lock()
+                .expect("killed agents lock poisoned")
+                .clone()
+        }
+
         fn attach(&mut self, client: ClientId) {
             let (outgoing, incoming) = smol::channel::unbounded();
             self.router
@@ -1985,8 +2035,14 @@ mod tests {
         }
 
         fn from_agent(&mut self, message: Value) {
-            self.router
-                .handle(Event::AgentMessage { agent: 1, message });
+            let agent = self
+                .launcher
+                .launched
+                .borrow()
+                .last()
+                .expect("an agent must be launched")
+                .0;
+            self.router.handle(Event::AgentMessage { agent, message });
         }
 
         fn disconnect(&mut self, client: ClientId) {
@@ -2001,7 +2057,7 @@ mod tests {
 
         fn agent_messages(&self) -> Vec<Value> {
             let launched = self.launcher.launched.borrow();
-            let receiver = &launched[0].1;
+            let receiver = &launched.last().expect("an agent must be launched").1;
             std::iter::from_fn(|| receiver.try_recv().ok()).collect()
         }
 
@@ -2073,6 +2129,82 @@ mod tests {
                 {"optionId": "no", "name": "Reject", "kind": "reject_once"},
             ],
         }})
+    }
+
+    #[test]
+    fn stops_sessionless_agent_after_its_last_client_disconnects() {
+        let mut harness = Harness::new();
+        harness.attach(1);
+        harness.initialize(1);
+
+        harness.disconnect(1);
+
+        assert_eq!(harness.killed_agents(), vec![1]);
+        assert!(harness.router.agents[&1].stopping);
+
+        harness.attach(2);
+        assert_eq!(harness.launcher.launched.borrow().len(), 2);
+    }
+
+    #[test]
+    fn keeps_agent_running_after_disconnect_when_it_has_a_session() {
+        let mut harness = Harness::new();
+        harness.attach(1);
+        harness.initialize(1);
+        harness.new_session(1, "s1");
+
+        harness.disconnect(1);
+
+        assert!(harness.killed_agents().is_empty());
+        assert!(!harness.router.agents[&1].stopping);
+    }
+
+    #[test]
+    fn waits_for_session_creation_before_stopping_an_unused_agent() {
+        let mut harness = Harness::new();
+        harness.attach(1);
+        harness.initialize(1);
+        harness.from_client(
+            1,
+            json!({"jsonrpc": "2.0", "id": "new", "method": "session/new", "params": {"cwd": "/project", "mcpServers": []}}),
+        );
+        let request = harness.agent_messages().remove(0);
+
+        harness.disconnect(1);
+        assert!(harness.killed_agents().is_empty());
+
+        harness.from_agent(json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "error": {"code": INTERNAL_ERROR, "message": "creation failed"},
+        }));
+        assert_eq!(harness.killed_agents(), vec![1]);
+    }
+
+    #[test]
+    fn keeps_agent_when_session_creation_finishes_after_disconnect() {
+        let mut harness = Harness::new();
+        harness.attach(1);
+        harness.initialize(1);
+        harness.from_client(
+            1,
+            json!({"jsonrpc": "2.0", "id": "new", "method": "session/new", "params": {"cwd": "/project", "mcpServers": []}}),
+        );
+        let request = harness.agent_messages().remove(0);
+
+        harness.disconnect(1);
+        harness.from_agent(response_message(
+            request["id"].clone(),
+            json!({"sessionId": "s1"}),
+        ));
+
+        assert!(harness.killed_agents().is_empty());
+        assert!(
+            harness
+                .router
+                .sessions
+                .contains_key(&("claude".to_string(), "s1".to_string()))
+        );
     }
 
     #[test]
@@ -2240,6 +2372,52 @@ mod tests {
             )]
         );
         assert!(harness.client_messages(1).is_empty());
+    }
+
+    #[test]
+    fn deletes_empty_session_only_after_agent_success() {
+        let mut harness = Harness::new();
+        harness.attach(1);
+        harness.initialize(1);
+        harness.new_session(1, "empty");
+        let key = ("claude".to_string(), "empty".to_string());
+
+        for succeeds in [false, true] {
+            harness.from_client(
+                1,
+                json!({"jsonrpc": "2.0", "id": "delete", "method": "session/delete", "params": {"sessionId": "empty"}}),
+            );
+            let requests = harness.agent_messages();
+            assert_eq!(requests.len(), 1);
+            let request = requests.first().expect("delete must reach the agent");
+            assert_eq!(request["method"], "session/delete");
+            assert_eq!(request["params"]["sessionId"], "empty");
+            assert!(harness.router.sessions.contains_key(&key));
+
+            let response = if succeeds {
+                response_message(request["id"].clone(), json!({}))
+            } else {
+                json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32603, "message": "delete failed"}})
+            };
+            harness.from_agent(response);
+            assert_eq!(harness.router.sessions.contains_key(&key), !succeeds);
+            let responses = harness.client_messages(1);
+            assert_eq!(responses.len(), 1);
+            let response = responses
+                .first()
+                .expect("client must receive delete result");
+            assert_eq!(response["id"], "delete");
+            assert_eq!(response.get("error").is_some(), !succeeds);
+        }
+
+        harness.from_client(
+            1,
+            json!({"jsonrpc": "2.0", "id": "list", "method": "session/list", "params": {}}),
+        );
+        assert_eq!(
+            harness.client_messages(1),
+            vec![response_message(json!("list"), json!({"sessions": []}))]
+        );
     }
 
     #[test]

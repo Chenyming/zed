@@ -1,8 +1,8 @@
 //! Per-thread draft prompt persistence and display label rendering.
 //!
-//! Drafts are persisted in the thread metadata store with `session_id: None`,
-//! but their unsent prompt text is kept separately here so we don't have to
-//! plumb draft-prompt storage through the native agent's thread database.
+//! Unsent input is stored independently of session identity: an external agent
+//! already owns a session before the first message, but cannot restore the
+//! client's unsent prompt. Native drafts use this until their thread is saved.
 //!
 //! The display-label helpers ([`display_label_for_draft`] and friends) live
 //! alongside the storage so the sidebar's preview rendering can't drift from

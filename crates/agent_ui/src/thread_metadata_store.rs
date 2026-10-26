@@ -326,8 +326,7 @@ pub struct ThreadMetadata {
 }
 
 impl ThreadMetadata {
-    /// A thread is a draft until its first message is sent, at which point
-    /// it gets an ACP `session_id`.
+    /// A local draft has no persisted session to load or delete yet.
     pub fn is_draft(&self) -> bool {
         self.session_id.is_none()
     }
@@ -1353,10 +1352,13 @@ impl ThreadMetadataStore {
         let existing_thread = self.entry(thread_id);
         // Resuming without replay (or replay arriving later) can leave an
         // established session empty. Never erase its ID and reopen it as new.
-        let is_draft =
-            thread_ref.is_draft_thread() && existing_thread.is_none_or(ThreadMetadata::is_draft);
+        let is_native = view.agent_key().is_native();
+        let is_draft = is_native
+            && thread_ref.is_draft_thread()
+            && existing_thread.is_none_or(ThreadMetadata::is_draft);
 
-        // Draft session IDs may change on reload, so let's not save them until they're valid
+        // The native agent doesn't save empty threads. External agents already
+        // own a session, even before the user sends their first message.
         let session_id = if is_draft {
             None
         } else {
@@ -1405,7 +1407,7 @@ impl ThreadMetadataStore {
             .unwrap_or(worktree_paths.is_empty());
 
         let was_draft = existing_thread.map_or(true, |t| t.is_draft());
-        if was_draft && !is_draft {
+        if is_native && was_draft && !is_draft {
             // Draft has been promoted: drop its persisted prompt since the
             // promoted thread now owns its prompt state via the native
             // agent's thread database.
@@ -2852,7 +2854,47 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_draft_thread_metadata_promotes_on_first_message(cx: &mut TestAppContext) {
+    async fn test_native_draft_metadata_promotes_on_first_message(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None::<&Path>, cx).await;
+        let (panel, mut vcx) = setup_panel_with_project(project, cx);
+        crate::test_support::open_draft_with_connection(
+            &panel,
+            StubAgentConnection::new(),
+            &mut vcx,
+        );
+        let thread_id = crate::test_support::active_thread_id(&panel, &vcx);
+        let session_id = crate::test_support::active_session_id(&panel, &vcx);
+        cx.read(|cx| {
+            assert!(
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(thread_id)
+                    .unwrap()
+                    .is_draft()
+            );
+        });
+        let thread = panel.read_with(&vcx, |panel, cx| panel.active_agent_thread(cx).unwrap());
+        thread.update(&mut vcx, |thread, cx| {
+            thread.push_user_content_block(None, "Hello".into(), cx)
+        });
+        vcx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(thread_id)
+                    .unwrap()
+                    .session_id
+                    .as_ref(),
+                Some(&session_id)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_empty_external_thread_metadata_keeps_session_id(cx: &mut TestAppContext) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -2866,19 +2908,13 @@ mod tests {
         let session_id = thread.read_with(&vcx, |t, _| t.session_id().clone());
         let thread_id = crate::test_support::active_thread_id(&panel, &vcx);
 
-        // Empty (draft) threads are persisted with `session_id: None`.
         cx.read(|cx| {
             let store = ThreadMetadataStore::global(cx).read(cx);
             assert_eq!(store.entry_ids().count(), 1);
             let entry = store.entry(thread_id).expect("draft metadata row");
-            assert!(
-                entry.is_draft(),
-                "expected draft row to have session_id=None, got {:?}",
-                entry.session_id
-            );
+            assert_eq!(entry.session_id.as_ref(), Some(&session_id));
         });
 
-        // Updating the title while still a draft keeps the row as a draft.
         thread.update_in(&mut vcx, |thread, _window, cx| {
             thread.set_title("Draft Thread".into(), cx).detach();
         });
@@ -2887,14 +2923,13 @@ mod tests {
         cx.read(|cx| {
             let store = ThreadMetadataStore::global(cx).read(cx);
             let entry = store.entry(thread_id).expect("draft metadata row");
-            assert!(entry.is_draft(), "still a draft after title update");
+            assert_eq!(entry.session_id.as_ref(), Some(&session_id));
             assert_eq!(
                 entry.title.as_ref().map(|t| t.as_ref()),
                 Some("Draft Thread")
             );
         });
 
-        // Pushing content promotes the draft: session_id is now populated.
         thread.update_in(&mut vcx, |thread, _window, cx| {
             thread.push_user_content_block(None, "Hello".into(), cx);
         });

@@ -5798,7 +5798,7 @@ async fn test_sending_message_from_draft_promotes_in_place(cx: &mut TestAppConte
     connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
         acp_v1::ContentChunk::new("ok".into()),
     )]);
-    open_thread_with_connection(&panel, connection, cx);
+    agent_ui::test_support::open_draft_with_connection(&panel, connection, cx);
     let draft_id = panel.read_with(cx, |panel, cx| panel.active_thread_id(cx).unwrap());
 
     // Before sending: draft metadata row exists with session_id = None.
@@ -5839,10 +5839,6 @@ async fn test_sending_message_from_draft_promotes_in_place(cx: &mut TestAppConte
 
 #[gpui::test]
 async fn test_cmd_n_shows_new_thread_entry(cx: &mut TestAppContext) {
-    // When the user presses Cmd-N (NewThread action) while viewing a
-    // non-empty thread, the panel should switch to the draft thread and
-    // the sidebar should surface a "New {agent} Thread" placeholder row
-    // that mirrors the active empty draft.
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -5879,12 +5875,10 @@ async fn test_cmd_n_shows_new_thread_entry(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
-    // After Cmd-N the sidebar surfaces the active empty draft as a
-    // placeholder row above the real thread.
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec!["v [my-project]", "  New stub Thread", "  Hello *"],
-        "After Cmd-N the sidebar should show a placeholder row for the active empty draft"
+        vec!["v [my-project]", "  New Agent Thread *", "  Hello *"],
+        "the empty external session should appear as a regular thread"
     );
 
     // The panel should be on the draft and active_entry should track it.
@@ -5894,11 +5888,12 @@ async fn test_cmd_n_shows_new_thread_entry(cx: &mut TestAppContext) {
             "panel should be showing the draft after Cmd-N",
         );
     });
+    let new_session_id = active_session_id(&panel, cx);
     sidebar.read_with(cx, |sidebar, _cx| {
-        assert_active_draft(
+        assert_active_thread(
             sidebar,
-            &workspace,
-            "active_entry should be Draft after Cmd-N",
+            &new_session_id,
+            "new external session should be active",
         );
     });
 }
@@ -6001,18 +5996,15 @@ async fn test_cmd_n_shows_new_thread_entry_in_absorbed_worktree(cx: &mut TestApp
     });
     cx.run_until_parked();
 
-    // After Cmd-N the sidebar surfaces the active empty draft as a
-    // placeholder row. Its worktree chip identifies which workspace it
-    // belongs to (the linked worktree).
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
         vec![
             //
             "v [project]",
-            "  New stub Thread {wt-feature-a}",
+            "  New Agent Thread {wt-feature-a} *",
             "  Hello {wt-feature-a} *",
         ],
-        "After Cmd-N the sidebar should show a placeholder row for the active empty draft"
+        "the empty external session should retain its worktree association"
     );
 
     // The panel should be on the draft and active_entry should track it.
@@ -6022,26 +6014,20 @@ async fn test_cmd_n_shows_new_thread_entry_in_absorbed_worktree(cx: &mut TestApp
             "panel should be showing the draft after Cmd-N",
         );
     });
+    let new_session_id = active_session_id(&worktree_panel, cx);
     sidebar.read_with(cx, |sidebar, _cx| {
-        assert_active_draft(
+        assert_active_thread(
             sidebar,
-            &worktree_workspace,
-            "active_entry should be Draft after Cmd-N",
+            &new_session_id,
+            "new worktree session should be active",
         );
     });
 }
 
 #[gpui::test]
-async fn test_only_actively_viewed_empty_draft_is_visible_in_sidebar(cx: &mut TestAppContext) {
-    // The sidebar surfaces an empty-draft placeholder row only for the
-    // draft that the *active workspace's panel* is currently viewing.
-    // Specifically:
-    //   1. Empty ephemeral drafts in non-active workspaces (e.g. a
-    //      sibling linked-worktree panel) are hidden.
-    //   2. An empty ephemeral that is parked in its slot while the user
-    //      is viewing a real thread is hidden (it's not the active view).
-    //   3. When the active workspace switches, the placeholder follows
-    //      the new active panel's current view.
+async fn test_empty_drafts_remain_visible_when_switching_threads_and_workspaces(
+    cx: &mut TestAppContext,
+) {
     agent_ui::test_support::init_test(cx);
     cx.update(|cx| {
         ThreadStore::init_global(cx);
@@ -6128,14 +6114,8 @@ async fn test_only_actively_viewed_empty_draft_is_visible_in_sidebar(cx: &mut Te
     });
     cx.run_until_parked();
 
-    // The invariant under test is: at most one empty-draft placeholder is
-    // visible at a time, and it corresponds to the active workspace's
-    // panel's currently-active draft. Counting `is_empty_draft` rows is
-    // more robust than tracking specific thread_ids because draft
-    // creation flows can leave behind orphan ephemeral metadata that's
-    // also hidden by the filter.
     let empty_draft_rows =
-        |sidebar: &Entity<Sidebar>, cx: &mut gpui::VisualTestContext| -> Vec<ThreadId> {
+        |sidebar: &Entity<Sidebar>, cx: &mut gpui::VisualTestContext| -> HashSet<ThreadId> {
             sidebar.read_with(cx, |sidebar, _| {
                 sidebar
                     .contents
@@ -6159,20 +6139,20 @@ async fn test_only_actively_viewed_empty_draft_is_visible_in_sidebar(cx: &mut Te
             })
         };
 
-    // Baseline: main workspace active, main panel viewing its draft.
-    // Exactly one placeholder visible, matching the main panel's draft.
     let main_active_draft =
         active_panel_draft_id(&main_panel, cx).expect("main panel should be viewing a draft");
+    let worktree_active_draft = active_panel_draft_id(&worktree_panel, cx)
+        .expect("worktree panel should be viewing a draft");
     let visible = empty_draft_rows(&sidebar, cx);
-    assert_eq!(
-        visible,
-        vec![main_active_draft],
-        "exactly the main panel's active empty draft should be visible"
+    assert!(
+        visible.contains(&main_active_draft),
+        "the active workspace's empty draft should be visible"
+    );
+    assert!(
+        visible.contains(&worktree_active_draft),
+        "the inactive workspace's empty draft should also be visible"
     );
 
-    // Navigate the main panel AWAY from its draft to the real thread.
-    // The draft is no longer the active view of its panel, so its
-    // placeholder must disappear from the sidebar.
     main_panel.update_in(cx, |panel, window, cx| {
         panel.load_agent_thread(
             agent_ui::Agent::NativeAgent,
@@ -6194,25 +6174,94 @@ async fn test_only_actively_viewed_empty_draft_is_visible_in_sidebar(cx: &mut Te
             "main panel should now be viewing the real thread"
         );
     });
-    assert!(
-        empty_draft_rows(&sidebar, cx).is_empty(),
-        "no placeholder should be visible: main panel is on a real thread and worktree workspace is inactive"
+    assert_eq!(
+        empty_draft_rows(&sidebar, cx),
+        visible,
+        "switching to an existing thread must not hide empty drafts"
     );
 
-    // Switch the active workspace to the worktree. Now the worktree
-    // panel's draft is the active view, so its placeholder appears.
     multi_workspace.update_in(cx, |mw, window, cx| {
         mw.activate(worktree_workspace.clone(), None, window, cx);
     });
     cx.run_until_parked();
 
-    let worktree_active_draft = active_panel_draft_id(&worktree_panel, cx)
-        .expect("worktree panel should be viewing a draft");
-    let visible = empty_draft_rows(&sidebar, cx);
     assert_eq!(
+        empty_draft_rows(&sidebar, cx),
         visible,
-        vec![worktree_active_draft],
-        "exactly the worktree panel's active empty draft should be visible after switching workspaces"
+        "switching workspaces must not hide empty drafts"
+    );
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        let index = sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == main_active_draft)
+            })
+            .expect("the main workspace's empty draft should remain selectable");
+        sidebar.selection = Some(index);
+        sidebar.confirm(&Confirm, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        active_panel_draft_id(&main_panel, cx),
+        Some(main_active_draft),
+        "selecting the empty draft should reopen the same draft"
+    );
+    assert_eq!(
+        empty_draft_rows(&sidebar, cx),
+        visible,
+        "reopening a draft must not create another empty draft"
+    );
+
+    main_panel.update_in(cx, |panel, window, cx| {
+        panel.load_agent_thread(
+            agent_ui::Agent::NativeAgent,
+            main_real_thread_id,
+            None,
+            None,
+            false,
+            agent_ui::AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    let empty_draft_bounds = sidebar.read_with(cx, |sidebar, _| {
+        let index = sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == main_active_draft)
+            })
+            .expect("the inactive empty draft should remain visible");
+        sidebar
+            .list_state
+            .bounds_for_item(index)
+            .expect("the inactive empty draft should be rendered")
+    });
+    cx.simulate_mouse_move(empty_draft_bounds.center(), None, Modifiers::default());
+    let delete_button_bounds = cx
+        .debug_bounds("ICON-Trash")
+        .expect("the empty draft should have a delete button");
+    cx.simulate_click(delete_button_bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        assert!(
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(main_active_draft)
+                .is_none(),
+            "deleting an empty draft should remove its metadata"
+        );
+    });
+    assert!(
+        !empty_draft_rows(&sidebar, cx).contains(&main_active_draft),
+        "the deleted empty draft should disappear from the sidebar"
     );
 }
 
@@ -8974,6 +9023,124 @@ async fn test_delete_thread_preserves_local_worktree(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_delete_empty_external_session_uses_agent_delete(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let connection = StubAgentConnection::new()
+        .with_agent_id(AgentId::new("empty-deletion-test"))
+        .with_session_deletion();
+    open_thread_with_custom_connection(&panel, connection.clone(), cx);
+    let session_id = active_session_id(&panel, cx);
+    let thread_id = active_thread_id(&panel, cx);
+    cx.run_until_parked();
+    let bounds = sidebar.read_with(cx, |sidebar, _| {
+        let index = sidebar.contents.entries.iter().position(|entry| {
+            matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == thread_id)
+        }).expect("empty external session must be visible");
+        let Some(ListEntry::Thread(thread)) = sidebar.contents.entries.get(index) else {
+            panic!("expected thread");
+        };
+        assert_eq!(thread.metadata.session_id.as_ref(), Some(&session_id));
+        assert!(thread.draft.is_none());
+        sidebar
+            .list_state
+            .bounds_for_item(index)
+            .expect("empty session must be rendered")
+    });
+    cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
+    let delete = cx
+        .debug_bounds("ICON-Trash")
+        .expect("empty session must have Delete");
+    cx.simulate_click(delete.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(connection.deleted_sessions(), vec![session_id]);
+    cx.read(|cx| {
+        assert!(
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(thread_id)
+                .is_none()
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_delete_waits_for_pending_external_session(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let connection = StubAgentConnection::new()
+        .with_agent_id(AgentId::new("pending-deletion-test"))
+        .with_session_deletion();
+    let response = connection.defer_next_new_session_response();
+    open_thread_with_custom_connection(&panel, connection.clone(), cx);
+    let thread_id = active_thread_id(&panel, cx);
+    let conversation = panel.read_with(cx, |panel, _| {
+        panel.active_conversation_view().unwrap().clone()
+    });
+    assert!(conversation.read_with(cx, |view, _| view.is_loading()));
+
+    // A pre-upgrade draft has no session ID while its replacement is loading.
+    cx.update(|_, cx| {
+        let metadata = ThreadMetadata {
+            thread_id,
+            session_id: None,
+            agent_id: AgentId::new("pending-deletion-test"),
+            title: None,
+            title_override: None,
+            updated_at: Utc::now(),
+            created_at: None,
+            interacted_at: None,
+            worktree_paths: project.read(cx).worktree_paths(cx),
+            remote_connection: None,
+            archived: false,
+        };
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
+    });
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.delete_thread_by_id(thread_id, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(connection.deleted_sessions().is_empty());
+    cx.read(|cx| {
+        assert!(
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(thread_id)
+                .is_some()
+        )
+    });
+    response
+        .send(Ok(()))
+        .expect("session/new must not be cancelled by deletion");
+    cx.run_until_parked();
+    let session_id = conversation.read_with(cx, |view, cx| {
+        view.root_thread_view()
+            .unwrap()
+            .read(cx)
+            .thread
+            .read(cx)
+            .session_id()
+            .clone()
+    });
+    assert_eq!(connection.deleted_sessions(), vec![session_id]);
+    cx.read(|cx| {
+        assert!(
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(thread_id)
+                .is_none()
+        )
+    });
+    assert!(panel.read_with(cx, |panel, cx| {
+        panel.conversation_view_for_id(&thread_id, cx).is_none()
+    }));
+}
+
+#[gpui::test]
 async fn test_delete_thread_failure_keeps_metadata_for_retry(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/project", cx).await;
     let (multi_workspace, cx) =
@@ -8982,11 +9149,7 @@ async fn test_delete_thread_failure_keeps_metadata_for_retry(cx: &mut TestAppCon
     let connection = StubAgentConnection::new()
         .with_agent_id(AgentId::new("deletion-test"))
         .with_session_deletion();
-    connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
-        acp_v1::ContentChunk::new("Done".into()),
-    )]);
     open_thread_with_custom_connection(&panel, connection.clone(), cx);
-    send_message(&panel, cx);
     cx.run_until_parked();
     let session_id = active_session_id(&panel, cx);
     let thread_id = active_thread_id(&panel, cx);

@@ -590,7 +590,9 @@ impl Agent {
                 Rc::new(agent_servers::CustomAgentServer::new(name.clone()))
             }
             #[cfg(any(test, feature = "test-support"))]
-            Self::Stub => Rc::new(crate::test_support::StubAgentServer::default_response()),
+            Self::Stub => Rc::new(crate::test_support::StubAgentServer::new(
+                crate::test_support::stub_agent_connection(),
+            )),
         }
     }
 }

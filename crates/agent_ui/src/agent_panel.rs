@@ -1193,7 +1193,8 @@ impl AgentPanel {
                     let title = thread.title();
                     let work_dirs = thread.work_dirs().cloned();
                     SerializedActiveThread {
-                        session_id: (!is_draft_active).then(|| thread.session_id().0.to_string()),
+                        session_id: (!is_draft_active || !active_thread_agent.is_native())
+                            .then(|| thread.session_id().0.to_string()),
                         thread_id: active_thread_id,
                         agent_type: active_thread_agent.clone(),
                         title: title.map(|t| t.to_string()),
@@ -1931,6 +1932,11 @@ impl AgentPanel {
 
     fn draft_has_content(&self, draft: &Entity<ConversationView>, cx: &App) -> bool {
         let cv = draft.read(cx);
+        if !cv.agent_key().is_native() {
+            // Even an empty composer may own a session or have session/new
+            // in flight. Recycling it locally would orphan the agent's session.
+            return true;
+        }
         if cv.has_pending_selections() || cv.title_override(cx).is_some() || cv.has_saved_input() {
             return true;
         }
@@ -1981,8 +1987,8 @@ impl AgentPanel {
             _ => None,
         };
         if let Some(conversation_view) = active_matching {
+            self.draft_thread = Some(conversation_view.clone());
             self.observe_draft_editor(&conversation_view, cx);
-            self.draft_thread = Some(conversation_view);
             return;
         }
 
@@ -2022,8 +2028,8 @@ impl AgentPanel {
             window,
             cx,
         );
+        self.draft_thread = Some(thread.conversation_view.clone());
         self.observe_draft_editor(&thread.conversation_view, cx);
-        self.draft_thread = Some(thread.conversation_view);
     }
 
     pub fn new_external_agent_thread(
@@ -3159,12 +3165,14 @@ impl AgentPanel {
                 return draft.clone();
             }
 
-            // Clean up the old empty draft's metadata so it doesn't
-            // linger as a ghost entry in the sidebar.
             let old_draft_id = draft.read(cx).thread_id;
-            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                store.delete(old_draft_id, cx);
-            });
+            if draft.read(cx).agent_key().is_native() {
+                ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                    store.delete(old_draft_id, cx);
+                });
+            } else {
+                self.insert_retained_thread(old_draft_id, draft.clone(), cx);
+            }
 
             self.draft_thread = None;
             self._draft_editor_observation = None;
@@ -3194,6 +3202,14 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         if let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) {
+            if !conversation_view.read(cx).agent_key().is_native() {
+                if self.draft_thread.as_ref() == Some(conversation_view) {
+                    self.draft_thread = None;
+                    self._draft_editor_observation = None;
+                    self.serialize(cx);
+                }
+                return;
+            }
             self._draft_editor_observation = Some(cx.subscribe(
                 &acp_thread,
                 |this, acp_thread, event: &AcpThreadEvent, cx| {
@@ -3243,10 +3259,11 @@ impl AgentPanel {
             self._active_draft_reclaim_observation = None;
             return;
         }
-        let is_draft = conversation_view
-            .read(cx)
-            .root_thread(cx)
-            .is_some_and(|t| t.read(cx).is_draft_thread());
+        let conversation = conversation_view.read(cx);
+        let is_draft = conversation.agent_key().is_native()
+            && conversation
+                .root_thread(cx)
+                .is_some_and(|t| t.read(cx).is_draft_thread());
         if !is_draft {
             self._active_draft_reclaim_observation = None;
             return;
@@ -3295,9 +3312,10 @@ impl AgentPanel {
         let (thread_id, is_draft, is_empty) = {
             let conversation = conversation_view.read(cx);
             let thread_id = conversation.thread_id;
-            let is_draft = conversation
-                .root_thread(cx)
-                .is_some_and(|thread| thread.read(cx).is_draft_thread());
+            let is_draft = conversation.agent_key().is_native()
+                && conversation
+                    .root_thread(cx)
+                    .is_some_and(|thread| thread.read(cx).is_draft_thread());
             let is_empty = if let Some(thread_view) = conversation.active_thread() {
                 thread_view
                     .read(cx)
@@ -3335,9 +3353,13 @@ impl AgentPanel {
             let old_id = old_draft.read(cx).thread_id;
             let new_id = conversation_view.read(cx).thread_id;
             if old_id != new_id {
-                ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                    store.delete(old_id, cx);
-                });
+                if old_draft.read(cx).agent_key().is_native() {
+                    ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                        store.delete(old_id, cx);
+                    });
+                } else {
+                    self.insert_retained_thread(old_id, old_draft, cx);
+                }
             }
             self._draft_editor_observation = None;
         }
@@ -4218,13 +4240,10 @@ impl AgentPanel {
         cx: &App,
     ) -> Option<&Entity<ConversationView>> {
         self.retained_threads.get(thread_id).or_else(|| {
-            if let Some(view) = self.active_conversation_view()
-                && view.read(cx).thread_id == *thread_id
-            {
-                Some(view)
-            } else {
-                None
-            }
+            self.active_conversation_view()
+                .into_iter()
+                .chain(self.draft_thread.as_ref())
+                .find(|view| view.read(cx).thread_id == *thread_id)
         })
     }
 
@@ -4425,7 +4444,7 @@ impl AgentPanel {
             .iter()
             .filter(|(_id, view)| {
                 let view = view.read(cx);
-                if view.has_pending_selections() || view.has_saved_input() {
+                if view.is_loading() || view.has_pending_selections() || view.has_saved_input() {
                     return false;
                 }
                 let Some(thread_view) = view.root_thread_view() else {
@@ -4681,7 +4700,7 @@ impl AgentPanel {
         let is_draft = ThreadMetadataStore::try_global(cx)
             .and_then(|store| store.read(cx).entry(thread_id).map(|m| m.is_draft()))
             .unwrap_or(false);
-        let initial_content = is_draft
+        let initial_content = (is_draft || !agent.is_native())
             .then(|| crate::draft_prompt_store::read(thread_id, cx))
             .flatten()
             .map(|blocks| AgentInitialContent::ContentBlock {
@@ -4903,7 +4922,7 @@ impl AgentPanel {
                     .is_some_and(|active| active.entity_id() == draft.entity_id())
         })
     }
-    /// Whether the active thread is any kind of draft
+    /// Whether the active conversation has no messages, including external sessions.
     pub fn active_thread_is_draft(&self, cx: &App) -> bool {
         self.active_agent_thread(cx)
             .is_some_and(|thread| thread.read(cx).is_draft_thread())
@@ -6973,9 +6992,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ext_agent = Agent::Custom {
-            id: server.agent_id(),
-        };
+        let ext_agent = Agent::from(server.agent_id());
         let thread = self.create_agent_thread_with_server(
             ext_agent,
             Some(server),
@@ -6989,6 +7006,7 @@ impl AgentPanel {
             cx,
         );
         self.draft_thread = Some(thread.conversation_view.clone());
+        self.observe_draft_editor(&thread.conversation_view, cx);
         self.set_base_view(thread.into(), true, window, cx);
     }
 
@@ -8626,8 +8644,9 @@ mod tests {
             panel
         });
 
-        let _stub_connection =
-            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        let _stub_connection = crate::test_support::set_stub_agent_connection(
+            StubAgentConnection::new().with_supports_load_session(true),
+        );
         panel_a.update_in(cx, |panel, window, cx| {
             panel.selected_agent = Agent::Stub;
             panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
@@ -8969,9 +8988,103 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_draft_promotion_creates_metadata_and_new_session_on_reload(
+    async fn test_empty_external_session_is_not_reclaimed_or_discarded(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        crate::test_support::set_stub_agent_connection(
+            StubAgentConnection::new().with_supports_load_session(true),
+        );
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Stub;
+            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+        let thread_id = active_thread_id(&panel, &cx);
+        let session_id = active_session_id(&panel, &cx);
+        crate::test_support::type_draft_prompt(&panel, "unsent", &mut cx);
+        crate::test_support::type_draft_prompt(&panel, "", &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            let conversation = panel.active_conversation_view().unwrap().clone();
+            assert!(!panel.try_make_empty_draft_ephemeral(conversation, cx));
+            assert!(panel.draft_thread.is_none());
+            panel.new_external_agent_thread(
+                &NewExternalAgentThread {
+                    agent: agent::ZED_AGENT_ID.clone(),
+                },
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            assert_ne!(panel.active_thread_id(cx), Some(thread_id));
+            assert!(panel.retained_threads.contains_key(&thread_id));
+            assert_eq!(
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(thread_id)
+                    .unwrap()
+                    .session_id
+                    .as_ref(),
+                Some(&session_id)
+            );
+            assert!(crate::draft_prompt_store::read(thread_id, cx).is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_empty_external_session_load_failure_preserves_id_and_input(
         cx: &mut TestAppContext,
     ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = crate::test_support::set_stub_agent_connection(
+            StubAgentConnection::new().with_supports_load_session(true),
+        );
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Stub;
+            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+        let thread_id = active_thread_id(&panel, &cx);
+        let session_id = active_session_id(&panel, &cx);
+        crate::test_support::type_draft_prompt(&panel, "keep this input", &mut cx);
+        connection.set_next_load_error(anyhow!("agent unavailable"));
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.base_view = BaseView::Uninitialized;
+            panel.load_agent_thread(
+                Agent::Stub,
+                thread_id,
+                None,
+                None,
+                false,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            let view = panel.active_conversation_view().unwrap().read(cx);
+            assert!(!view.is_loading());
+            assert!(
+                view.root_thread(cx).is_none(),
+                "load failure must not create a new session"
+            );
+            assert_eq!(view.root_session_id.as_ref(), Some(&session_id));
+            assert_eq!(
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(thread_id)
+                    .unwrap()
+                    .session_id
+                    .as_ref(),
+                Some(&session_id)
+            );
+            assert!(crate::draft_prompt_store::read(thread_id, cx).is_some());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_empty_external_session_and_unsent_prompt_survive_reload(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
             agent::ThreadStore::init_global(cx);
@@ -9001,10 +9114,9 @@ mod tests {
             panel
         });
 
-        // Register a shared stub connection and use Agent::Stub so the draft
-        // (and any reloaded draft) uses it.
-        let stub_connection =
-            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        let stub_connection = crate::test_support::set_stub_agent_connection(
+            StubAgentConnection::new().with_supports_load_session(true),
+        );
         stub_connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
             acp::ContentChunk::new("Response".into()),
         )]);
@@ -9014,31 +9126,25 @@ mod tests {
         });
         cx.run_until_parked();
 
-        // Verify the thread is considered a draft.
         panel.read_with(cx, |panel, cx| {
             assert!(
                 panel.active_thread_is_draft(cx),
                 "thread should be a draft before any message is sent"
             );
             assert!(
-                panel.draft_thread.is_some(),
-                "draft_thread field should be set"
+                panel.draft_thread.is_none(),
+                "external sessions must not occupy the disposable draft slot"
             );
         });
         let draft_session_id = active_session_id(&panel, cx);
         let thread_id = active_thread_id(&panel, cx);
 
-        // A draft thread is persisted with session_id: None.
         cx.update(|_window, cx| {
             let store = ThreadMetadataStore::global(cx).read(cx);
             let entry = store
                 .entry(thread_id)
                 .expect("draft thread should have a metadata row");
-            assert!(
-                entry.is_draft(),
-                "draft thread metadata should have session_id=None, got {:?}",
-                entry.session_id,
-            );
+            assert_eq!(entry.session_id.as_ref(), Some(&draft_session_id));
         });
 
         // Type into the message editor; the editor observer pushes the text
@@ -9059,19 +9165,8 @@ mod tests {
                 panel.active_thread_is_draft(cx),
                 "reloaded panel should still show the draft as active"
             );
-            assert!(
-                panel.active_view_is_new_draft(cx),
-                "reloaded draft should still occupy the new-draft slot: \
-                 what's in the new-draft slot stays there across restarts, \
-                 regardless of whether it's also the active view"
-            );
-            let active_entity = panel.active_conversation_view().map(|v| v.entity_id());
-            let draft_entity = panel.draft_thread.as_ref().map(|v| v.entity_id());
-            assert!(
-                active_entity.is_some() && active_entity == draft_entity,
-                "active view and draft slot should share a single ConversationView entity \
-                 (active={active_entity:?}, draft={draft_entity:?})"
-            );
+            assert!(!panel.active_view_is_new_draft(cx));
+            assert!(panel.draft_thread.is_none());
         });
 
         // Thread identity is stable across reload — the metadata row we wrote
@@ -9082,12 +9177,10 @@ mod tests {
             "reloaded draft should preserve its ThreadId"
         );
 
-        // ACP session_id is NOT preserved: drafts don't persist a session id,
-        // so the reloaded ConversationView opens a fresh ACP session.
         let reloaded_session_id = active_session_id(&reloaded_panel, cx);
-        assert_ne!(
+        assert_eq!(
             reloaded_session_id, draft_session_id,
-            "reloaded draft should have a fresh ACP session ID"
+            "an empty external session must load the original ACP session"
         );
 
         let restored_text =
@@ -9098,11 +9191,13 @@ mod tests {
             "draft prompt text should be restored from the draft-prompt kvp store"
         );
 
-        // Send a message on the reloaded panel — this promotes the draft to a
-        // real thread. `ThreadId` stays the same; `session_id` is populated.
         let panel = reloaded_panel;
         let promoted_session_id = reloaded_session_id;
         send_message(&panel, cx);
+        cx.executor()
+            .advance_clock(crate::conversation_view::DRAFT_PROMPT_PERSIST_DEBOUNCE);
+        cx.run_until_parked();
+        cx.read(|cx| assert!(crate::draft_prompt_store::read(thread_id, cx).is_none()));
 
         panel.read_with(cx, |panel, cx| {
             assert!(
@@ -9136,7 +9231,7 @@ mod tests {
             );
         });
 
-        // Serialize the panel, then reload it again.
+        crate::test_support::type_draft_prompt(&panel, "next unsent message", cx);
         panel.update(cx, |panel, cx| panel.serialize(cx));
         cx.run_until_parked();
 
@@ -9155,15 +9250,22 @@ mod tests {
                 Some(thread_id),
                 "loaded panel should restore the promoted thread"
             );
-            assert!(
-                !panel.active_thread_is_draft(cx),
-                "restored thread should not be a draft"
+            assert!(panel.draft_thread.is_none());
+            assert_eq!(
+                panel.editor_text(thread_id, cx).as_deref(),
+                Some("next unsent message")
+            );
+            assert_eq!(
+                panel.active_agent_thread(cx).unwrap().read(cx).session_id(),
+                &promoted_session_id,
             );
         });
     }
 
     #[gpui::test]
-    async fn test_new_draft_survives_reload_when_real_thread_is_active(cx: &mut TestAppContext) {
+    async fn test_unsent_external_prompts_survive_reload_when_another_thread_is_active(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
         cx.update(|cx| {
             agent::ThreadStore::init_global(cx);
@@ -9188,11 +9290,9 @@ mod tests {
             panel
         });
 
-        // Register a shared stub connection under `Agent::Stub` so every
-        // ConversationView the panel creates in this test (including any
-        // post-reload rehydrations) reaches Connected synchronously.
-        let stub_connection =
-            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        let stub_connection = crate::test_support::set_stub_agent_connection(
+            StubAgentConnection::new().with_supports_load_session(true),
+        );
         stub_connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
             acp::ContentChunk::new("ok".into()),
         )]);
@@ -9261,8 +9361,8 @@ mod tests {
         assert_ne!(retained_draft_id, draft_thread_id);
         panel.read_with(cx, |panel, cx| {
             assert!(
-                panel.active_view_is_new_draft(cx),
-                "draft should currently occupy the new-draft slot"
+                !panel.active_view_is_new_draft(cx),
+                "external sessions do not occupy the local draft slot"
             );
         });
 
@@ -9306,9 +9406,9 @@ mod tests {
                 Some(real_thread_id),
                 "real thread should be the active view after reload"
             );
-            assert!(
-                !panel.active_thread_is_draft(cx),
-                "real thread is not a draft"
+            assert_eq!(
+                panel.active_agent_thread(cx).unwrap().read(cx).session_id(),
+                &real_session_id
             );
             assert!(
                 panel.draft_thread.is_none(),
@@ -9323,15 +9423,15 @@ mod tests {
                 .entry(draft_thread_id)
                 .expect("ephemeral draft metadata row should survive reload");
             assert!(
-                ephemeral_row.is_draft(),
-                "ephemeral draft row should still be a draft"
+                ephemeral_row.session_id.is_some(),
+                "external session identity must survive without a sent message"
             );
             let retained_row = store
                 .entry(retained_draft_id)
                 .expect("retained draft metadata row should survive reload");
             assert!(
-                retained_row.is_draft(),
-                "retained draft row should still be a draft"
+                retained_row.session_id.is_some(),
+                "parked external session identity must survive"
             );
             let real_row = store
                 .entry(real_thread_id)
@@ -9392,7 +9492,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_reloaded_ephemeral_draft_preserves_original_agent(cx: &mut TestAppContext) {
+    async fn test_reloaded_empty_external_session_preserves_original_agent(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
         cx.update(|cx| {
             agent::ThreadStore::init_global(cx);
@@ -9417,8 +9519,9 @@ mod tests {
             panel
         });
 
-        let _stub_connection =
-            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        let _stub_connection = crate::test_support::set_stub_agent_connection(
+            StubAgentConnection::new().with_supports_load_session(true),
+        );
         panel.update_in(cx, |panel, window, cx| {
             panel.selected_agent = Agent::Stub;
             panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
@@ -9461,9 +9564,9 @@ mod tests {
 
         reloaded_panel.read_with(cx, |panel, cx| {
             let draft_view = panel
-                .draft_thread
-                .as_ref()
-                .expect("draft slot should be repopulated");
+                .active_conversation_view()
+                .expect("external session should be restored");
+            assert!(panel.draft_thread.is_none());
             assert_eq!(
                 draft_view.read(cx).thread_id,
                 draft_thread_id,
@@ -13212,11 +13315,7 @@ mod tests {
             panel
         });
 
-        // Create a draft using the Stub agent, which connects synchronously.
-        panel.update_in(cx, |panel, window, cx| {
-            panel.selected_agent = Agent::Stub;
-            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
-        });
+        crate::test_support::open_draft_with_connection(&panel, StubAgentConnection::new(), cx);
         cx.run_until_parked();
 
         let initial_draft_id = panel.read_with(cx, |panel, _cx| {
@@ -13303,10 +13402,7 @@ mod tests {
         // Open an initial draft, type into it, then press `+` to park it
         // and create a fresh ephemeral. The fresh ephemeral is what we'll
         // expect to refocus later.
-        panel.update_in(cx, |panel, window, cx| {
-            panel.selected_agent = Agent::Stub;
-            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
-        });
+        crate::test_support::open_draft_with_connection(&panel, StubAgentConnection::new(), cx);
         cx.run_until_parked();
         let parked_thread_id = crate::test_support::active_thread_id(&panel, cx);
         crate::test_support::type_draft_prompt(&panel, "parked draft prompt", cx);
@@ -13327,7 +13423,7 @@ mod tests {
         // Activate the parked draft (simulates clicking it in the sidebar).
         panel.update_in(cx, |panel, window, cx| {
             panel.load_agent_thread(
-                Agent::Stub,
+                Agent::NativeAgent,
                 parked_thread_id,
                 None,
                 None,
@@ -13428,7 +13524,11 @@ mod tests {
         assert_ne!(ephemeral_thread_id, parked_thread_id);
         panel.read_with(cx, |panel, cx| {
             assert_eq!(
-                panel.draft_thread.as_ref().unwrap().read(cx).agent_key(),
+                panel
+                    .active_conversation_view()
+                    .unwrap()
+                    .read(cx)
+                    .agent_key(),
                 &Agent::Stub,
                 "ephemeral draft should be Stub agent"
             );
@@ -13479,6 +13579,15 @@ mod tests {
                 panel.retained_threads.contains_key(&parked_thread_id),
                 "parked draft should still be in retained_threads"
             );
+            assert!(panel.retained_threads.contains_key(&ephemeral_thread_id));
+            assert!(
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(ephemeral_thread_id)
+                    .unwrap()
+                    .session_id
+                    .is_some()
+            );
         });
     }
 
@@ -13527,7 +13636,7 @@ mod tests {
         cx.run_until_parked();
 
         let initial_draft_id = panel.read_with(cx, |panel, _cx| {
-            panel.draft_thread.as_ref().unwrap().entity_id()
+            panel.active_conversation_view().unwrap().entity_id()
         });
         let initial_thread_id =
             panel.read_with(cx, |panel, cx| panel.active_thread_id(cx).unwrap());
@@ -13550,7 +13659,10 @@ mod tests {
 
         // A new draft should have been created for the Stub agent.
         panel.read_with(cx, |panel, cx| {
-            let draft = panel.draft_thread.as_ref().expect("draft should exist");
+            let draft = panel
+                .active_conversation_view()
+                .expect("external session should exist");
+            assert!(panel.draft_thread.is_none());
             assert_ne!(
                 draft.entity_id(),
                 initial_draft_id,
