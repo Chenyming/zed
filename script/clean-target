@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+fail() {
+    echo "$*" >&2
+    exit 2
+}
+
+repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+target_dir="${CARGO_TARGET_DIR:-$repository_root/target}"
+show_help=false
+dry_run=false
+clean_incremental=false
+clean_build_cache=false
+clean_debug=false
+clean_release=false
+clean_all=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --incremental)
+            clean_incremental=true
+            shift
+            ;;
+        --build-cache)
+            clean_build_cache=true
+            shift
+            ;;
+        --debug)
+            clean_debug=true
+            shift
+            ;;
+        --release)
+            clean_release=true
+            shift
+            ;;
+        --all)
+            clean_all=true
+            shift
+            ;;
+        --dry-run)
+            dry_run=true
+            shift
+            ;;
+        --target-dir)
+            [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || fail "--target-dir 缺少参数"
+            target_dir="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_help=true
+            shift
+            ;;
+        *) fail "未知参数: $1；使用 --help 查看用法" ;;
+    esac
+done
+
+if [[ "$target_dir" != /* ]]; then
+    target_dir="$repository_root/$target_dir"
+fi
+
+if [[ -e "$target_dir" ]]; then
+    [[ -d "$target_dir" && ! -L "$target_dir" ]] || fail "target 路径必须是普通目录: $target_dir"
+    target_dir="$(cd "$target_dir" && pwd -P)"
+fi
+
+directory_kib() {
+    if [[ -d "$1" ]]; then
+        du -sk "$1" 2>/dev/null | awk '{print $1}'
+    else
+        echo 0
+    fi
+}
+
+paths_kib() {
+    local total=0 path size
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        size=$(directory_kib "$path")
+        total=$((total + size))
+    done
+    echo "$total"
+}
+
+human_kib() {
+    awk -v kib="$1" 'BEGIN {
+        if (kib >= 1048576) printf "%.1f GB", kib / 1048576;
+        else if (kib >= 1024) printf "%.1f MB", kib / 1024;
+        else printf "%d KB", kib;
+    }'
+}
+
+profile_paths() {
+    local profile="$1"
+    [[ -d "$target_dir" ]] || return 0
+    find "$target_dir" -mindepth 1 -maxdepth 2 -type d -name "$profile" -print
+}
+
+named_cache_paths() {
+    local name="$1"
+    [[ -d "$target_dir" ]] || return 0
+    find "$target_dir" -type d -name "$name" -print
+}
+
+incremental_kib=$(named_cache_paths incremental | paths_kib)
+build_cache_kib=$(named_cache_paths build | paths_kib)
+debug_kib=$(profile_paths debug | paths_kib)
+release_kib=$(profile_paths release | paths_kib)
+all_kib=$(directory_kib "$target_dir")
+
+usage() {
+    cat <<USAGE
+用法: ./script/clean-target [清理范围...] [选项]
+
+清理 Cargo target 目录。帮助中的空间来自当前磁盘扫描，是实际占用的近似值。
+
+清理范围:
+  --incremental   增量编译缓存，预计释放 $(human_kib "$incremental_kib")
+                  下次编译会变慢，但保留已编译依赖和可执行文件
+  --build-cache   build.rs 输出及原生依赖缓存，预计释放 $(human_kib "$build_cache_kib")
+                  Cargo 会在需要时重新运行构建脚本，可能重新下载或编译大型依赖
+  --debug         所有 host/target 的 debug 与测试产物，预计释放 $(human_kib "$debug_kib")
+  --release       所有 host/target 的 release 产物，预计释放 $(human_kib "$release_kib")
+  --all           整个 target 目录，预计释放 $(human_kib "$all_kib")
+
+选项:
+  --dry-run       只显示本次会删除的目录和预计释放空间
+  --target-dir D  指定 Cargo target 目录，默认 CARGO_TARGET_DIR 或 <仓库>/target
+  -h, --help      扫描 target 并显示本帮助
+
+可以组合多个清理范围；重叠目录只计算和删除一次，因此各项空间不可直接相加。
+示例:
+  ./script/clean-target --incremental
+  ./script/clean-target --debug --release --dry-run
+  ./script/clean-target --all
+USAGE
+}
+
+if [[ "$show_help" == true ]]; then
+    usage
+    exit 0
+fi
+
+if [[ "$clean_incremental" == false && "$clean_build_cache" == false &&
+    "$clean_debug" == false && "$clean_release" == false && "$clean_all" == false ]]; then
+    usage >&2
+    exit 2
+fi
+
+if [[ ! -d "$target_dir" ]]; then
+    echo "target 目录不存在，无需清理: $target_dir"
+    exit 0
+fi
+
+[[ -f "$target_dir/CACHEDIR.TAG" ]] ||
+    fail "拒绝清理缺少 Cargo CACHEDIR.TAG 的目录: $target_dir"
+grep -q 'cache directory tag created by cargo' "$target_dir/CACHEDIR.TAG" ||
+    fail "拒绝清理无法识别的缓存目录: $target_dir"
+[[ "$target_dir" != / && "$target_dir" != "$repository_root" ]] ||
+    fail "拒绝清理不安全的路径: $target_dir"
+
+selected_paths=()
+
+add_selected_path() {
+    local candidate="$1" existing
+    local retained_paths=()
+    [[ -d "$candidate" ]] || return 0
+    if [[ ${#selected_paths[@]} -gt 0 ]]; then
+        for existing in "${selected_paths[@]}"; do
+            if [[ "$candidate" == "$existing" || "$candidate" == "$existing/"* ]]; then
+                return 0
+            fi
+        done
+
+        for existing in "${selected_paths[@]}"; do
+            if [[ "$existing" != "$candidate/"* ]]; then
+                retained_paths+=("$existing")
+            fi
+        done
+    fi
+    if [[ ${#retained_paths[@]} -gt 0 ]]; then
+        selected_paths=("${retained_paths[@]}" "$candidate")
+    else
+        selected_paths=("$candidate")
+    fi
+}
+
+if [[ "$clean_all" == true ]]; then
+    add_selected_path "$target_dir"
+else
+    if [[ "$clean_debug" == true ]]; then
+        while IFS= read -r path; do add_selected_path "$path"; done < <(profile_paths debug)
+    fi
+    if [[ "$clean_release" == true ]]; then
+        while IFS= read -r path; do add_selected_path "$path"; done < <(profile_paths release)
+    fi
+    if [[ "$clean_incremental" == true ]]; then
+        while IFS= read -r path; do add_selected_path "$path"; done < <(named_cache_paths incremental)
+    fi
+    if [[ "$clean_build_cache" == true ]]; then
+        while IFS= read -r path; do add_selected_path "$path"; done < <(named_cache_paths build)
+    fi
+fi
+
+if [[ ${#selected_paths[@]} -eq 0 ]]; then
+    echo "所选范围当前没有可清理内容。"
+    exit 0
+fi
+
+selected_kib=0
+for path in "${selected_paths[@]}"; do
+    size=$(directory_kib "$path")
+    selected_kib=$((selected_kib + size))
+    echo "$(human_kib "$size")  $path"
+done
+echo "预计释放: $(human_kib "$selected_kib")"
+
+if [[ "$dry_run" == true ]]; then
+    echo "dry-run：未删除任何内容。"
+    exit 0
+fi
+
+before_kib=$(directory_kib "$target_dir")
+for path in "${selected_paths[@]}"; do
+    rm -rf -- "$path"
+done
+after_kib=$(directory_kib "$target_dir")
+freed_kib=$((before_kib - after_kib))
+echo "清理完成，target 占用减少约 $(human_kib "$freed_kib")。"
