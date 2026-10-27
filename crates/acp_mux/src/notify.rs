@@ -253,20 +253,13 @@ fn curl_quote(value: &str) -> String {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use std::sync::Mutex;
-
-    fn recording_sender() -> (SendNotification, Arc<Mutex<Vec<Notification>>>) {
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let send: SendNotification = Arc::new({
-            let sent = sent.clone();
-            move |notification| {
-                sent.lock()
-                    .expect("notification lock poisoned")
-                    .push(notification);
-                Box::pin(async { Ok(()) })
-            }
+    fn recording_sender() -> (SendNotification, Receiver<Notification>) {
+        let (sent, received) = smol::channel::unbounded();
+        let send: SendNotification = Arc::new(move |notification| {
+            sent.try_send(notification).expect("recording notification");
+            Box::pin(async { Ok(()) })
         });
-        (send, sent)
+        (send, received)
     }
 
     fn input_requested(key: &str) -> Notice {
@@ -282,7 +275,7 @@ mod tests {
     fn announces_unanswered_requests_and_finished_turns() {
         let (send, sent) = recording_sender();
         let (notices, receiver) = smol::channel::unbounded();
-        smol::block_on(async {
+        let sent = smol::block_on(async {
             let runner = smol::spawn(run(receiver, Duration::from_millis(100), send));
             notices.send(input_requested("answered")).await.ok();
             notices
@@ -300,12 +293,28 @@ mod tests {
                 })
                 .await
                 .ok();
-            smol::Timer::at(Instant::now() + Duration::from_millis(300)).await;
+            // Wait for delivery rather than assuming the runner was scheduled
+            // within a fixed delay on a busy build host.
+            let received = async {
+                vec![
+                    sent.recv().await.expect("turn notification"),
+                    sent.recv().await.expect("permission notification"),
+                ]
+            };
+            let timeout = smol::Timer::at(Instant::now() + Duration::from_secs(5));
+            futures::pin_mut!(received, timeout);
+            let mut notifications = match futures::future::select(received, timeout).await {
+                futures::future::Either::Left((notifications, _)) => notifications,
+                futures::future::Either::Right(_) => panic!("timed out waiting for notifications"),
+            };
             drop(notices);
             runner.await;
+            while let Ok(notification) = sent.try_recv() {
+                notifications.push(notification);
+            }
+            notifications
         });
 
-        let sent = sent.lock().expect("notification lock poisoned").clone();
         assert_eq!(
             sent,
             vec![

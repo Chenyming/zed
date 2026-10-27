@@ -176,8 +176,62 @@ pub fn wrap_command(
     key_env: impl IntoIterator<Item = String>,
 ) -> Result<(PathBuf, Vec<String>)> {
     let executable = std::env::current_exe().context("resolving the remote server executable")?;
+    wrap_command_with_executable(executable, agent_name, program, args, key_env)
+}
+
+pub fn wrap_local_command(
+    agent_name: &str,
+    program: &Path,
+    args: &[String],
+    key_env: impl IntoIterator<Item = String>,
+) -> Result<Option<(PathBuf, Vec<String>)>> {
+    let Some(config) = Config::load()? else {
+        return Ok(None);
+    };
+    if !config.wraps_agent(agent_name) {
+        return Ok(None);
+    }
+    let executable = std::env::current_exe().context("resolving the Zed executable")?;
+    let directory = executable
+        .parent()
+        .context("Zed executable has no parent")?;
+    let helper = directory.join("zed-acp-mux");
+    anyhow::ensure!(
+        helper.is_file(),
+        "acp-mux is enabled but {} is missing; build or install zed-acp-mux alongside Zed",
+        helper.display()
+    );
+    // Attach records its actual cwd in PWD, so local projects never reuse a
+    // process started with another project's working directory.
+    let (helper, mut args) = wrap_command_with_executable(
+        helper,
+        agent_name,
+        program,
+        args,
+        key_env.into_iter().chain(["PWD".to_string()]),
+    )?;
+    if let Some(directory) = paths::custom_data_dir() {
+        args.splice(
+            0..0,
+            [
+                "--user-data-dir".to_string(),
+                directory.to_string_lossy().into_owned(),
+            ],
+        );
+    }
+    Ok(Some((helper, args)))
+}
+
+fn wrap_command_with_executable(
+    executable: PathBuf,
+    agent_name: &str,
+    program: &Path,
+    args: &[String],
+    key_env: impl IntoIterator<Item = String>,
+) -> Result<(PathBuf, Vec<String>)> {
     let mut key_env = key_env.into_iter().collect::<Vec<_>>();
     key_env.sort();
+    key_env.dedup();
     let mut wrapped = vec![
         "acp-mux".to_string(),
         "attach".to_string(),
@@ -207,7 +261,10 @@ fn pid_path() -> PathBuf {
 }
 
 fn log_path() -> PathBuf {
-    paths::logs_dir().join("acp-mux.log")
+    paths::custom_data_dir()
+        .map(|directory| directory.join("logs"))
+        .unwrap_or_else(|| paths::logs_dir().clone())
+        .join("acp-mux.log")
 }
 
 fn config_path() -> PathBuf {

@@ -1,9 +1,10 @@
 # acp-mux 使用方法
 
-acp-mux 让 SSH 远程项目里的外部 ACP agent 在 Linux 服务端常驻运行，像 tmux 一样
+acp-mux 让本地项目或 SSH 远程项目里的外部 ACP agent 常驻运行，像 tmux 一样
 可以随时断开（detach）和重新连接（attach）：
 
-- 在 agent 线程里发起任务后，可以关掉 Zed、合上笔记本或断网，agent 在服务端继续执行。
+- 本地项目：退出 Zed 后，agent 在本机继续执行；计算机需要保持运行，系统睡眠时任务不能继续推进。
+- SSH 远程项目：可以关掉 Zed、合上笔记本或断网，agent 在服务端继续执行。
 - 重新连接并打开这个线程，可以看到断开期间产生的消息、工具调用和 diff，以及等待授权的请求。
 - 如果 agent 还在执行，线程显示"生成中"，可以停止，结束时有通知（需要 Mac 端 Zed 也包含 acp-mux 的修改，见[版本要求](#requirements)）。
 - 可选：用手机或浏览器查看会话、发消息、批准工具调用和停止任务（见[网页和手机访问](#web)），并在等待授权或任务结束时收到推送通知（见[通知](#notify)）。
@@ -15,7 +16,7 @@ acp-mux 让 SSH 远程项目里的外部 ACP agent 在 Linux 服务端常驻运�
 
 ### 外部 agent：开启后接入
 
-acp-mux 不维护白名单。开启后，SSH 远程项目里由 Zed 启动的外部 ACP agent 都会接入，
+acp-mux 不维护内置白名单。开启后，本地项目或 SSH 远程项目里由 Zed 启动的外部 ACP agent 都会接入，
 包括 ACP 注册表中的 agent 和自定义 agent。agent 的名称就是 Zed 设置
 `agent_servers` 中的键名，内置的几个名称是：
 
@@ -30,23 +31,66 @@ acp-mux 不维护白名单。开启后，SSH 远程项目里由 Zed 启动的外
 不确定名称时，可以先不限制 agent，连接后执行 `acp-mux list`（见[管理命令](#commands)），
 第一列就是名称。
 
-验证情况：目前只用脚本化的假 agent 在 Linux 上验证过完整流程，**还没有用以上真实 agent
-测试过**。agent 需要能在不使用 Zed 的文件读写和终端能力的情况下工作（用自己的工具读写
+验证情况：自动化测试使用脚本化的假 agent，覆盖本地 helper 的断开重连、项目隔离和数据目录隔离，
+以及远程 daemon 的会话流程。**真实 Zed 窗口与以上真实 agent 的本地完整流程仍需验证**。
+agent 需要能在不使用 Zed 的文件读写和终端能力的情况下工作（用自己的工具读写
 文件、执行命令），常见的 agent 都是这样，但需要逐个实测。
 
 ### Zed 内置 agent：不接入
 
 Zed 内置的 agent（Zed Agent）运行在 Mac 上的 Zed 进程里，通过远程项目读写 Linux 上的
 文件，不会在 Linux 上启动 agent 进程，所以**始终不经过 acp-mux**，断开连接后任务会停止。
-这一点与配置无关。
+这一点与配置无关。本机接入的一期只支持外部 ACP agent，Zed 内置 Agent 留到二期。
 
 ### 其他不接入的情况
 
-- 本地项目：agent 直接在 Mac 上运行，不经过 remote server。
+- Windows 本地项目：不支持本机 mux。
 - Windows 远端：acp-mux 只在 Unix 上编译。
 - WSL 和 Docker 连接也使用 remote server，在其中放置配置文件同样会开启，但没有验证过。
 - 配置文件不存在，或没有设置 `"enabled": true`。
 - 设置了 `agents`，但 agent 名称不在列表里。
+
+## 本地项目开启 {#local}
+
+macOS 打包版本包含 `zed-acp-mux` helper，与 Zed 主程序放在同一个文件夹。
+使用 `script/build-mac.sh` 或 `script/bundle-mac` 构建时会自动编译它。
+开发构建需要同时编译 helper，例如先执行 `cargo build -p acp_mux --bin zed-acp-mux`，
+再运行同一构建配置下的 Zed。其他 Unix 本地构建也需要把 helper 放在 Zed 可执行文件旁。
+
+在本机 `~/.config/zed/acp_mux.json` 中开启，建议先选择一个 agent：
+
+```json
+{
+  "enabled": true,
+  "agents": ["codex-acp"]
+}
+```
+
+如果 Zed 使用 `--user-data-dir <目录>`，配置文件位于 `<目录>/config/acp_mux.json`。
+Zed 会把这个目录传给 helper 和 daemon，隔离它们的配置、socket 和会话。
+
+重新建立 agent 连接后生效，已有直连会话不会自动迁入 mux。配置格式错误或 helper 缺失时，
+Zed 会报告启动错误，不会回退到直接启动 agent。不同项目按实际工作目录隔离 agent 进程，
+同一项目且命令、相关环境一致的连接可以复用进程。
+
+在终端中使用 app 内的 helper 管理本机会话（应用名称按安装版本调整）：
+
+```sh
+"/Applications/Zed.app/Contents/MacOS/zed-acp-mux" acp-mux list
+"/Applications/Zed.app/Contents/MacOS/zed-acp-mux" acp-mux kill --agent codex-acp
+"/Applications/Zed.app/Contents/MacOS/zed-acp-mux" acp-mux restart
+```
+
+`restart` 会中断该 daemon 管理的所有任务。使用自定义数据目录时，在 `acp-mux` 前加上
+`--user-data-dir <目录>`，确保管理的是对应实例。
+
+macOS 默认 socket 位于 `~/Library/Application Support/Zed/server_state/acp-mux/daemon.sock`，
+日志位于 `~/Library/Logs/Zed/acp-mux.log`。网页和通知使用本文相同的配置，在本机 daemon 上运行。
+
+本地接入同样受[功能限制](#limitations)约束：agent 的文件工具读取磁盘上的内容，不能自动读取
+Zed 未保存的 buffer；依赖 Zed 进程提供服务的 MCP 连接也不能保证在退出后继续工作。
+当前 mux 支持 ACP v1，Zed 会从 ACP v2 回退；仅支持 ACP v2 的 agent 暂不接入。
+这里的 ACP 版本与 mux 自己的握手协议版本不同。
 
 ## 版本要求 {#requirements}
 
@@ -58,7 +102,7 @@ Zed 内置的 agent（Zed Agent）运行在 Mac 上的 Zed 进程里，通过远
 
 编译和上传 remote_server 的方法见 [独立编译 Linux Remote Server](./linux-remote-server-build.zh-CN.md)。
 
-## 开启 {#enable}
+## SSH 远程项目开启 {#enable}
 
 在 **Linux 服务端** 创建 `~/.config/zed/acp_mux.json`（设置了 `XDG_CONFIG_HOME`
 时为 `$XDG_CONFIG_HOME/zed/acp_mux.json`）。注意不是 Mac 上的文件，也不是 Zed 的
@@ -102,7 +146,7 @@ Zed 内置的 agent（Zed Agent）运行在 Mac 上的 Zed 进程里，通过远
 
 生效时机：
 
-- `enabled` 和 `agents`：每次建立远程连接时读取。修改后，在 Zed 中断开并重新连接 Linux 才生效。
+- `enabled` 和 `agents`：本地项目每次建立 agent 连接时读取；远程项目每次建立远程连接时读取，修改后需断开并重新连接 Linux。
 - `auto_approve`、`gateway`、`notify`、`auto_generate_thread_title`：daemon 启动时读取。修改后执行 `acp-mux restart` 才生效。
 
 配置文件格式错误时，远程连接会忽略它并按未开启处理，错误记录在 remote server 的日志里。
@@ -279,7 +323,7 @@ daemon 保存这个名字并推送给网页等其他客户端，不转发给 age
 
 ## 与不使用 acp-mux 的区别 {#limitations}
 
-- **改动审阅不可用**：agent 直接在 Linux 上写文件，不经过 Zed，所以"审阅、保留或撤销改动"不可用。工具调用里附带的 diff 仍然可以看到。
+- **改动审阅不可用**：agent 直接在运行所在的主机上写文件，不经过 Zed，所以"审阅、保留或撤销改动"不可用。工具调用里附带的 diff 仍然可以看到。
 - **没有内嵌终端**：agent 自己执行命令，输出以工具调用内容的形式显示。
 - **agent 进程常驻**：断开所有连接后 agent 也不会退出，会一直占用内存，需要时用 `acp-mux kill --agent` 结束。
 - **会话不持久化**：daemon 重启（`acp-mux restart`、服务器重启）后，会话内容只保存在内存里的部分会丢失。agent 自己支持加载历史会话时，仍可以从 agent 恢复。

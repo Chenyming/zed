@@ -32,17 +32,18 @@ pub fn run(agent: String, key_env: Vec<String>, command: Vec<String>) -> Result<
         return Err(error).with_context(|| format!("executing {program}"));
     }
 
-    let spec = AgentSpec {
+    let cwd = std::env::current_dir().context("resolving the agent working directory")?;
+    let mut spec = AgentSpec {
         program: program.clone(),
         args: args.to_vec(),
         env: std::env::vars_os()
             .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
             .collect(),
-        cwd: std::env::current_dir()
-            .ok()
-            .map(|cwd| cwd.to_string_lossy().into_owned()),
+        cwd: Some(cwd.to_string_lossy().into_owned()),
         key_env,
     };
+    spec.env
+        .insert("PWD".to_string(), cwd.to_string_lossy().into_owned());
 
     let stream = connect_or_spawn_daemon()?;
     let mut from_daemon = control::handshake(
@@ -149,6 +150,9 @@ fn spawn_daemon() -> Result<()> {
         .with_context(|| format!("opening {}", log_path.display()))?;
 
     let mut command = std::process::Command::new(executable);
+    if let Some(directory) = paths::custom_data_dir() {
+        command.arg("--user-data-dir").arg(directory);
+    }
     command.args(["acp-mux", "daemon"]).current_dir("/");
     // SAFETY: setsid is async-signal-safe. A new session detaches the daemon
     // from the SSH session, so it survives the connection closing.

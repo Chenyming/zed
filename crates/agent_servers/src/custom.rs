@@ -271,6 +271,30 @@ impl AgentServer for CustomAgentServer {
                     anyhow::Ok(agent.get_command(vec![], extra_env, &mut cx.to_async()))
                 })??
                 .await?;
+            #[cfg(unix)]
+            let command = if project.read_with(cx, |project, _| project.is_local()) {
+                let agent_id = agent_id.clone();
+                cx.background_spawn(async move {
+                    let mut command = command;
+                    let key_env = command
+                        .env
+                        .iter()
+                        .flat_map(|environment| environment.keys().cloned());
+                    if let Some((path, args)) = acp_mux::wrap_local_command(
+                        agent_id.as_ref(),
+                        &command.path,
+                        &command.args,
+                        key_env,
+                    )? {
+                        command.path = path;
+                        command.args = args;
+                    }
+                    anyhow::Ok(command)
+                })
+                .await?
+            } else {
+                command
+            };
             let connection = crate::acp::connect(
                 agent_id,
                 project,

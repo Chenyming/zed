@@ -118,6 +118,10 @@ pub fn set_custom_data_dir(dir: &str) -> &'static PathBuf {
     })
 }
 
+pub fn custom_data_dir() -> Option<&'static Path> {
+    CUSTOM_DATA_DIR.get().map(PathBuf::as_path)
+}
+
 /// Returns the path to the configuration directory used by Zed.
 pub fn config_dir() -> &'static PathBuf {
     CONFIG_DIR.get_or_init(|| {

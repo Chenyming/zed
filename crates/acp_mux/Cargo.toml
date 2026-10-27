@@ -12,6 +12,10 @@ workspace = true
 path = "src/acp_mux.rs"
 doctest = false
 
+[[bin]]
+name = "zed-acp-mux"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 async-tungstenite.workspace = true

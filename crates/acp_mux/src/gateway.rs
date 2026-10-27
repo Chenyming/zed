@@ -678,7 +678,9 @@ mod tests {
             "test".into(),
         ));
         let token = loop {
-            if let Ok(token) = std::fs::read_to_string(&token_path) {
+            if let Ok(token) = std::fs::read_to_string(&token_path)
+                && token.ends_with('\n')
+            {
                 break token.trim().to_string();
             }
             std::thread::sleep(Duration::from_millis(10));

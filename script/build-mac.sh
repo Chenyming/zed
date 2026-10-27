@@ -181,6 +181,9 @@ if [[ "$mode" == "binaries" ]]; then
     fi
     cargo "$@"
 
+    cargo --config .cargo/bundle-config.toml build --release \
+        --package acp_mux --bin zed-acp-mux --target "$TARGET_TRIPLE"
+
     if [[ "$build_remote_server" == true ]]; then
         # remote_server 单独一次调用,避免其他 crate 的 feature 统一影响它
         # 依赖的动态库。
@@ -190,7 +193,8 @@ if [[ "$mode" == "binaries" ]]; then
     fi
 
     echo "二进制产物:"
-    set -- "target/${TARGET_TRIPLE}/release/zed" "target/${TARGET_TRIPLE}/release/cli"
+    set -- "target/${TARGET_TRIPLE}/release/zed" "target/${TARGET_TRIPLE}/release/cli" \
+        "target/${TARGET_TRIPLE}/release/zed-acp-mux"
     if [[ "$build_remote_server" == true ]]; then
         set -- "$@" "target/${TARGET_TRIPLE}/release/remote_server"
     fi
