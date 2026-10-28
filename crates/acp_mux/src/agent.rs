@@ -199,7 +199,10 @@ pub fn client_initialize_response(agent_response: &Value) -> Value {
         *meta = json!({});
     }
     if let Some(meta) = meta.as_object_mut() {
-        meta.insert(META_KEY.into(), json!({"protocol": PROTOCOL_VERSION}));
+        meta.insert(
+            META_KEY.into(),
+            json!({"protocol": PROTOCOL_VERSION, "sessionLifecycle": true}),
+        );
     }
     response
 }
@@ -341,7 +344,7 @@ mod tests {
                     "sessionCapabilities": {"list": {}, "close": {}},
                 },
                 "authMethods": [],
-                "_meta": {"zed.dev/acpMux": {"protocol": PROTOCOL_VERSION}},
+                "_meta": {"zed.dev/acpMux": {"protocol": PROTOCOL_VERSION, "sessionLifecycle": true}},
             })
         );
     }

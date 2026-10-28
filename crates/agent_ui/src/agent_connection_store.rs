@@ -88,6 +88,7 @@ pub struct AgentConnectionStore {
     project: Entity<Project>,
     entries: HashMap<Agent, Entity<AgentConnectionEntry>>,
     owned_connections: Vec<Weak<dyn AgentConnection>>,
+    session_sync_tasks: Vec<(Weak<dyn AgentConnection>, Task<()>)>,
     shutdown: Option<watch::Sender<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -159,6 +160,7 @@ impl AgentConnectionStore {
             project,
             entries: HashMap::default(),
             owned_connections: Vec::new(),
+            session_sync_tasks: Vec::new(),
             shutdown: Some(shutdown),
             _subscriptions: vec![subscription, quit],
         }
@@ -166,6 +168,7 @@ impl AgentConnectionStore {
 
     fn shutdown_connections(&mut self) {
         drop(self.shutdown.take());
+        self.session_sync_tasks.clear();
         // Cache replacement must not hide a connection retained by an older view or receipt.
         for connection in self
             .owned_connections
@@ -414,13 +417,19 @@ impl AgentConnectionStore {
                 Err(error) => LoadError::Other(error.to_string().into()),
             })?;
             let registered = this
-                .update(cx, |this, _| {
+                .update(cx, |this, cx| {
                     if this.shutdown.is_none() {
                         return false;
                     }
                     this.owned_connections
                         .retain(|connection| connection.strong_count() > 0);
                     this.owned_connections.push(Rc::downgrade(&connection));
+                    if let Some(task) = crate::mux_session_sync::watch(&connection, &this.project, cx) {
+                        this.session_sync_tasks
+                            .retain(|(connection, _)| connection.strong_count() > 0);
+                        this.session_sync_tasks
+                            .push((Rc::downgrade(&connection), task));
+                    }
                     true
                 })
                 .is_ok_and(|registered| registered);

@@ -4,7 +4,8 @@ use smol::channel::Sender;
 use std::{collections::HashMap, mem, time::SystemTime};
 
 use crate::{
-    Config, HISTORY_METHOD, META_KEY, PROTOCOL_VERSION, SET_TITLE_METHOD, TURN_STATE_METHOD,
+    AGENTS_METHOD, Config, HISTORY_METHOD, META_KEY, PROTOCOL_VERSION, SESSIONS_CHANGED_METHOD,
+    SET_TITLE_METHOD, TURN_STATE_METHOD,
     agent::{
         AgentId, AgentKey, AgentLauncher, AgentState, CallKind, InitState, PendingAgentRequest,
         PendingCall, client_initialize_response, daemon_initialize_params,
@@ -42,7 +43,7 @@ pub enum Event {
         reply: oneshot::Sender<Result<(), String>>,
     },
     /// A client that is not tied to an agent, such as a web or mobile client.
-    /// It can only list and use existing sessions.
+    /// It can use sessions and create them on an initialized agent.
     Observe {
         client: ClientId,
         label: String,
@@ -85,6 +86,8 @@ struct ClientState {
     label: String,
     outgoing: Sender<Value>,
     next_request_id: i64,
+    session_notifications: bool,
+    client_instance: Option<String>,
     /// Requests forwarded from an agent to this client, keyed by the id the client sees.
     forwarded: HashMap<i64, (AgentId, String)>,
 }
@@ -230,6 +233,8 @@ pub struct Router {
     agents: HashMap<AgentId, AgentState>,
     clients: HashMap<ClientId, ClientState>,
     sessions: HashMap<SessionKey, MuxSession>,
+    pub(crate) deleted_sessions: crate::deleted_sessions::DeletedSessions,
+    created_by_instance: HashMap<SessionKey, String>,
 }
 
 impl Router {
@@ -250,6 +255,8 @@ impl Router {
             agents: HashMap::new(),
             clients: HashMap::new(),
             sessions: HashMap::new(),
+            deleted_sessions: Default::default(),
+            created_by_instance: HashMap::new(),
         }
     }
 
@@ -281,6 +288,8 @@ impl Router {
                         label,
                         outgoing,
                         next_request_id: 0,
+                        session_notifications: false,
+                        client_instance: None,
                         forwarded: HashMap::new(),
                     },
                 );
@@ -399,6 +408,8 @@ impl Router {
                 label: format!("attach {}", key.name),
                 outgoing,
                 next_request_id: 0,
+                session_notifications: false,
+                client_instance: None,
                 forwarded: HashMap::new(),
             },
         );
@@ -430,8 +441,30 @@ impl Router {
         message: Value,
     ) {
         let client_agent = self.client_agent(client);
+        if let Some(key) = session_id_of(&params).and_then(|id| self.session_key(client, &id)) {
+            let deleting = self.agents.values().any(|agent| agent.key.name == key.0 && agent.calls.values().any(|call|
+                matches!(call, PendingCall::Forwarded { kind: CallKind::DeleteSession { session_id }, .. } if session_id == &key.1)));
+            if deleting && method != "session/close" {
+                Self::send_to_client(
+                    &self.clients,
+                    client,
+                    error_message(id, INVALID_PARAMS, "Session deletion is in progress"),
+                );
+                return;
+            }
+        }
         match method {
             "initialize" => {
+                if let Some(state) = self.clients.get_mut(&client) {
+                    state.session_notifications = params
+                        .pointer("/_meta/zed.dev~1acpMux/sessionLifecycle")
+                        == Some(&json!(true));
+                    state.client_instance = params
+                        .pointer("/_meta/zed.dev~1acpMux/clientInstance")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty() && value.len() <= 128)
+                        .map(str::to_owned);
+                }
                 // Prompt responses still end turns in the mux. Let v2 clients retry
                 // with v1 instead of negotiating a lifecycle we cannot yet route.
                 if let Some(version) = params.get("protocolVersion").and_then(Value::as_u64)
@@ -453,17 +486,97 @@ impl Router {
                     None => self.initialize_observer(client, id, &params),
                 }
             }
+            AGENTS_METHOD => {
+                let mut agents = self
+                    .agents
+                    .iter()
+                    .filter(|(_, agent)| !agent.stopping && agent.initialize_response().is_some())
+                    .filter(|(id, _)| client_agent.as_ref().is_none_or(|(own, _)| own == *id))
+                    .map(|(id, agent)| json!({"id": id.to_string(), "name": agent.key.name}))
+                    .collect::<Vec<_>>();
+                agents.sort_by_key(|agent| agent["id"].as_str().unwrap_or_default().to_owned());
+                Self::send_to_client(
+                    &self.clients,
+                    client,
+                    response_message(id, json!({"agents": agents})),
+                );
+            }
             "session/new" => {
-                let Some((agent, _)) = client_agent else {
-                    self.reject_observer(client, id);
+                let target = client_agent.map(|(agent, _)| agent).or_else(|| {
+                    params
+                        .pointer("/_meta/zed.dev~1acpMux/agentId")?
+                        .as_str()?
+                        .parse::<u64>()
+                        .ok()
+                });
+                let Some(agent) = target.filter(|id| {
+                    self.agents.get(id).is_some_and(|agent| {
+                        !agent.stopping && agent.initialize_response().is_some()
+                    })
+                }) else {
+                    Self::send_to_client(
+                        &self.clients,
+                        client,
+                        error_message(id, INVALID_PARAMS, "Choose a running, initialized agent"),
+                    );
                     return;
                 };
-                let cwd = params
+                let Some(cwd) = params
                     .get("cwd")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                self.forward_request(client, agent, id, message, CallKind::NewSession { cwd });
+                    .filter(|cwd| cwd.starts_with('/') && !cwd.contains('\0'))
+                else {
+                    Self::send_to_client(
+                        &self.clients,
+                        client,
+                        error_message(id, INVALID_PARAMS, "cwd must be an absolute server path"),
+                    );
+                    return;
+                };
+                self.forward_request(
+                    client,
+                    agent,
+                    id,
+                    message.clone(),
+                    CallKind::NewSession {
+                        cwd: cwd.to_string(),
+                    },
+                );
+            }
+            "session/delete" => {
+                let Some(key) = session_id_of(&params).and_then(|id| self.session_key(client, &id))
+                else {
+                    Self::send_to_client(
+                        &self.clients,
+                        client,
+                        error_message(id, RESOURCE_NOT_FOUND, "Session not found"),
+                    );
+                    return;
+                };
+                let session = &self.sessions[&key];
+                if session.dead
+                    || session.is_running()
+                    || self.is_waiting_for_input(session)
+                    || !session.queued_prompts.is_empty()
+                {
+                    Self::send_to_client(
+                        &self.clients,
+                        client,
+                        error_message(
+                            id,
+                            INVALID_PARAMS,
+                            "The session must be idle with a running agent before deletion",
+                        ),
+                    );
+                    return;
+                }
+                self.forward_request(
+                    client,
+                    session.agent,
+                    id,
+                    message,
+                    CallKind::DeleteSession { session_id: key.1 },
+                );
             }
             "session/list" => {
                 let agent_name = client_agent.map(|(_, name)| name);
@@ -624,7 +737,7 @@ impl Router {
             },
             "agentInfo": {"name": "acp-mux", "version": self.version},
             "authMethods": [],
-            "_meta": {META_KEY: {"protocol": PROTOCOL_VERSION, "observer": true}},
+            "_meta": {META_KEY: {"protocol": PROTOCOL_VERSION, "observer": true, "sessionLifecycle": true}},
         });
         Self::send_to_client(&self.clients, client, response_message(id, response));
     }
@@ -707,13 +820,56 @@ impl Router {
         sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
         let sessions = sessions
             .into_iter()
-            .map(|session| session.list_entry(self.is_waiting_for_input(session)))
+            .map(|session| {
+                let mut entry = session.list_entry(self.is_waiting_for_input(session));
+                if let Some(instance) = self
+                    .clients
+                    .get(&client)
+                    .and_then(|client| client.client_instance.as_ref())
+                {
+                    entry["_meta"][META_KEY]["own"] = json!(
+                        self.created_by_instance
+                            .get(&(session.agent_name.clone(), session.session_id.clone()))
+                            == Some(instance)
+                    );
+                }
+                entry
+            })
             .collect::<Vec<_>>();
-        Self::send_to_client(
-            &self.clients,
-            client,
-            response_message(id, json!({"sessions": sessions})),
-        );
+        let mut result = json!({"sessions": sessions});
+        if self
+            .clients
+            .get(&client)
+            .is_some_and(|client| client.session_notifications)
+            && cwd.is_none()
+            && params.get("cursor").is_none_or(Value::is_null)
+        {
+            // Retry a previously failed durability write before offering a
+            // complete synchronization snapshot.
+            if let Err(error) = self.deleted_sessions.persist() {
+                log::error!("persisting confirmed session deletions: {error:#}");
+                Self::send_to_client(
+                    &self.clients,
+                    client,
+                    error_message(
+                        id,
+                        INTERNAL_ERROR,
+                        "Cannot persist session synchronization state",
+                    ),
+                );
+                return;
+            }
+            let deleted = self
+                .deleted_sessions
+                .entries
+                .iter()
+                .filter(|(agent, _)| agent_name.is_none_or(|name| agent == name))
+                .map(|(agent, session)| json!({"agent":agent,"sessionId":session}))
+                .collect::<Vec<_>>();
+            result["_meta"] =
+                json!({META_KEY:{"sessionSync":{"complete":true,"deletedSessions":deleted}}});
+        }
+        Self::send_to_client(&self.clients, client, response_message(id, result));
     }
 
     fn handle_load(
@@ -731,6 +887,18 @@ impl Router {
             );
             return;
         };
+        if client_agent.as_ref().is_some_and(|(_, name)| {
+            self.deleted_sessions
+                .entries
+                .contains(&(name.clone(), session_id.clone()))
+        }) {
+            Self::send_to_client(
+                &self.clients,
+                client,
+                error_message(id, RESOURCE_NOT_FOUND, "Session was deleted"),
+            );
+            return;
+        }
         if let Some(key) = self.session_key(client, &session_id) {
             self.attach_session(client, id, &key, history_tail(&params));
             return;
@@ -1224,7 +1392,22 @@ impl Router {
                                 session.set_session_config(result);
                             }
                             log::info!("agent {agent_name} created session {session_id}");
-                            self.sessions.insert((agent_name, session_id), session);
+                            if let Some(instance) = self
+                                .clients
+                                .get(&client)
+                                .and_then(|client| client.client_instance.clone())
+                            {
+                                self.created_by_instance
+                                    .insert((agent_name.clone(), session_id.clone()), instance);
+                            }
+                            self.sessions
+                                .insert((agent_name.clone(), session_id.clone()), session);
+                            self.broadcast_session_change(
+                                &agent_name,
+                                &session_id,
+                                "created",
+                                client,
+                            );
                         }
                     }
                     CallKind::LoadSession { session_id } => {
@@ -1289,7 +1472,32 @@ impl Router {
                     }
                     CallKind::DeleteSession { session_id } => {
                         if result.is_some() {
-                            self.sessions.remove(&(agent_name, session_id));
+                            self.sessions
+                                .remove(&(agent_name.clone(), session_id.clone()));
+                            self.created_by_instance
+                                .remove(&(agent_name.clone(), session_id.clone()));
+                            let persistence = self
+                                .deleted_sessions
+                                .record(agent_name.clone(), session_id.clone());
+                            self.broadcast_session_change(
+                                &agent_name,
+                                &session_id,
+                                "deleted",
+                                client,
+                            );
+                            if let Err(error) = persistence {
+                                log::error!("saving confirmed session deletion: {error:#}");
+                                Self::send_to_client(
+                                    &self.clients,
+                                    client,
+                                    error_message(
+                                        client_request_id,
+                                        INTERNAL_ERROR,
+                                        "Agent deleted the session, but synchronization state could not be persisted; check the session list before retrying",
+                                    ),
+                                );
+                                return;
+                            }
                         }
                     }
                 }
@@ -1297,6 +1505,35 @@ impl Router {
                 if let Some(key) = next_prompt {
                     self.start_queued_prompt(&key);
                 }
+            }
+        }
+    }
+
+    fn broadcast_session_change(
+        &self,
+        agent_name: &str,
+        session_id: &str,
+        kind: &str,
+        author: ClientId,
+    ) {
+        let session = self
+            .sessions
+            .get(&(agent_name.to_owned(), session_id.to_owned()))
+            .map(|session| session.list_entry(self.is_waiting_for_input(session)));
+        for (client, state) in &self.clients {
+            if state.session_notifications
+                && self
+                    .client_agent(*client)
+                    .is_none_or(|(_, name)| name == agent_name)
+            {
+                Self::send_to_client(
+                    &self.clients,
+                    *client,
+                    notification_message(
+                        SESSIONS_CHANGED_METHOD,
+                        json!({"agent": agent_name, "sessionId": session_id, "kind": kind, "session": session, "own": *client == author || state.client_instance.as_ref().is_some_and(|instance| self.clients.get(&author).and_then(|author| author.client_instance.as_ref()) == Some(instance))}),
+                    ),
+                );
             }
         }
     }
@@ -2296,7 +2533,7 @@ mod tests {
                 "loadSession": true,
                 "sessionCapabilities": {"list": {}, "close": {}},
             },
-            "_meta": {"zed.dev/acpMux": {"protocol": PROTOCOL_VERSION}},
+            "_meta": {"zed.dev/acpMux": {"protocol": PROTOCOL_VERSION, "sessionLifecycle": true}},
         });
         assert_eq!(
             harness.client_messages(1),
@@ -2372,6 +2609,262 @@ mod tests {
             )]
         );
         assert!(harness.client_messages(1).is_empty());
+    }
+
+    #[test]
+    fn observer_lifecycle_reaches_all_opted_in_clients_only_after_success() {
+        let mut h = Harness::new();
+        h.attach(1);
+        h.initialize(1);
+        h.attach(2);
+        h.initialize(2);
+        h.observe(9);
+        h.observe(10);
+        for client in [1, 9, 10] {
+            h.from_client(
+                client,
+                json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{
+                    "protocolVersion":1,"_meta":{META_KEY:{"sessionLifecycle":true}}
+                }}),
+            );
+            h.client_messages(client);
+        }
+        h.from_client(
+            9,
+            json!({"jsonrpc":"2.0","id":"agents","method":AGENTS_METHOD,"params":{}}),
+        );
+        let agents = h.client_messages(9).remove(0)["result"]["agents"].clone();
+        let agent_id = agents[0]["id"].clone();
+        for success in [false, true] {
+            h.from_client(
+                9,
+                json!({"jsonrpc":"2.0","id":"new","method":"session/new","params":{
+                    "cwd":"/project","mcpServers":[],"_meta":{META_KEY:{"agentId":agent_id}}
+                }}),
+            );
+            let request = h.agent_messages().remove(0);
+            assert_eq!(request["method"], "session/new");
+            assert!(h.client_messages(1).is_empty());
+            h.from_agent(if success {
+                response_message(request["id"].clone(), json!({"sessionId":"mobile"}))
+            } else {
+                error_message(request["id"].clone(), INTERNAL_ERROR, "failed")
+            });
+            for client in [1, 10] {
+                let messages = h.client_messages(client);
+                assert_eq!(messages.len(), usize::from(success));
+                if success {
+                    assert_eq!(messages[0]["method"], SESSIONS_CHANGED_METHOD);
+                    assert_eq!(messages[0]["params"]["kind"], "created");
+                    assert_eq!(messages[0]["params"]["session"]["sessionId"], "mobile");
+                    assert_eq!(messages[0]["params"]["own"], false);
+                }
+            }
+            assert!(h.client_messages(2).is_empty()); // legacy client
+            let own = h.client_messages(9);
+            assert_eq!(own.len(), if success { 2 } else { 1 });
+            if success {
+                assert_eq!(own[0]["params"]["own"], true);
+            }
+        }
+        for success in [false, true] {
+            h.from_client(10, json!({"jsonrpc":"2.0","id":"delete","method":"session/delete","params":{"sessionId":"mobile"}}));
+            let request = h.agent_messages().remove(0);
+            h.from_agent(if success {
+                response_message(request["id"].clone(), json!({}))
+            } else {
+                error_message(request["id"].clone(), INTERNAL_ERROR, "failed")
+            });
+            for client in [1, 9] {
+                let messages = h.client_messages(client);
+                assert_eq!(messages.len(), usize::from(success));
+                if success {
+                    assert_eq!(messages[0]["params"]["kind"], "deleted");
+                }
+            }
+            h.client_messages(10);
+            assert!(h.client_messages(2).is_empty());
+            assert_eq!(
+                h.router
+                    .sessions
+                    .contains_key(&("claude".into(), "mobile".into())),
+                !success
+            );
+        }
+    }
+
+    #[test]
+    fn reconnect_snapshot_contains_created_sessions_and_scoped_deletions() {
+        let mut h = Harness::new();
+        h.attach(1);
+        h.initialize(1);
+        h.new_session(1, "offline-created");
+        h.router
+            .deleted_sessions
+            .record("claude".into(), "offline-deleted".into())
+            .unwrap();
+        h.router
+            .deleted_sessions
+            .record("other-agent".into(), "unrelated".into())
+            .unwrap();
+        h.attach(2);
+        h.initialize(2);
+        h.router.clients.get_mut(&2).unwrap().session_notifications = true;
+        h.from_client(2, json!({"id":1,"method":"session/list","params":{}}));
+        let response = h.client_messages(2).remove(0);
+        assert_eq!(
+            response["result"]["sessions"][0]["sessionId"],
+            "offline-created"
+        );
+        assert_eq!(
+            response["result"]["_meta"][META_KEY]["sessionSync"],
+            json!({
+                "complete": true, "deletedSessions": [{"agent":"claude","sessionId":"offline-deleted"}]
+            })
+        );
+        // A cwd-filtered list is not a complete reconciliation snapshot.
+        h.from_client(
+            2,
+            json!({"id":2,"method":"session/list","params":{"cwd":"/project"}}),
+        );
+        assert!(h.client_messages(2)[0]["result"].get("_meta").is_none());
+        h.observe(3);
+        h.router.clients.get_mut(&3).unwrap().session_notifications = true;
+        h.from_client(3, json!({"id":3,"method":"session/list","params":{}}));
+        assert_eq!(
+            h.client_messages(3)[0]["result"]["_meta"][META_KEY]["sessionSync"]["deletedSessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        // The restored tombstone prevents an attached client reloading agent history.
+        h.from_client(2, json!({"id":4,"method":"session/load","params":{"sessionId":"offline-deleted","cwd":"/project","mcpServers":[]}}));
+        assert!(h.client_messages(2)[0].get("error").is_some());
+        assert!(h.agent_messages().is_empty());
+    }
+
+    #[test]
+    fn failed_deletion_persistence_never_acknowledges_a_complete_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deleted.json");
+        let mut h = Harness::new();
+        h.router.deleted_sessions =
+            crate::deleted_sessions::DeletedSessions::open(path.clone()).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        h.attach(1);
+        h.initialize(1);
+        h.new_session(1, "s");
+        h.router.clients.get_mut(&1).unwrap().session_notifications = true;
+        h.from_client(
+            1,
+            json!({"id":1,"method":"session/delete","params":{"sessionId":"s"}}),
+        );
+        let request = h.agent_messages().remove(0);
+        h.from_agent(response_message(request["id"].clone(), json!({})));
+        let messages = h.client_messages(1);
+        assert_eq!(messages[0]["params"]["kind"], "deleted");
+        assert!(messages[1].get("error").is_some());
+        h.from_client(1, json!({"id":2,"method":"session/list","params":{}}));
+        assert!(h.client_messages(1)[0].get("error").is_some());
+        std::fs::remove_dir(&path).unwrap();
+        h.from_client(1, json!({"id":3,"method":"session/list","params":{}}));
+        assert_eq!(
+            h.client_messages(1)[0]["result"]["_meta"][META_KEY]["sessionSync"]["deletedSessions"]
+                [0]["sessionId"],
+            "s"
+        );
+        let restored = crate::deleted_sessions::DeletedSessions::open(path).unwrap();
+        assert!(restored.entries.contains(&("claude".into(), "s".into())));
+    }
+
+    #[test]
+    fn windows_of_one_client_instance_do_not_duplicate_their_own_creation() {
+        let mut h = Harness::new();
+        h.attach(1);
+        h.initialize(1);
+        h.attach(2);
+        h.initialize(2);
+        for client in [1, 2] {
+            h.from_client(client, json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{
+                "protocolVersion":1,"_meta":{META_KEY:{"sessionLifecycle":true,"clientInstance":"one-desktop"}}
+            }}));
+            h.client_messages(client);
+        }
+        h.new_session(1, "s");
+        assert_eq!(h.client_messages(2)[0]["params"]["own"], true);
+        h.from_client(2, json!({"id":2,"method":"session/list","params":{}}));
+        assert_eq!(
+            h.client_messages(2)[0]["result"]["sessions"][0]["_meta"][META_KEY]["own"],
+            true
+        );
+    }
+
+    #[test]
+    fn lifecycle_notifications_respect_attached_agent_scope() {
+        let mut h = Harness::new();
+        h.attach(1);
+        h.initialize(1);
+        h.attach(2);
+        h.initialize(2);
+        h.new_session(1, "s");
+        h.router.clients.get_mut(&2).unwrap().session_notifications = true;
+        let agent = h.router.clients[&2].agent.unwrap();
+        h.router.agents.get_mut(&agent).unwrap().key.name = "other-agent".into();
+        h.router
+            .broadcast_session_change("claude", "s", "created", 1);
+        assert!(h.client_messages(2).is_empty());
+    }
+
+    #[test]
+    fn deletion_serializes_with_prompts_and_rejects_busy_sessions() {
+        let mut h = Harness::new();
+        h.attach(1);
+        h.initialize(1);
+        h.new_session(1, "s");
+        let prompt = h.prompt(1, "s", "work");
+        h.from_client(1, json!({"jsonrpc":"2.0","id":"delete","method":"session/delete","params":{"sessionId":"s"}}));
+        assert!(h.agent_messages().is_empty());
+        assert_eq!(h.client_messages(1)[0]["error"]["code"], INVALID_PARAMS);
+        h.from_agent(response_message(prompt, json!({"stopReason":"end_turn"})));
+        h.client_messages(1);
+        h.from_client(1, json!({"jsonrpc":"2.0","id":"delete","method":"session/delete","params":{"sessionId":"s"}}));
+        let deletion = h.agent_messages().remove(0);
+        for method in ["session/delete", "session/prompt", "session/load"] {
+            h.from_client(
+                1,
+                json!({"jsonrpc":"2.0","id":"race","method":method,"params":{"sessionId":"s"}}),
+            );
+            assert_eq!(h.client_messages(1)[0]["error"]["code"], INVALID_PARAMS);
+            assert!(h.agent_messages().is_empty());
+        }
+        h.from_agent(error_message(
+            deletion["id"].clone(),
+            INTERNAL_ERROR,
+            "not supported",
+        ));
+        h.client_messages(1);
+        h.prompt(1, "s", "still available");
+    }
+
+    #[test]
+    fn observer_creation_validates_agent_and_cwd() {
+        let mut h = Harness::new();
+        h.attach(1);
+        h.initialize(1);
+        h.observe(9);
+        for params in [
+            json!({"cwd":"/project"}),
+            json!({"cwd":"/project","_meta":{META_KEY:{"agentId":"999"}}}),
+            json!({"cwd":"relative","_meta":{META_KEY:{"agentId":"1"}}}),
+        ] {
+            h.from_client(
+                9,
+                json!({"jsonrpc":"2.0","id":"new","method":"session/new","params":params}),
+            );
+            assert_eq!(h.client_messages(9)[0]["error"]["code"], INVALID_PARAMS);
+            assert!(h.agent_messages().is_empty());
+        }
     }
 
     #[test]
@@ -2733,7 +3226,7 @@ mod tests {
     }
 
     #[test]
-    fn observers_list_every_session_but_cannot_start_sessions() {
+    fn observers_list_every_session_but_cannot_authenticate_agents() {
         let mut harness = Harness::new();
         harness.attach(1);
         harness.initialize(1);
@@ -2762,7 +3255,7 @@ mod tests {
             json!({"agent": "claude", "state": "idle", "observers": 1})
         );
 
-        for (id, method) in [(3, "session/new"), (4, "authenticate")] {
+        for (id, method) in [(4, "authenticate")] {
             harness.from_client(
                 9,
                 json!({"jsonrpc": "2.0", "id": id, "method": method, "params": {"cwd": "/", "mcpServers": []}}),

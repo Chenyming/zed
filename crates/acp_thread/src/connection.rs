@@ -533,6 +533,9 @@ impl From<acp_v2::SessionInfoUpdate> for AgentSessionInfoUpdate {
 #[derive(Debug, Clone)]
 pub enum SessionListUpdate {
     Refresh,
+    /// A session created elsewhere on this acp-mux connection.
+    SessionCreated(AgentSessionInfo),
+    SessionDeleted(acp_v2::SessionId),
     SessionInfo {
         session_id: acp_v2::SessionId,
         update: AgentSessionInfoUpdate,

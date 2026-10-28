@@ -259,7 +259,7 @@ impl AcpSessionList {
         }
     }
 
-    fn notify_update(&self) {
+    pub(super) fn notify_update(&self) {
         self.updates_tx
             .try_send(acp_thread::SessionListUpdate::Refresh)
             .log_err();
@@ -486,6 +486,14 @@ fn client_builder(
             {
                 let dispatch_sender = dispatch_sender.clone();
                 async move |message: UntypedMessage, connection: ConnectionTo<Agent>| {
+                    if message.method() == "_zed.dev/acpMux/sessions_changed" {
+                        enqueue_notification(
+                            &dispatch_sender,
+                            message.params().clone(),
+                            handle_mux_session_change,
+                        );
+                        return Ok(Handled::Yes);
+                    }
                     match mux_turn_state_notification(&message) {
                         Some(notification) => {
                             enqueue_notification(
@@ -504,6 +512,12 @@ fn client_builder(
             },
             agent_client_protocol::on_receive_notification!(),
         )
+}
+
+/// All windows in this Zed process share one sidebar metadata store.
+fn mux_client_instance() -> &'static str {
+    static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
 
 fn is_hosted_by_mux(response: &acp::InitializeResponse) -> bool {
@@ -553,6 +567,10 @@ fn client_capabilities_for_agent(
 }
 
 impl AcpConnection {
+    pub fn is_hosted_by_mux(&self) -> bool {
+        self.hosted_by_mux
+    }
+
     /// Binds supported v2 client handlers to the existing foreground owners.
     /// This does not change the protocol used by the connection's transport.
     pub fn with_v2_client_ingress<Handler: HandleDispatchFrom<Agent>>(
@@ -669,6 +687,7 @@ impl AcpConnection {
         let initialize_response = connection
             .send_request(
                 acp::InitializeRequest::new(ProtocolVersion::V1)
+                    .meta(serde_json::Map::from_iter([(MUX_META_KEY.into(), serde_json::json!({"sessionLifecycle": true, "clientInstance": mux_client_instance()}))]))
                     .client_capabilities(client_capabilities)
                     .client_info(
                         acp::Implementation::new("zed", version)
@@ -10019,9 +10038,10 @@ exit 7
 
             let sessions = Rc::new(RefCell::new(HashMap::default()));
             let request_elicitations = cx.new(|_| ElicitationStore::default());
+            let lifecycle_list = Rc::new(AcpSessionList::new(client_connection.clone(), true));
             let dispatch_context = ClientContext {
                 sessions: sessions.clone(),
-                session_list: Rc::new(RefCell::new(None)),
+                session_list: Rc::new(RefCell::new(Some(lifecycle_list.clone()))),
                 request_elicitations: request_elicitations.clone(),
                 active_request_scopes: None,
                 mux_turn_state: Rc::new(Cell::new(is_hosted_by_mux(&response))),
@@ -10053,6 +10073,7 @@ exit 7
                 )
             });
             connection.hosted_by_mux = hosted_by_mux;
+            connection.session_list = Some(lifecycle_list);
             let agent = agent_receiver.await.expect("fake agent handle");
 
             Self {
@@ -10123,6 +10144,66 @@ exit 7
         cx: &mut gpui::TestAppContext,
     ) -> acp_thread::ThreadStatus {
         thread.read_with(cx, |thread, _| thread.status())
+    }
+
+    #[gpui::test]
+    async fn mux_lifecycle_notifies_list_and_invalidates_deleted_thread(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let agent = FakeMuxAgent::connect(true, cx).await;
+        let list = agent.connection.session_list.as_ref().unwrap();
+        let updates = list.updates_rx.clone();
+        let thread = agent.load(vec![], cx).await;
+        agent.send(
+            UntypedMessage::new(
+                "_zed.dev/acpMux/sessions_changed",
+                serde_json::json!({
+                    "kind":"created", "own":false, "sessionId":"external",
+                    "session":{"sessionId":"external","cwd":"/a","title":"From Android"}
+                }),
+            )
+            .unwrap(),
+            cx,
+        );
+        let acp_thread::SessionListUpdate::SessionCreated(info) = updates.try_recv().unwrap()
+        else {
+            panic!("expected creation");
+        };
+        assert_eq!(info.session_id, acp_v2::SessionId::new("external"));
+        assert_eq!(info.title.as_deref(), Some("From Android"));
+        agent.send(
+            UntypedMessage::new(
+                "_zed.dev/acpMux/sessions_changed",
+                serde_json::json!({
+                    "kind":"deleted", "own":false, "sessionId":MUX_SESSION_ID
+                }),
+            )
+            .unwrap(),
+            cx,
+        );
+        assert!(matches!(
+            updates.try_recv().unwrap(),
+            acp_thread::SessionListUpdate::SessionDeleted(_)
+        ));
+        assert!(thread.read_with(cx, |thread, _| thread.is_observation_closed()));
+    }
+
+    #[gpui::test]
+    async fn mux_lifecycle_ignores_own_creation_and_non_mux_agents(cx: &mut gpui::TestAppContext) {
+        for (hosted, own) in [(true, true), (false, false)] {
+            let agent = FakeMuxAgent::connect(hosted, cx).await;
+            let updates = agent
+                .connection
+                .session_list
+                .as_ref()
+                .unwrap()
+                .updates_rx
+                .clone();
+            agent.send(UntypedMessage::new("_zed.dev/acpMux/sessions_changed", serde_json::json!({
+                "kind":"created", "own":own, "sessionId":"s", "session":{"sessionId":"s","cwd":"/a"}
+            })).unwrap(), cx);
+            assert!(updates.try_recv().is_err());
+        }
     }
 
     #[gpui::test]
@@ -10643,6 +10724,61 @@ fn apply_v1_subagent_update(
         MaybeUndefined::Null => subagent.clear_session_state(cx),
         MaybeUndefined::Value(state) => subagent.update_session_state(state, cx),
     })
+}
+
+fn handle_mux_session_change(params: serde_json::Value, cx: &mut AsyncApp, ctx: &ClientContext) {
+    if !ctx.mux_turn_state.get() {
+        return;
+    }
+    let Some(list) = ctx.session_list.borrow().clone() else {
+        return;
+    };
+    // The initiating Zed operation already updates its local metadata. In
+    // particular, a new session has not acquired its local ThreadId yet.
+    if params.get("own").and_then(serde_json::Value::as_bool) == Some(true) {
+        return;
+    }
+    match params.get("kind").and_then(serde_json::Value::as_str) {
+        Some("created") => {
+            let Ok(info) = serde_json::from_value::<acp::SessionInfo>(params["session"].clone())
+            else {
+                return;
+            };
+            let session = AgentSessionInfo {
+                session_id: acp_v2::SessionId::new(info.session_id.0),
+                work_dirs: Some(work_dirs_from_session_info(
+                    info.cwd,
+                    info.additional_directories,
+                )),
+                title: info.title.map(Into::into),
+                updated_at: info
+                    .updated_at
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+                    .map(|date| date.with_timezone(&chrono::Utc)),
+                created_at: None,
+                meta: info.meta,
+            };
+            list.updates_tx
+                .try_send(acp_thread::SessionListUpdate::SessionCreated(session))
+                .log_err();
+        }
+        Some("deleted") => {
+            let Some(id) = params.get("sessionId").and_then(serde_json::Value::as_str) else {
+                return;
+            };
+            let id = acp_v2::SessionId::new(id);
+            if let Some(session) = ctx.sessions.borrow_mut().remove(&id) {
+                session
+                    .thread
+                    .update(cx, |thread, cx| thread.handle_connection_lost(cx))
+                    .log_err();
+            }
+            list.updates_tx
+                .try_send(acp_thread::SessionListUpdate::SessionDeleted(id))
+                .log_err();
+        }
+        _ => {}
+    }
 }
 
 fn handle_session_notification(

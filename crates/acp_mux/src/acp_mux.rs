@@ -7,6 +7,7 @@ mod agent;
 mod attach;
 mod control;
 mod daemon;
+mod deleted_sessions;
 mod gateway;
 mod notify;
 mod router;
@@ -20,6 +21,10 @@ use std::path::{Path, PathBuf};
 
 pub use control::PROTOCOL_VERSION;
 
+/// Successful session creation/deletion, sent to clients that opt in at initialize.
+pub const SESSIONS_CHANGED_METHOD: &str = "_zed.dev/acpMux/sessions_changed";
+/// Lists running, initialized agents that an observer can create sessions on.
+pub const AGENTS_METHOD: &str = "_zed.dev/acpMux/agents";
 /// Method of the extension notification that tells an attached client whether a
 /// turn it did not start itself is running.
 pub const TURN_STATE_METHOD: &str = "_zed.dev/acpMux/turn_state";

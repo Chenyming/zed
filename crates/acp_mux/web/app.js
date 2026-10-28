@@ -128,6 +128,7 @@ function connect() {
       await request("initialize", {
         protocolVersion: 1,
         clientCapabilities: {},
+        _meta: { [META_KEY]: { sessionLifecycle: true } },
         clientInfo: { name: "acp-mux-web", version: "2" },
       });
       setConnection("online");
@@ -149,7 +150,10 @@ function connect() {
   socket.addEventListener("close", () => {
     if (connection.socket !== socket) return;
     connection.connected = false;
-    for (const { reject } of connection.pending.values()) reject(new Error("连接已断开"));
+    for (const { reject, timer } of connection.pending.values()) {
+      clearTimeout(timer);
+      reject(new Error("连接已断开"));
+    }
     connection.pending.clear();
     // The daemon forgets this observer with the connection, so the open
     // session has to be loaded again after reconnecting.
@@ -178,13 +182,18 @@ function send(message) {
   connection.socket.send(JSON.stringify({ jsonrpc: "2.0", ...message }));
 }
 
-function request(method, params) {
+function request(method, params, timeoutMs = 0) {
   return new Promise((resolve, reject) => {
     const id = connection.nextId++;
-    connection.pending.set(id, { resolve, reject });
+    const timer = timeoutMs > 0 ? setTimeout(() => {
+      connection.pending.delete(id);
+      reject(new Error("请求超时，请重试"));
+    }, timeoutMs) : null;
+    connection.pending.set(id, { resolve, reject, timer });
     try {
       send({ id, method, params });
     } catch (error) {
+      clearTimeout(timer);
       connection.pending.delete(id);
       reject(error);
     }
@@ -196,6 +205,7 @@ function handleMessage(message) {
     const pending = connection.pending.get(message.id);
     if (!pending) return;
     connection.pending.delete(message.id);
+    clearTimeout(pending.timer);
     if (message.error) {
       pending.reject(new Error(message.error.message || "请求失败"));
     } else {
@@ -209,6 +219,14 @@ function handleMessage(message) {
     return;
   }
   switch (message.method) {
+    case "_zed.dev/acpMux/sessions_changed":
+      if (params.kind === "deleted" && currentRoute() === params.sessionId) {
+        closeSession();
+        location.hash = "#/";
+        route();
+      }
+      refreshList();
+      break;
     case "session/update":
       if (session && params.sessionId === session.id) applyUpdate(params.update || {});
       break;
@@ -367,17 +385,37 @@ $("logout").addEventListener("click", async () => {
 
 let listTimer = null;
 let listLoaded = false;
+let listRevision = 0;
 const knownSessions = new Map();
 
 async function refreshList() {
   clearTimeout(listTimer);
+  const revision = ++listRevision;
   if (!connection.connected) return;
   if (!listLoaded) renderListSkeleton();
   try {
-    const result = await request("session/list", {});
+    const result = await request("session/list", {}, 15000);
+    if (revision !== listRevision) return;
+    if (!Array.isArray(result.sessions) || result.nextCursor != null) throw new Error("会话列表不完整，请重试");
+    const sync = result._meta?.[META_KEY]?.sessionSync;
+    let deleted = [];
+    if (sync != null) {
+      if (sync.complete !== true || !Array.isArray(sync.deletedSessions) ||
+          sync.deletedSessions.some(entry => typeof entry?.sessionId !== "string" || !entry.sessionId)) {
+        throw new Error("会话同步数据不完整，请重试");
+      }
+      deleted = sync.deletedSessions.map(entry => entry.sessionId);
+    }
     listLoaded = true;
-    renderList(result.sessions || []);
+    renderList(result.sessions.filter(entry => !deleted.includes(entry.sessionId)));
+    if (deleted.includes(currentRoute())) {
+      closeSession();
+      location.hash = "#/";
+      route();
+      showListBanner("会话已在其他设备删除");
+    }
   } catch (error) {
+    if (revision !== listRevision) return;
     if (connection.connected) showListBanner(`获取会话失败：${error.message}`);
   }
   listTimer = setTimeout(refreshList, LIST_REFRESH_MS);

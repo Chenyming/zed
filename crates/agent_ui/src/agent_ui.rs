@@ -1,5 +1,6 @@
 mod agent_configuration;
 pub mod agent_connection_store;
+mod mux_session_sync;
 mod agent_diff;
 mod agent_model_selector;
 mod agent_panel;

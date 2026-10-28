@@ -77,7 +77,12 @@ pub fn run(version: &str) -> Result<()> {
         socket.display()
     );
 
-    let result = smol::block_on(serve(listener, config, version.to_string()));
+    let result = smol::block_on(serve(
+        listener,
+        config,
+        version.to_string(),
+        Some(state_dir.join("deleted_sessions.json")),
+    ));
     std::fs::remove_file(&socket).ok();
     log::info!("acp-mux daemon exiting");
     result
@@ -124,7 +129,12 @@ async fn serve(
     listener: std::os::unix::net::UnixListener,
     config: Config,
     version: String,
+    deletion_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
+    let deleted_sessions = deletion_path
+        .map(crate::deleted_sessions::DeletedSessions::open)
+        .transpose()?
+        .unwrap_or_default();
     let listener = UnixListener::try_from(listener)?;
     let (events, events_rx) = smol::channel::unbounded();
     let client_ids = ClientIds::default();
@@ -163,6 +173,7 @@ async fn serve(
         events.clone(),
         notices,
     );
+    router.deleted_sessions = deleted_sessions;
     let _accept_task = smol::spawn(accept_loop(listener, events, client_ids, version));
     while let Ok(event) = events_rx.recv().await {
         if router.handle(event) == Flow::Exit {
@@ -453,7 +464,7 @@ read -r line
         let listener =
             std::os::unix::net::UnixListener::bind(&socket).expect("binding the test socket");
         std::thread::spawn(move || {
-            smol::block_on(serve(listener, Config::default(), "test".into())).ok();
+            smol::block_on(serve(listener, Config::default(), "test".into(), None)).ok();
         });
         (directory, socket)
     }
@@ -492,7 +503,7 @@ read -r line
         let listener =
             std::os::unix::net::UnixListener::bind(&socket).expect("binding the test socket");
         std::thread::spawn(move || {
-            smol::block_on(serve(listener, Config::default(), "test".into())).ok();
+            smol::block_on(serve(listener, Config::default(), "test".into(), None)).ok();
         });
 
         let mut first = TestClient::connect(&socket);
